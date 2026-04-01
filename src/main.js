@@ -1,0 +1,8791 @@
+import * as pc from 'playcanvas';
+import { DataTable, Column, MemoryFileSystem, writePly } from '@playcanvas/splat-transform';
+import { registerSW } from 'virtual:pwa-register';
+import { hydrateTablerIcons, warmTablerIconCache, tablerIconHtmlSync } from './tabler-icons.js';
+import { initCgGradeSliderUi, refreshCgGradeSliderTracks } from './cg-grade-slider-ui.js';
+import { initSupportModal, isSupportModalOpen, closeSupportModalSnoozed } from './support-modal.js';
+
+registerSW({ immediate: true });
+
+await warmTablerIconCache([
+    'file-import', 'stack-push', 'arrow-back-up', 'arrow-forward-up', 'color-picker', 'hand-love-you',
+    'location', 'brush', 'eraser', 'restore', 'bucket-droplet', 'grid-3x3', 'selection-rectangle', 'lasso', 'polygon', 'selection-brush', 'color-selection', 'braille',
+    'square-rounded', 'square-rounded-plus', 'square-rounded-minus',
+    'cube-3d-sphere', 'grid-dots', 'square-off', 'circle-dot', 'circle',
+    'eye', 'eye-off', 'layout-grid', 'copy', 'trash', 'stack-2', 'arrows-split',
+    'square-plus', 'arrow-merge', 'arrows-move', 'rotate', 'resize', 'gizmo',
+    'select-all', 'arrows-left-right', 'blur-off', 'focus-centered', 'grip-vertical',
+    'file-export', 'camera', 'plus', 'camera-rotate',
+    'cube-plus', 'reload', 'circle-check',
+]);
+await warmTablerIconCache(['tilt-shift'], 'filled');
+await hydrateTablerIcons(document.getElementById('app'));
+initSupportModal();
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const SH_C0 = 0.28209479177387814;
+const sigmoid    = (v) => 1 / (1 + Math.exp(-v));
+const invSigmoid = (v) => -Math.log(1 / Math.max(1e-6, Math.min(1 - 1e-6, v)) - 1);
+const smoothstepJS = (e0, e1, x) => {
+    const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+};
+
+// Plateau falloff for paint (matches GPU): inner region = full strength so ALPHABLEND
+// doesn’t strand splats at low alpha (mottled / lighter random splats).
+const paintPlateauFalloff = (dist, radius, hardness) => {
+    if (radius <= 0 || dist >= radius) return 0;
+    const u = dist / radius;
+    const h = Math.max(0, Math.min(1, hardness));
+    const feather = (1 - h) * 0.4 + h * 0.05;
+    const inner = 1 - feather;
+    if (u <= inner) return 1;
+    return 1 - smoothstepJS(inner, 1, u);
+};
+
+// ── Shader: paint ────────────────────────────────────────────────────────────
+// Writes only to customColor. Uses ALPHABLEND accumulation.
+const PAINT_GLSL = /* glsl */`
+uniform vec4  uPaintSphere;     // xyz=center (model space), w=radius
+uniform vec4  uPaintColor;     // rgb=color, a=intensity
+uniform float uHardness;       // 0=soft, 1=hard
+// 0 = ignore selection · 1 = exclude selected · 2 = only selected
+uniform int   uSelectionConstraint;
+
+void process() {
+    vec3  center = getCenter();
+    float dist   = distance(center, uPaintSphere.xyz);
+    if (dist >= uPaintSphere.w) { writeCustomColor(vec4(0.0)); return; }
+
+    float sel = loadCustomSelection().r;
+    if (uSelectionConstraint == 1 && sel > 0.5) { writeCustomColor(vec4(0.0)); return; }
+    if (uSelectionConstraint == 2 && sel <= 0.5) { writeCustomColor(vec4(0.0)); return; }
+
+    // Plateau: nearly flat fill in the interior, short smooth rim only.
+    // Reduces mottling from SRC_ALPHA blending when falloff varies per splat per dab.
+    float u = dist / uPaintSphere.w;
+    float h = clamp(uHardness, 0.0, 1.0);
+    float feather = mix(0.40, 0.05, h);
+    float inner = 1.0 - feather;
+    float falloff = (u <= inner) ? 1.0 : (1.0 - smoothstep(inner, 1.0, u));
+    if (falloff < 0.008) return;
+    writeCustomColor(vec4(uPaintColor.rgb, uPaintColor.a * falloff));
+}
+`;
+
+const PAINT_WGSL = /* wgsl */`
+uniform uPaintSphere:    vec4f;
+uniform uPaintColor:     vec4f;
+uniform uHardness:       f32;
+uniform uSelectionConstraint: i32;
+
+fn process() {
+    let center = getCenter();
+    let dist   = distance(center, uniform.uPaintSphere.xyz);
+    if dist >= uniform.uPaintSphere.w { writeCustomColor(vec4f(0.0)); return; }
+
+    let sel = loadCustomSelection().r;
+    if uniform.uSelectionConstraint == 1 && sel > 0.5 { writeCustomColor(vec4f(0.0)); return; }
+    if uniform.uSelectionConstraint == 2 && sel <= 0.5 { writeCustomColor(vec4f(0.0)); return; }
+
+    let u = dist / uniform.uPaintSphere.w;
+    let h = clamp(uniform.uHardness, 0.0, 1.0);
+    let feather = mix(0.40, 0.05, h);
+    let inner = 1.0 - feather;
+    var falloff = 1.0;
+    if u > inner {
+        falloff = 1.0 - smoothstep(inner, 1.0, u);
+    }
+    if falloff < 0.008 { return; }
+    writeCustomColor(vec4f(
+        uniform.uPaintColor.r,
+        uniform.uPaintColor.g,
+        uniform.uPaintColor.b,
+        uniform.uPaintColor.a * falloff
+    ));
+}
+`;
+
+// ── Shader: erase ────────────────────────────────────────────────────────────
+// Writes only to customOpacity. Uses ADDITIVE accumulation.
+const ERASE_GLSL = /* glsl */`
+uniform vec4  uPaintSphere;
+uniform vec4  uPaintColor;     // a = erase intensity
+uniform float uHardness;
+uniform int   uSelectionConstraint;
+// View ray in model space (unit). uEraseDepthHalf > 0 → cylinder along this axis
+// (radius uPaintSphere.w, half-length uEraseDepthHalf); 0 → sphere.
+uniform vec3  uEraseViewDir;
+uniform float uEraseDepthHalf;
+
+void process() {
+    vec3  center = getCenter();
+    vec3  d      = center - uPaintSphere.xyz;
+
+    float inside = 0.0;
+    float tEdge  = 0.0;
+
+    if (uEraseDepthHalf < 1e-6) {
+        float dist = length(d);
+        if (dist >= uPaintSphere.w) { writeCustomOpacity(vec4(0.0)); return; }
+        tEdge = dist / uPaintSphere.w;
+        inside = 1.0;
+    } else {
+        vec3  V = uEraseViewDir;
+        float longitud = dot(d, V);
+        float perpSq   = dot(d, d) - longitud * longitud;
+        float perp     = sqrt(max(perpSq, 0.0));
+        float R = uPaintSphere.w;
+        float D = max(uEraseDepthHalf, 1e-6);
+        if (perp >= R || abs(longitud) > D) { writeCustomOpacity(vec4(0.0)); return; }
+        tEdge = max(perp / R, abs(longitud) / D);
+        inside = 1.0;
+    }
+
+    if (inside < 0.5) { writeCustomOpacity(vec4(0.0)); return; }
+
+    float sel = loadCustomSelection().r;
+    if (uSelectionConstraint == 1 && sel > 0.5) { writeCustomOpacity(vec4(0.0)); return; }
+    if (uSelectionConstraint == 2 && sel <= 0.5) { writeCustomOpacity(vec4(0.0)); return; }
+
+    float t       = 1.0 - tEdge;
+    float falloff  = (uHardness >= 1.0) ? 1.0
+                   : smoothstep(0.0, max(0.001, 1.0 - uHardness), t);
+    writeCustomOpacity(vec4(0.0, 0.0, 0.0, uPaintColor.a * falloff));
+}
+`;
+
+const ERASE_WGSL = /* wgsl */`
+uniform uPaintSphere:    vec4f;
+uniform uPaintColor:     vec4f;
+uniform uHardness:       f32;
+uniform uSelectionConstraint: i32;
+uniform uEraseViewDir:   vec3f;
+uniform uEraseDepthHalf: f32;
+
+fn process() {
+    let center = getCenter();
+    let d = center - uniform.uPaintSphere.xyz;
+
+    var inside = 0.0;
+    var tEdge = 0.0;
+
+    if uniform.uEraseDepthHalf < 1e-6 {
+        let dist = length(d);
+        if dist >= uniform.uPaintSphere.w { writeCustomOpacity(vec4f(0.0)); return; }
+        tEdge = dist / uniform.uPaintSphere.w;
+        inside = 1.0;
+    } else {
+        let V = uniform.uEraseViewDir;
+        let longitud = dot(d, V);
+        let perpSq = dot(d, d) - longitud * longitud;
+        let perp = sqrt(max(perpSq, 0.0));
+        let R = uniform.uPaintSphere.w;
+        let D = max(uniform.uEraseDepthHalf, 1e-6);
+        if perp >= R || abs(longitud) > D { writeCustomOpacity(vec4f(0.0)); return; }
+        tEdge = max(perp / R, abs(longitud) / D);
+        inside = 1.0;
+    }
+
+    if inside < 0.5 { writeCustomOpacity(vec4f(0.0)); return; }
+
+    let sel = loadCustomSelection().r;
+    if uniform.uSelectionConstraint == 1 && sel > 0.5 { writeCustomOpacity(vec4f(0.0)); return; }
+    if uniform.uSelectionConstraint == 2 && sel <= 0.5 { writeCustomOpacity(vec4f(0.0)); return; }
+
+    let t = 1.0 - tEdge;
+    let falloff = select(
+        smoothstep(0.0, max(0.001, 1.0 - uniform.uHardness), t),
+        1.0, uniform.uHardness >= 1.0
+    );
+    writeCustomOpacity(vec4f(0.0, 0.0, 0.0, uniform.uPaintColor.a * falloff));
+}
+`;
+
+// ── Shader: reset (restore original colors) ────────────────────────────────────
+// Write (0,0,0,falloff). Blend dst*(1-src.a) clears when falloff=1, preserves when falloff=0.
+// No read needed — can't read/write same stream in one pass.
+const RESET_COLOR_GLSL = /* glsl */`
+uniform vec4 uPaintSphere;
+uniform float uHardness;
+uniform int   uSelectionConstraint;
+
+void process() {
+    vec3 center = getCenter();
+    float dist = distance(center, uPaintSphere.xyz);
+    if (dist >= uPaintSphere.w) { writeCustomColor(vec4(0.0, 0.0, 0.0, 0.0)); return; }
+    float sel = loadCustomSelection().r;
+    if (uSelectionConstraint == 1 && sel > 0.5) { writeCustomColor(vec4(0.0, 0.0, 0.0, 0.0)); return; }
+    if (uSelectionConstraint == 2 && sel <= 0.5) { writeCustomColor(vec4(0.0, 0.0, 0.0, 0.0)); return; }
+    float t = 1.0 - dist / uPaintSphere.w;
+    float falloff = (uHardness >= 1.0) ? 1.0 : smoothstep(0.0, max(0.001, 1.0 - uHardness), t);
+    writeCustomColor(vec4(0.0, 0.0, 0.0, falloff));
+}
+`;
+const RESET_COLOR_WGSL = /* wgsl */`
+uniform uPaintSphere: vec4f;
+uniform uHardness: f32;
+uniform uSelectionConstraint: i32;
+
+fn process() {
+    let center = getCenter();
+    let dist = distance(center, uniform.uPaintSphere.xyz);
+    if dist >= uniform.uPaintSphere.w { writeCustomColor(vec4f(0.0, 0.0, 0.0, 0.0)); return; }
+    let sel = loadCustomSelection().r;
+    if uniform.uSelectionConstraint == 1 && sel > 0.5 { writeCustomColor(vec4f(0.0, 0.0, 0.0, 0.0)); return; }
+    if uniform.uSelectionConstraint == 2 && sel <= 0.5 { writeCustomColor(vec4f(0.0, 0.0, 0.0, 0.0)); return; }
+    let t = 1.0 - dist / uniform.uPaintSphere.w;
+    let falloff = select(smoothstep(0.0, max(0.001, 1.0 - uniform.uHardness), t), 1.0, uniform.uHardness >= 1.0);
+    writeCustomColor(vec4f(0.0, 0.0, 0.0, falloff));
+}
+`;
+const RESET_OPACITY_GLSL = /* glsl */`
+uniform vec4 uPaintSphere;
+uniform float uHardness;
+uniform int   uSelectionConstraint;
+
+void process() {
+    vec3 center = getCenter();
+    float dist = distance(center, uPaintSphere.xyz);
+    if (dist >= uPaintSphere.w) { writeCustomOpacity(vec4(0.0, 0.0, 0.0, 0.0)); return; }
+    float sel = loadCustomSelection().r;
+    if (uSelectionConstraint == 1 && sel > 0.5) { writeCustomOpacity(vec4(0.0, 0.0, 0.0, 0.0)); return; }
+    if (uSelectionConstraint == 2 && sel <= 0.5) { writeCustomOpacity(vec4(0.0, 0.0, 0.0, 0.0)); return; }
+    float t = 1.0 - dist / uPaintSphere.w;
+    float falloff = (uHardness >= 1.0) ? 1.0 : smoothstep(0.0, max(0.001, 1.0 - uHardness), t);
+    writeCustomOpacity(vec4(0.0, 0.0, 0.0, falloff));
+}
+`;
+const RESET_OPACITY_WGSL = /* wgsl */`
+uniform uPaintSphere: vec4f;
+uniform uHardness: f32;
+uniform uSelectionConstraint: i32;
+
+fn process() {
+    let center = getCenter();
+    let dist = distance(center, uniform.uPaintSphere.xyz);
+    if dist >= uniform.uPaintSphere.w { writeCustomOpacity(vec4f(0.0, 0.0, 0.0, 0.0)); return; }
+    let sel = loadCustomSelection().r;
+    if uniform.uSelectionConstraint == 1 && sel > 0.5 { writeCustomOpacity(vec4f(0.0, 0.0, 0.0, 0.0)); return; }
+    if uniform.uSelectionConstraint == 2 && sel <= 0.5 { writeCustomOpacity(vec4f(0.0, 0.0, 0.0, 0.0)); return; }
+    let t = 1.0 - dist / uniform.uPaintSphere.w;
+    let falloff = select(smoothstep(0.0, max(0.001, 1.0 - uniform.uHardness), t), 1.0, uniform.uHardness >= 1.0);
+    writeCustomOpacity(vec4f(0.0, 0.0, 0.0, falloff));
+}
+`;
+
+// ── Shader: paint bucket (fill selected splats; blend mode applied in modifier) ─
+const PAINT_BUCKET_GLSL = /* glsl */`
+uniform vec4 uBucketColor;
+
+void process() {
+    if (loadCustomSelection().r <= 0.5) { writeCustomColor(vec4(0.0)); return; }
+    writeCustomColor(vec4(uBucketColor.rgb, uBucketColor.a));
+}
+`;
+const PAINT_BUCKET_WGSL = /* wgsl */`
+uniform uBucketColor: vec4f;
+
+fn process() {
+    if loadCustomSelection().r <= 0.5 { writeCustomColor(vec4f(0.0)); return; }
+    writeCustomColor(vec4f(
+        uniform.uBucketColor.r,
+        uniform.uBucketColor.g,
+        uniform.uBucketColor.b,
+        uniform.uBucketColor.a
+    ));
+}
+`;
+
+// ── Shader: work-buffer modifier ─────────────────────────────────────────────
+// Blends paint color and erase opacity into every rendered splat each frame.
+// Also overlays a tint on selected splats (see selection highlight).
+const MODIFIER_GLSL = /* glsl */`
+uniform int  uBlendMode;        // 0=Normal 1=Multiply 2=Lighten 3=Darken
+uniform int  uShowSelection;
+uniform vec4 uSelectionColor;  // rgb = highlight color, a = intensity (0-1)
+uniform int  uSplatMode;        // 0=off 1=centers (cyan dots) 2=rings (colored rim stroke) — see gsplatPS patch
+uniform vec4 uHoverSphere;      // xyz = model-space center, w = radius (0 = off)
+uniform vec4 uHoverColor;       // rgb = tint, a = strength
+
+// Per-layer color grade (viewport; baked on export / Bake to model)
+uniform vec4 uGradeBasicA;      // exposure (EV), contrast, blackPoint, whitePoint
+uniform vec4 uGradeBasicB;      // saturation, temperature (blue-yellow), tint (green-magenta), _
+uniform vec3 uGradeWheelSh;
+uniform vec3 uGradeWheelMd;
+uniform vec3 uGradeWheelHi;
+uniform vec4 uGradeCross;       // luminance split thresholds for shadow / mid / highlight
+uniform int  uGradeSelectedOnly; // 1 = apply grade only to splats in customSelection
+uniform vec3 uGradeSec0;
+uniform vec3 uGradeSec1;
+uniform vec3 uGradeSec2;
+uniform vec3 uGradeSec3;
+uniform vec3 uGradeSec4;
+uniform vec3 uGradeSec5;
+uniform vec3 uGradeSec6;
+uniform vec3 uGradeSec7;
+uniform float uLayerOpacity;    // 0–1, multiplies final splat alpha (layer / base display)
+
+void modifySplatCenter(inout vec3 center) {}
+void modifySplatRotationScale(vec3 oc, vec3 mc, inout vec4 rotation, inout vec3 scale) {
+    // Splat view overlay (cyan center dots + ring strokes) is done in gsplatPS patch.
+}
+
+vec3 sp_rgb2hsv(vec3 c) {
+    vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+vec3 sp_hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+vec3 sp_grade_sectors(vec3 rgb) {
+    vec3 hsv = sp_rgb2hsv(clamp(rgb, 0.0, 1.0));
+    float fsec = hsv.x * 8.0;
+    vec3 adj = uGradeSec0;
+    if (fsec >= 1.0) adj = uGradeSec1;
+    if (fsec >= 2.0) adj = uGradeSec2;
+    if (fsec >= 3.0) adj = uGradeSec3;
+    if (fsec >= 4.0) adj = uGradeSec4;
+    if (fsec >= 5.0) adj = uGradeSec5;
+    if (fsec >= 6.0) adj = uGradeSec6;
+    if (fsec >= 7.0) adj = uGradeSec7;
+    hsv.x = fract(hsv.x + adj.x);
+    hsv.y = clamp(hsv.y * (1.0 + adj.y), 0.0, 1.0);
+    hsv.z = clamp(hsv.z + adj.z, 0.0, 1.0);
+    return sp_hsv2rgb(hsv);
+}
+
+vec3 sp_color_grade(vec3 col, float Lsplit) {
+    vec3 g = col * exp2(uGradeBasicA.x);
+    float bp = uGradeBasicA.z;
+    float wp = max(uGradeBasicA.w, bp + 1e-4);
+    g = (g - bp) / max(wp - bp, 1e-4);
+    g = (g - 0.5) * uGradeBasicA.y + 0.5;
+    g = clamp(g, 0.0, 1.0);
+    g = sp_grade_sectors(g);
+    float lu = dot(g, vec3(0.2126, 0.7152, 0.0722));
+    g = mix(vec3(lu), g, clamp(uGradeBasicB.x, 0.0, 4.0));
+    g.r += uGradeBasicB.y * 0.14;
+    g.b -= uGradeBasicB.y * 0.14;
+    g.r += uGradeBasicB.z * 0.10;
+    g.g -= uGradeBasicB.z * 0.10;
+    float sw = 1.0 - smoothstep(uGradeCross.x, uGradeCross.y, Lsplit);
+    float mw = smoothstep(uGradeCross.x, uGradeCross.y, Lsplit) * (1.0 - smoothstep(uGradeCross.z, uGradeCross.w, Lsplit));
+    float hw = smoothstep(uGradeCross.z, uGradeCross.w, Lsplit);
+    g += uGradeWheelSh * sw + uGradeWheelMd * mw + uGradeWheelHi * hw;
+    return clamp(g, 0.0, 1.0);
+}
+
+void modifySplatColor(vec3 center, inout vec4 color) {
+    // Paint colour blend
+    vec4 c = loadCustomColor();
+    if (c.a > 0.0) {
+        if      (uBlendMode == 1) color.rgb = mix(color.rgb, color.rgb * c.rgb, c.a);
+        else if (uBlendMode == 2) color.rgb = mix(color.rgb, max(color.rgb, c.rgb), c.a);
+        else if (uBlendMode == 3) color.rgb = mix(color.rgb, min(color.rgb, c.rgb), c.a);
+        else                      color.rgb = mix(color.rgb, c.rgb, c.a);
+    }
+
+    // Erase opacity
+    vec4 e = loadCustomOpacity();
+    if (e.a > 0.0) {
+        color.a = max(0.0, color.a * (1.0 - clamp(e.a, 0.0, 1.0)));
+    }
+
+    // Brush hover preview: tint splats inside the hover sphere
+    if (uHoverSphere.w > 0.0) {
+        float nd = length(center - uHoverSphere.xyz) / uHoverSphere.w;
+        if (nd < 1.0) {
+            float f = clamp((1.0 - nd) * uHoverColor.a, 0.0, 1.0);
+            color.rgb = mix(color.rgb, uHoverColor.rgb, f);
+            color.a   = max(color.a, f * 0.4);
+        }
+    }
+
+    vec3 pre = color.rgb;
+    float Lsplit = clamp(dot(pre, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+    bool applyGrade = (uGradeSelectedOnly == 0);
+    if (uGradeSelectedOnly != 0) {
+        vec4 selG = loadCustomSelection();
+        applyGrade = (selG.r > 0.5);
+    }
+    if (applyGrade) color.rgb = sp_color_grade(pre, Lsplit);
+    else color.rgb = pre;
+
+    // Selection highlight (after grade)
+    if (uShowSelection > 0) {
+        vec4 sel = loadCustomSelection();
+        if (sel.r > 0.5) {
+            color.rgb = mix(color.rgb, uSelectionColor.rgb, uSelectionColor.a);
+        }
+    }
+
+    color.a *= clamp(uLayerOpacity, 0.0, 1.0);
+}
+`;
+
+const MODIFIER_WGSL = /* wgsl */`
+uniform uBlendMode:     i32;
+uniform uShowSelection: i32;
+uniform uSelectionColor: vec4f;
+uniform uSplatMode:     i32;
+uniform uHoverSphere:   vec4f;
+uniform uHoverColor:    vec4f;
+uniform uGradeBasicA: vec4f;
+uniform uGradeBasicB: vec4f;
+uniform uGradeWheelSh: vec3f;
+uniform uGradeWheelMd: vec3f;
+uniform uGradeWheelHi: vec3f;
+uniform uGradeCross: vec4f;
+uniform uGradeSelectedOnly: i32;
+uniform uGradeSec0: vec3f;
+uniform uGradeSec1: vec3f;
+uniform uGradeSec2: vec3f;
+uniform uGradeSec3: vec3f;
+uniform uGradeSec4: vec3f;
+uniform uGradeSec5: vec3f;
+uniform uGradeSec6: vec3f;
+uniform uGradeSec7: vec3f;
+uniform uLayerOpacity: f32;
+
+fn sp_rgb2hsv(c: vec3f) -> vec3f {
+    let K = vec4f(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    let p = mix(vec4f(c.b, c.g, K.w, K.z), vec4f(c.g, c.b, K.x, K.y), step(c.b, c.g));
+    let q = mix(vec4f(p.x, p.y, p.w, c.r), vec4f(c.r, p.y, p.z, p.x), step(p.x, c.r));
+    let d = q.x - min(q.w, q.y);
+    let e = 1.0e-10;
+    return vec3f(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+fn sp_hsv2rgb(c: vec3f) -> vec3f {
+    let K = vec4f(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, vec3f(0.0), vec3f(1.0)), c.y);
+}
+
+fn sp_grade_sectors(rgb: vec3f) -> vec3f {
+    var hsv = sp_rgb2hsv(clamp(rgb, vec3f(0.0), vec3f(1.0)));
+    let fsec = hsv.x * 8.0;
+    var adj = uniform.uGradeSec0;
+    if fsec >= 1.0 { adj = uniform.uGradeSec1; }
+    if fsec >= 2.0 { adj = uniform.uGradeSec2; }
+    if fsec >= 3.0 { adj = uniform.uGradeSec3; }
+    if fsec >= 4.0 { adj = uniform.uGradeSec4; }
+    if fsec >= 5.0 { adj = uniform.uGradeSec5; }
+    if fsec >= 6.0 { adj = uniform.uGradeSec6; }
+    if fsec >= 7.0 { adj = uniform.uGradeSec7; }
+    hsv.x = fract(hsv.x + adj.x);
+    hsv.y = clamp(hsv.y * (1.0 + adj.y), 0.0, 1.0);
+    hsv.z = clamp(hsv.z + adj.z, 0.0, 1.0);
+    return sp_hsv2rgb(hsv);
+}
+
+fn sp_color_grade(col: vec3f, Lsplit: f32) -> vec3f {
+    var g = col * exp2(uniform.uGradeBasicA.x);
+    let bp = uniform.uGradeBasicA.z;
+    let wp = max(uniform.uGradeBasicA.w, bp + 1e-4);
+    g = (g - bp) / max(wp - bp, 1e-4);
+    g = (g - 0.5) * uniform.uGradeBasicA.y + 0.5;
+    g = clamp(g, vec3f(0.0), vec3f(1.0));
+    g = sp_grade_sectors(g);
+    let lu = dot(g, vec3f(0.2126, 0.7152, 0.0722));
+    g = mix(vec3f(lu), g, clamp(uniform.uGradeBasicB.x, 0.0, 4.0));
+    g.x += uniform.uGradeBasicB.y * 0.14;
+    g.z -= uniform.uGradeBasicB.y * 0.14;
+    g.x += uniform.uGradeBasicB.z * 0.10;
+    g.y -= uniform.uGradeBasicB.z * 0.10;
+    let sw = 1.0 - smoothstep(uniform.uGradeCross.x, uniform.uGradeCross.y, Lsplit);
+    let mw = smoothstep(uniform.uGradeCross.x, uniform.uGradeCross.y, Lsplit) * (1.0 - smoothstep(uniform.uGradeCross.z, uniform.uGradeCross.w, Lsplit));
+    let hw = smoothstep(uniform.uGradeCross.z, uniform.uGradeCross.w, Lsplit);
+    g += uniform.uGradeWheelSh * sw + uniform.uGradeWheelMd * mw + uniform.uGradeWheelHi * hw;
+    return clamp(g, vec3f(0.0), vec3f(1.0));
+}
+
+fn modifySplatCenter(center: ptr<function, vec3f>) {}
+fn modifySplatRotationScale(oc: vec3f, mc: vec3f, rotation: ptr<function, vec4f>, scale: ptr<function, vec3f>) {
+}
+fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
+    let c = loadCustomColor();
+    if c.a > 0.0 {
+        if uniform.uBlendMode == 1 {
+            (*color).r = mix((*color).r, (*color).r * c.r, c.a);
+            (*color).g = mix((*color).g, (*color).g * c.g, c.a);
+            (*color).b = mix((*color).b, (*color).b * c.b, c.a);
+        } else if uniform.uBlendMode == 2 {
+            (*color).r = mix((*color).r, max((*color).r, c.r), c.a);
+            (*color).g = mix((*color).g, max((*color).g, c.g), c.a);
+            (*color).b = mix((*color).b, max((*color).b, c.b), c.a);
+        } else if uniform.uBlendMode == 3 {
+            (*color).r = mix((*color).r, min((*color).r, c.r), c.a);
+            (*color).g = mix((*color).g, min((*color).g, c.g), c.a);
+            (*color).b = mix((*color).b, min((*color).b, c.b), c.a);
+        } else {
+            (*color).r = mix((*color).r, c.r, c.a);
+            (*color).g = mix((*color).g, c.g, c.a);
+            (*color).b = mix((*color).b, c.b, c.a);
+        }
+    }
+    let e = loadCustomOpacity();
+    if e.a > 0.0 {
+        (*color).a = max(0.0, (*color).a * (1.0 - clamp(e.a, 0.0, 1.0)));
+    }
+    // Brush hover preview
+    if uniform.uHoverSphere.w > 0.0 {
+        let nd = length(center - uniform.uHoverSphere.xyz) / uniform.uHoverSphere.w;
+        if nd < 1.0 {
+            let f = clamp((1.0 - nd) * uniform.uHoverColor.a, 0.0, 1.0);
+            (*color).r = mix((*color).r, uniform.uHoverColor.r, f);
+            (*color).g = mix((*color).g, uniform.uHoverColor.g, f);
+            (*color).b = mix((*color).b, uniform.uHoverColor.b, f);
+            (*color).a = max((*color).a, f * 0.4);
+        }
+    }
+    let pre = vec3f((*color).r, (*color).g, (*color).b);
+    let Lsplit = clamp(dot(pre, vec3f(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+    var applyGrade = uniform.uGradeSelectedOnly == 0;
+    if uniform.uGradeSelectedOnly != 0 {
+        let selG = loadCustomSelection();
+        applyGrade = selG.r > 0.5;
+    }
+    let gradedFull = sp_color_grade(pre, Lsplit);
+    let graded = select(pre, gradedFull, applyGrade);
+    (*color).r = graded.x;
+    (*color).g = graded.y;
+    (*color).b = graded.z;
+    if uniform.uShowSelection > 0 {
+        let sel = loadCustomSelection();
+        if sel.r > 0.5 {
+            (*color).r = mix((*color).r, uniform.uSelectionColor.r, uniform.uSelectionColor.a);
+            (*color).g = mix((*color).g, uniform.uSelectionColor.g, uniform.uSelectionColor.a);
+            (*color).b = mix((*color).b, uniform.uSelectionColor.b, uniform.uSelectionColor.a);
+        }
+    }
+    (*color).a *= clamp(uniform.uLayerOpacity, 0.0, 1.0);
+}
+`;
+
+/** Ring stroke width in splat UV radius units (0 = center, 1 = ellipse edge). */
+const SPLAT_VIEW_RING_THICKNESS = 0.022;
+
+/**
+ * Patch engine `gsplatPS` for SuperSplat-style splat view:
+ * mode 1 = normal gaussian fill + sharp cyan center dots; mode 2 = fill + per-splat RGB rim stroke.
+ */
+const installGsplatSplatViewFragmentShaderPatch = (gfxDevice) => {
+    const tag = '// photoshock: gsplat view';
+
+    // ── GLSL ──────────────────────────────────────────────────────────────
+    const glslMap = pc.ShaderChunks.get(gfxDevice, pc.SHADERLANGUAGE_GLSL ?? 'glsl');
+    if (!glslMap?.get) {
+        console.warn('[photoshock] ShaderChunks GLSL map unavailable');
+        return;
+    }
+    const glsl = glslMap.get('gsplatPS');
+    if (!glsl) {
+        console.warn('[photoshock] gsplatPS GLSL chunk not found');
+    } else if (glsl.includes(tag)) {
+        console.log('[photoshock] gsplatPS GLSL already patched');
+    } else {
+        const inj = 'varying mediump vec4 gaussianColor;';
+        if (!glsl.includes(inj)) {
+            console.warn('[photoshock] gsplatPS GLSL: injection point not found');
+        } else {
+            let code = glsl.replace(
+                inj,
+                `${inj}\nuniform int uSplatMode;\nuniform float uSplatRingThickness;\n${tag}`,
+            );
+
+            // Match the forward rendering block after all the special passes.
+            // Use a regex to be whitespace-resilient.
+            const forwardRe = /#else\s+if\s*\(\s*alpha\s*<\s*1\.0\s*\/\s*255\.0\s*\)\s*\{\s*discard;\s*\}\s*#ifndef\s+DITHER_NONE\s+opacityDither\(\s*alpha\s*,\s*id\s*\*\s*0\.013\s*\);\s*#endif\s+gl_FragColor\s*=\s*vec4\(\s*gaussianColor\.xyz\s*\*\s*alpha\s*,\s*alpha\s*\);\s*#endif/;
+
+            if (forwardRe.test(code)) {
+                code = code.replace(forwardRe,
+`#else
+\tif (uSplatMode != 0) {
+\t\tmediump vec3 rgb = gaussianColor.rgb;
+\t\tmediump float ne = normExp(A);
+\t\tmediump float ba = ne * gaussianColor.a;
+\t\tmediump vec3 basePm = rgb * ba;
+\t\tif (uSplatMode == 2 && uSplatRingThickness > 0.0) {
+\t\t\tmediump float edge = sqrt(max(A, 1e-8));
+\t\t\tmediump float t = clamp(uSplatRingThickness, 0.005, 0.1);
+\t\t\tmediump float lo = max(0.05, 1.0 - t);
+\t\t\tmediump float ringMask = smoothstep(lo - t * 0.06, lo, edge) * (1.0 - smoothstep(1.0 - 0.0004, 1.0 + t * 0.028, edge));
+\t\t\tmediump float rimA = ringMask * 0.98;
+\t\t\tgl_FragColor = vec4(basePm + rgb * rimA * 1.65, max(ba, rimA));
+\t\t} else if (uSplatMode == 1) {
+\t\t\tconst mediump vec3 SPLAT_CENTER_CYAN = vec3(0.18, 0.74, 1.0);
+\t\t\tconst mediump float centerRad2 = 0.0028;
+\t\t\tmediump float c = 1.0 - smoothstep(0.0, centerRad2, A);
+\t\t\tc = c * c * c;
+\t\t\tmediump float dotA = c * 0.99;
+\t\t\tgl_FragColor = vec4(basePm + SPLAT_CENTER_CYAN * dotA * 2.15, max(ba, dotA));
+\t\t} else {
+\t\t\tgl_FragColor = vec4(basePm, ba);
+\t\t}
+\t\tif (gl_FragColor.a < 1.0 / 255.0) { discard; }
+\t} else {
+\t\tif (alpha < 1.0 / 255.0) { discard; }
+\t\t#ifndef DITHER_NONE
+\t\t\topacityDither(alpha, id * 0.013);
+\t\t#endif
+\t\tgl_FragColor = vec4(gaussianColor.xyz * alpha, alpha);
+\t}
+#endif`);
+                glslMap.set('gsplatPS', code);
+                console.log('[photoshock] gsplatPS GLSL patched OK');
+            } else {
+                console.warn('[photoshock] gsplatPS GLSL: forward block regex did not match');
+                console.warn('[photoshock] chunk tail:', glsl.slice(-300));
+            }
+        }
+    }
+
+    // ── WGSL ──────────────────────────────────────────────────────────────
+    const wgslMap = pc.ShaderChunks.get(gfxDevice, pc.SHADERLANGUAGE_WGSL ?? 'wgsl');
+    if (!wgslMap?.get) return;
+
+    const wgsl = wgslMap.get('gsplatPS');
+    if (!wgsl) {
+        console.warn('[photoshock] gsplatPS WGSL chunk not found');
+    } else if (wgsl.includes(tag)) {
+        console.log('[photoshock] gsplatPS WGSL already patched');
+    } else {
+        const winj = 'varying gaussianColor: vec4f;';
+        if (!wgsl.includes(winj)) {
+            console.warn('[photoshock] gsplatPS WGSL: injection point not found');
+        } else {
+            let code = wgsl.replace(
+                winj,
+                `${winj}\nuniform uSplatMode: i32;\nuniform uSplatRingThickness: f32;\n${tag}`,
+            );
+
+            const wgslForwardRe = /#else\s+if\s*\(\s*alpha\s*<\s*\(?\s*1\.0\s*\/\s*255\.0\s*\)?\s*\)\s*\{\s*discard;\s*return\s+output;\s*\}\s*#ifndef\s+DITHER_NONE\s+opacityDither\(\s*&alpha\s*,\s*id\s*\*\s*0\.013\s*\);\s*#endif\s+output\.color\s*=\s*vec4f\(\s*input\.gaussianColor\.xyz\s*\*\s*alpha\s*,\s*alpha\s*\);\s*#endif/;
+
+            if (wgslForwardRe.test(code)) {
+                code = code.replace(wgslForwardRe,
+`#else
+\tif (uniform.uSplatMode != 0) {
+\t\tlet rgb = gaussianColor.xyz;
+\t\tlet ne = normExp(A);
+\t\tlet ba = ne * gaussianColor.a;
+\t\tlet basePm = rgb * ba;
+\t\tif (uniform.uSplatMode == 2 && uniform.uSplatRingThickness > 0.0) {
+\t\t\tlet edge = sqrt(max(A, 1e-8));
+\t\t\tlet t = clamp(uniform.uSplatRingThickness, 0.005, 0.1);
+\t\t\tlet lo = max(0.05, 1.0 - t);
+\t\t\tlet ringMask = smoothstep(lo - t * 0.06, lo, edge) * (1.0 - smoothstep(1.0 - 0.0004, 1.0 + t * 0.028, edge));
+\t\t\tlet rimA = ringMask * 0.98;
+\t\t\toutput.color = vec4f(basePm + rgb * rimA * 1.65, max(ba, rimA));
+\t\t} else if (uniform.uSplatMode == 1) {
+\t\t\tlet SPLAT_CENTER_CYAN = vec3f(0.18, 0.74, 1.0);
+\t\t\tlet centerRad2 = 0.0028;
+\t\t\tvar c = 1.0 - smoothstep(0.0, centerRad2, A);
+\t\t\tc = c * c * c;
+\t\t\tlet dotA = c * 0.99;
+\t\t\toutput.color = vec4f(basePm + SPLAT_CENTER_CYAN * dotA * 2.15, max(ba, dotA));
+\t\t} else {
+\t\t\toutput.color = vec4f(basePm, ba);
+\t\t}
+\t\tif (output.color.a < (1.0 / 255.0)) { discard; return output; }
+\t} else {
+\t\tif (alpha < (1.0 / 255.0)) { discard; return output; }
+\t\t#ifndef DITHER_NONE
+\t\t\topacityDither(&alpha, id * 0.013);
+\t\t#endif
+\t\toutput.color = vec4f(input.gaussianColor.xyz * alpha, alpha);
+\t}
+#endif`);
+                wgslMap.set('gsplatPS', code);
+                console.log('[photoshock] gsplatPS WGSL patched OK');
+            } else {
+                console.warn('[photoshock] gsplatPS WGSL: forward block regex did not match');
+                console.warn('[photoshock] wgsl chunk tail:', wgsl.slice(-300));
+            }
+        }
+    }
+};
+
+// ── PlayCanvas app ────────────────────────────────────────────────────────────
+const canvas = document.getElementById('application-canvas');
+
+const device = await pc.createGraphicsDevice(canvas, {
+    deviceTypes: [pc.DEVICETYPE_WEBGPU, pc.DEVICETYPE_WEBGL2],
+    antialias: false,
+});
+
+const appOptions = new pc.AppOptions();
+appOptions.graphicsDevice = device;
+appOptions.mouse = new pc.Mouse(canvas);
+appOptions.touch = new pc.TouchDevice(canvas);
+appOptions.componentSystems = [
+    pc.RenderComponentSystem, pc.CameraComponentSystem, pc.GSplatComponentSystem,
+];
+appOptions.resourceHandlers = [
+    pc.TextureHandler, pc.ContainerHandler, pc.GSplatHandler,
+];
+
+const app = new pc.AppBase(canvas);
+app.init(appOptions);
+// Must run after app.init(): AppBase registers default ShaderChunks (including gsplatPS),
+// which would overwrite any earlier patch.
+installGsplatSplatViewFragmentShaderPatch(app.graphicsDevice);
+app.setCanvasFillMode(pc.FILLMODE_NONE);
+app.setCanvasResolution(pc.RESOLUTION_AUTO);
+
+const canvasContainer = document.getElementById('canvas-container');
+
+const isSplatDropFile = (name) => {
+    const lower = (name || '').toLowerCase();
+    return lower.endsWith('.sog') || lower.endsWith('.ply') || lower.endsWith('.compressed.ply');
+};
+
+/** SOG bundles default to GPU-compressed data; Photoshock needs full GSplatData for paint/export/CPU layers. */
+const gsplatAssetDataForFilename = (filename) => {
+    if ((filename || '').toLowerCase().endsWith('.sog')) return { decompress: true };
+    return {};
+};
+
+/** CPU-side splat table: SOG uses async decompress(); compressed PLY is sync. */
+const resolveGsplatCpuData = async (rawData) => {
+    if (!rawData) return null;
+    if (typeof rawData.decompress !== 'function') return rawData;
+    const d = rawData.decompress();
+    return d && typeof d.then === 'function' ? await d : d;
+};
+['dragenter', 'dragover'].forEach((ev) => {
+    canvasContainer.addEventListener(ev, (e) => {
+        if (![...e.dataTransfer.types].includes('Files')) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+        canvasContainer.classList.add('file-drop-target');
+    });
+});
+canvasContainer.addEventListener('dragleave', (e) => {
+    const rel = e.relatedTarget;
+    if (rel && canvasContainer.contains(rel)) return;
+    canvasContainer.classList.remove('file-drop-target');
+});
+canvasContainer.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    canvasContainer.classList.remove('file-drop-target');
+    const files = [...e.dataTransfer.files].filter((f) => isSplatDropFile(f.name));
+    if (!files.length) return;
+    for (const file of files) {
+        try {
+            if (e.shiftKey) await loadSplat(file);
+            else await importSplatAsLayer(file);
+        } catch (err) {
+            console.error('[drop]', file.name, err);
+        }
+    }
+});
+
+const resizeCanvasToContainer = () => {
+    const w = Math.max(1, canvasContainer.clientWidth);
+    const h = Math.max(1, canvasContainer.clientHeight);
+    app.resizeCanvas(w, h);
+};
+
+const LS_RIGHT_PANEL_W = 'photoshock-right-panel-width';
+const clampRightPanelWidthPx = (w) => {
+    const min = 160;
+    const max = Math.min(560, window.innerWidth * 0.92);
+    return Math.max(min, Math.min(max, Math.round(w)));
+};
+const applyRightPanelWidth = (wPx, persist) => {
+    const clamped = clampRightPanelWidthPx(wPx);
+    document.documentElement.style.setProperty('--right-panel-width', `${clamped}px`);
+    if (persist) {
+        try { localStorage.setItem(LS_RIGHT_PANEL_W, String(clamped)); } catch (_) {}
+    }
+    resizeCanvasToContainer();
+};
+
+window.addEventListener('resize', () => {
+    const rp = document.getElementById('right-panel');
+    if (rp) {
+        const w = rp.getBoundingClientRect().width;
+        const c = clampRightPanelWidthPx(w);
+        if (c !== w) document.documentElement.style.setProperty('--right-panel-width', `${c}px`);
+    }
+    resizeCanvasToContainer();
+});
+// Defer initial resize so flex layout has computed; restore saved panel width
+requestAnimationFrame(() => {
+    try {
+        const saved = parseInt(localStorage.getItem(LS_RIGHT_PANEL_W), 10);
+        if (Number.isFinite(saved)) applyRightPanelWidth(saved, false);
+    } catch (_) {}
+    resizeCanvasToContainer();
+});
+
+// ── Camera & orbit ────────────────────────────────────────────────────────────
+const cameraEntity = new pc.Entity('camera');
+cameraEntity.addComponent('camera', {
+    clearColor: new pc.Color(36 / 255, 37 / 255, 43 / 255),
+    farClip: 100, nearClip: 0.01,
+    fov: 60,
+});
+app.root.addChild(cameraEntity);
+
+const orbit = { yaw: 0, pitch: -10, distance: 3, target: new pc.Vec3() };
+let cameraResetState = { target: new pc.Vec3(), distance: 3, yaw: 0, pitch: -15 };
+/** Free-fly position when not orbiting; yaw/pitch match orbit convention for continuity. */
+const flyCam = { pos: new pc.Vec3(), yaw: 0, pitch: -10 };
+let flyCamResetState = { pos: new pc.Vec3(), yaw: 0, pitch: -15 };
+
+const LS_CAMERA_NAV = 'photoshock-camera-nav';
+/** @type {'orbit' | 'fly'} */
+let cameraNavMode = 'orbit';
+
+const _camFwdScratch = new pc.Vec3();
+
+const getForwardFromYawPitch = (yawDeg, pitchDeg, out) => {
+    const yr = (yawDeg * Math.PI) / 180;
+    const pr = (pitchDeg * Math.PI) / 180;
+    out.set(
+        -Math.sin(yr) * Math.cos(pr),
+        -Math.sin(pr),
+        -Math.cos(yr) * Math.cos(pr),
+    );
+    return out;
+};
+
+const getDefaultPickDepth = () => {
+    if (cameraNavMode === 'orbit') return orbit.distance;
+    return Math.max(0.35, orbit.distance);
+};
+
+// WASD + QE camera movement (when cursor tool active)
+const keysNav = { w: false, a: false, s: false, d: false, q: false, e: false };
+const NAV_SPEED = 1.5;
+
+const syncFlyCamFromOrbitParams = () => {
+    const yr = (orbit.yaw * Math.PI) / 180;
+    const pr = (orbit.pitch * Math.PI) / 180;
+    flyCam.pos.set(
+        orbit.target.x + orbit.distance * Math.sin(yr) * Math.cos(pr),
+        orbit.target.y + orbit.distance * Math.sin(pr),
+        orbit.target.z + orbit.distance * Math.cos(yr) * Math.cos(pr),
+    );
+    flyCam.yaw = orbit.yaw;
+    flyCam.pitch = orbit.pitch;
+};
+
+const updateCamera = () => {
+    if (cameraNavMode === 'orbit') {
+        const yr = (orbit.yaw * Math.PI) / 180;
+        const pr = (orbit.pitch * Math.PI) / 180;
+        cameraEntity.setLocalPosition(
+            orbit.target.x + orbit.distance * Math.sin(yr) * Math.cos(pr),
+            orbit.target.y + orbit.distance * Math.sin(pr),
+            orbit.target.z + orbit.distance * Math.cos(yr) * Math.cos(pr),
+        );
+        cameraEntity.lookAt(orbit.target);
+    } else {
+        getForwardFromYawPitch(flyCam.yaw, flyCam.pitch, _camFwdScratch);
+        cameraEntity.setPosition(flyCam.pos);
+        cameraEntity.lookAt(
+            flyCam.pos.x + _camFwdScratch.x,
+            flyCam.pos.y + _camFwdScratch.y,
+            flyCam.pos.z + _camFwdScratch.z,
+        );
+    }
+};
+updateCamera();
+app.start();
+
+// ── World XZ reference grid (Blender-style: minor 1 · major 10 · X red / Z blue · distance fade) ─
+const LS_VIEWPORT_GRID = 'photoshock-viewport-grid';
+let viewportGridVisible = false;
+try {
+    if (localStorage.getItem(LS_VIEWPORT_GRID) === '1') viewportGridVisible = true;
+} catch (_) { /* ignore */ }
+
+const VIEWPORT_GRID_HALF = 100;
+const VIEWPORT_GRID_MAJOR = 10;
+
+const GRID_FADE_NEAR = 4;
+const GRID_FADE_RANGE = 78;
+const GRID_FADE_MIN = 0.04;
+
+const GRID_EMISSIVE_CHUNK_GLSL = /* glsl */ `
+uniform vec3 material_emissive;
+uniform float material_emissiveIntensity;
+void getEmission() {
+    float dist = distance(vPositionW, view_position);
+    float fade = clamp(1.0 - (dist - ${GRID_FADE_NEAR}.0) / ${GRID_FADE_RANGE}.0, ${GRID_FADE_MIN}, 1.0);
+    dEmission = material_emissive * material_emissiveIntensity * fade;
+}
+`;
+const GRID_EMISSIVE_CHUNK_WGSL = /* wgsl */ `
+uniform material_emissive: vec3f;
+uniform material_emissiveIntensity: f32;
+fn getEmission() {
+    let dist = length(vPositionW - uniform.view_position);
+    let fade = clamp(1.0 - (dist - ${GRID_FADE_NEAR}.0) / ${GRID_FADE_RANGE}.0, ${GRID_FADE_MIN}, 1.0);
+    dEmission = uniform.material_emissive * uniform.material_emissiveIntensity * fade;
+}
+`;
+
+const makeViewportGridLineMaterial = (r, g, b) => {
+    const mat = new pc.StandardMaterial();
+    mat.diffuse = new pc.Color(0, 0, 0);
+    mat.specular = new pc.Color(0, 0, 0);
+    mat.emissive = new pc.Color(r, g, b);
+    mat.emissiveIntensity = 1;
+    mat.useLighting = false;
+    mat.shaderChunksVersion = '2.16';
+    mat.getShaderChunks(pc.SHADERLANGUAGE_GLSL).set('emissivePS', GRID_EMISSIVE_CHUNK_GLSL);
+    mat.getShaderChunks(pc.SHADERLANGUAGE_WGSL).set('emissivePS', GRID_EMISSIVE_CHUNK_WGSL);
+    mat.update();
+    return mat;
+};
+
+const buildGridMinorPositions = (h, major) => {
+    const pos = [];
+    for (let z = -h; z <= h; z++) {
+        if (z % major === 0) continue;
+        pos.push(-h, 0, z, h, 0, z);
+    }
+    for (let x = -h; x <= h; x++) {
+        if (x % major === 0) continue;
+        pos.push(x, 0, -h, x, 0, h);
+    }
+    return new Float32Array(pos);
+};
+
+const buildGridMajorPositions = (h, major) => {
+    const pos = [];
+    for (let z = -h; z <= h; z += major) {
+        if (z === 0) continue;
+        pos.push(-h, 0, z, h, 0, z);
+    }
+    for (let x = -h; x <= h; x += major) {
+        if (x === 0) continue;
+        pos.push(x, 0, -h, x, 0, h);
+    }
+    return new Float32Array(pos);
+};
+
+const meshFromLinePositions = (positions) => {
+    const mesh = new pc.Mesh(device);
+    mesh.setPositions(positions);
+    mesh.update(pc.PRIMITIVE_LINES);
+    return mesh;
+};
+
+const viewportGridMinorMat = makeViewportGridLineMaterial(0.11, 0.11, 0.12);
+const viewportGridMajorMat = makeViewportGridLineMaterial(0.62, 0.62, 0.66);
+const viewportGridAxisXMat = makeViewportGridLineMaterial(0.92, 0.18, 0.14);
+const viewportGridAxisZMat = makeViewportGridLineMaterial(0.22, 0.48, 1.0);
+const shapePreviewLineMat = makeViewportGridLineMaterial(0.28, 0.62, 1.0);
+shapePreviewLineMat.depthTest = true;
+shapePreviewLineMat.depthWrite = true;
+shapePreviewLineMat.update();
+
+const shapePreviewFillMat = new pc.StandardMaterial();
+shapePreviewFillMat.diffuse = new pc.Color(0.18, 0.48, 0.95);
+shapePreviewFillMat.emissive = new pc.Color(0.06, 0.14, 0.28);
+shapePreviewFillMat.emissiveIntensity = 0.55;
+shapePreviewFillMat.opacity = 0.3;
+shapePreviewFillMat.blendType = pc.BLEND_NORMAL;
+shapePreviewFillMat.useLighting = false;
+shapePreviewFillMat.depthWrite = false;
+shapePreviewFillMat.depthTest = true;
+shapePreviewFillMat.update();
+
+const hG = VIEWPORT_GRID_HALF;
+const maj = VIEWPORT_GRID_MAJOR;
+const gridMinorMesh = meshFromLinePositions(buildGridMinorPositions(hG, maj));
+const gridMajorMesh = meshFromLinePositions(buildGridMajorPositions(hG, maj));
+const gridAxisXMesh = meshFromLinePositions(new Float32Array([-hG, 0, 0, hG, 0, 0]));
+const gridAxisZMesh = meshFromLinePositions(new Float32Array([0, 0, -hG, 0, 0, hG]));
+
+const miGridMinor = new pc.MeshInstance(gridMinorMesh, viewportGridMinorMat);
+const miGridMajor = new pc.MeshInstance(gridMajorMesh, viewportGridMajorMat);
+const miGridAxisX = new pc.MeshInstance(gridAxisXMesh, viewportGridAxisXMat);
+const miGridAxisZ = new pc.MeshInstance(gridAxisZMesh, viewportGridAxisZMat);
+miGridMinor.drawOrder = 0;
+miGridMajor.drawOrder = 1;
+miGridAxisX.drawOrder = 2;
+miGridAxisZ.drawOrder = 2;
+
+const viewportGridEntity = new pc.Entity('viewportGrid');
+viewportGridEntity.addComponent('render', {
+    meshInstances: [miGridMinor, miGridMajor, miGridAxisX, miGridAxisZ],
+    castShadows: false,
+});
+viewportGridEntity.setLocalEulerAngles(0, 0, 0);
+viewportGridEntity.enabled = viewportGridVisible;
+app.root.addChild(viewportGridEntity);
+
+const updateViewportGridToggleButton = () => {
+    const btn = g('toggle-viewport-grid-btn');
+    if (!btn) return;
+    btn.classList.toggle('grid-shown', viewportGridVisible);
+};
+
+// Camera WASD + QE navigation (always active)
+const _navStep = new pc.Vec3();
+app.on('update', (dt) => {
+    const dtClamped = Math.min(dt, 0.1);
+    let moved = false;
+    const fwd = cameraEntity.forward;
+    const right = cameraEntity.right;
+    const fwdXZ = new pc.Vec3(fwd.x, 0, fwd.z);
+    const rightXZ = new pc.Vec3(right.x, 0, right.z);
+    if (fwdXZ.length() > 0.001) fwdXZ.normalize();
+    if (rightXZ.length() > 0.001) rightXZ.normalize();
+    if (cameraNavMode === 'orbit') {
+        const speed = NAV_SPEED * orbit.distance * 0.3 * dtClamped;
+        if (keysNav.w && fwdXZ.length() > 0.001) { _navStep.copy(fwdXZ).mulScalar(speed); orbit.target.add2(orbit.target, _navStep); moved = true; }
+        if (keysNav.s && fwdXZ.length() > 0.001) { _navStep.copy(fwdXZ).mulScalar(speed); orbit.target.sub2(orbit.target, _navStep); moved = true; }
+        if (keysNav.d && rightXZ.length() > 0.001) { _navStep.copy(rightXZ).mulScalar(speed); orbit.target.add2(orbit.target, _navStep); moved = true; }
+        if (keysNav.a && rightXZ.length() > 0.001) { _navStep.copy(rightXZ).mulScalar(speed); orbit.target.sub2(orbit.target, _navStep); moved = true; }
+        if (keysNav.q) { orbit.target.y += speed; moved = true; }
+        if (keysNav.e) { orbit.target.y -= speed; moved = true; }
+    } else {
+        const speed = NAV_SPEED * 0.45 * dtClamped;
+        if (keysNav.w && fwd.length() > 0.001) { _navStep.copy(fwd).normalize().mulScalar(speed); flyCam.pos.add(_navStep); moved = true; }
+        if (keysNav.s && fwd.length() > 0.001) { _navStep.copy(fwd).normalize().mulScalar(speed); flyCam.pos.sub(_navStep); moved = true; }
+        if (keysNav.d && right.length() > 0.001) { _navStep.copy(right).normalize().mulScalar(speed); flyCam.pos.add(_navStep); moved = true; }
+        if (keysNav.a && right.length() > 0.001) { _navStep.copy(right).normalize().mulScalar(speed); flyCam.pos.sub(_navStep); moved = true; }
+        if (keysNav.q) { flyCam.pos.y += speed; moved = true; }
+        if (keysNav.e) { flyCam.pos.y -= speed; moved = true; }
+    }
+    if (moved) updateCamera();
+    if (viewportGridEntity.enabled) {
+        if (cameraNavMode === 'orbit') {
+            viewportGridEntity.setPosition(orbit.target.x, orbit.target.y, orbit.target.z);
+        } else {
+            viewportGridEntity.setPosition(flyCam.pos.x, flyCam.pos.y, flyCam.pos.z);
+        }
+    }
+    // Shape preview (plan V1): Add-placed preview follows orbit.target (WASD pan, etc.).
+    if (activeTool === 'shapeLayer' && shapePreviewOrbitLock && shapePreviewRoot?.parent
+        && cameraNavMode === 'orbit') {
+        shapePreviewRoot.setPosition(orbit.target.x, orbit.target.y, orbit.target.z);
+    }
+});
+
+// Enable gsplat IDs for accurate picking in unified mode
+app.scene.gsplat.enableIds = true;
+
+// ── World-point hit via GPU depth picker ──────────────────────────────────────
+// On each stroke start (mousedown) we use the Picker to read the actual GPU
+// depth buffer, giving the true 3D position of the splat surface under the
+// cursor.  Subsequent mousemove points during the same stroke reuse that depth
+// via camera.screenToWorld() — fast, synchronous, and accurate enough for
+// smooth painting along a curved surface.
+const picker = new pc.Picker(app, 1, 1, true);  // true = enable depth buffer
+
+// Distance from camera to the surface, established at each stroke start.
+// null means "not yet picked this stroke".
+let strokeDepth = null;
+
+// Synchronous world-point using the depth established at stroke start.
+// Falls back to orbit.distance when called before a pick (e.g. selection tools).
+// NOTE: CameraComponent.screenToWorld(x, y, z, [worldCoord]) — only 3 required
+// args; the component reads canvas size from the graphics device internally.
+const getWorldPoint = (screenX, screenY) => {
+    const depth = strokeDepth != null ? strokeDepth : getDefaultPickDepth();
+    return cameraEntity.camera.screenToWorld(screenX, screenY, depth);
+};
+
+// Async: render picking buffer at low resolution, read depth buffer, return
+// camera-to-surface distance. When the depth buffer is clear (sky / void),
+// getWorldPointAsync returns null — with fallback=false callers must skip paint
+// instead of using orbit.distance (which maps every pixel to a wrong plane and
+// can paint an entire layer at once).
+const pickStrokeDepth = async (x, y, fallback = true) => {
+    const scale = 0.25;
+    picker.resize(
+        Math.max(1, Math.round(canvas.clientWidth  * scale)),
+        Math.max(1, Math.round(canvas.clientHeight * scale)),
+    );
+    const worldLayer = app.scene.layers.getLayerByName('World');
+    picker.prepare(cameraEntity.camera, app.scene, [worldLayer]);
+    const worldPt = await picker.getWorldPointAsync(x * scale, y * scale);
+    if (worldPt) {
+        return worldPt.distance(cameraEntity.getPosition());
+    }
+    return fallback ? getDefaultPickDepth() : null;
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let activeTool = 'cursor';
+let splatMode  = false;    // M: splat overlay (centers/rings) on true splat colors
+/** @type {'centers' | 'rings'} */
+let splatViewStyle = 'centers';
+
+const getSplatModeUniform = () => {
+    if (!splatMode) return 0;
+    return splatViewStyle === 'rings' ? 2 : 1;
+};
+
+const pushSplatViewShaderUniforms = (gsplat) => {
+    if (!gsplat) return;
+    gsplat.setParameter('uSplatMode', getSplatModeUniform());
+    gsplat.setParameter('uSplatRingThickness', SPLAT_VIEW_RING_THICKNESS);
+};
+
+// Strokes: { isErase, blendMode, ops:[{sphere, color, hardness, isErase}],
+//            cpuOps:[...], selectionBefore?, selectionAfter? (captureSelectionSnapshot) }
+const strokes   = [];
+const redoStack = [];
+let   activeStroke = null;
+
+// Selection
+let selectionMask   = null;          // Uint8Array(numSplats)
+let showSelectionHighlight = true;   // H toggles visibility
+let hasSelection    = false;
+let selectionSphere = [0, 0, 0, -1]; // model space, w<=0 = disabled
+let selectionMode   = 'new';         // new | add | subtract
+/** Snapshot at pointer-down for drag selection tools; committed on pointer-up. */
+let pendingSelectionUndoSnap = null;
+
+// Box-select drag
+let boxSelectDrag = null; // { x1, y1, x2, y2 }
+/** Freehand lasso: points in canvas pixel space while dragging */
+let lassoPoints = [];
+let lassoDragActive = false;
+/** Polygon (vector) select: click to add vertices */
+let vectorPolyPoints = [];
+let vectorHoverScreen = null; // { x, y } preview line from last vertex
+
+// Paint interaction
+let isPainting     = false;
+let lastPaintWorld = null;
+const paintStrokeScratch = new pc.Vec3();
+// Erase depth (view-aligned cylinder): scratch vectors to avoid per-dab allocations
+const eraseRayWorldScratch = new pc.Vec3();
+const eraseWorldEdgeScratch = new pc.Vec3();
+const eraseCamToDabScratch = new pc.Vec3();
+const eraseModelCenterScratch = new pc.Vec3();
+const eraseModelEdgeScratch = new pc.Vec3();
+const eraseViewModelScratch = new pc.Vec3();
+
+// Brush selection
+let isBrushSelecting       = false;
+let lastBrushSelectWorld   = null;
+let brushSelectFirstDab    = false;
+const pendingPaints = [];    // { sphere, color, hardness, isErase }
+let pendingRebuild = false;
+
+// Camera interaction
+let isOrbiting = false;
+let isPanning  = false;
+let lastMouse  = { x: 0, y: 0 };
+
+// Loaded paintables: { entity, gsplatComponent, paintProcessor, paintBucketProcessor, eraseProcessor, ... }
+const paintables = [];
+
+// CPU splat cache for export
+let gsplatDataCache = null;
+
+// ── Layers ───────────────────────────────────────────────────────────────────
+// Layer: { id, name, visible, opacityPct (0–100), splats: [...], selectionMask: Uint8Array|null }
+// Special id 'base' refers to the loaded base model (paintables[0]).
+const layers = [];
+let selectedLayerId = 'base';  // default: base model is active
+
+// Saved selections: { id, name, layerId, numSplats, mask: Uint8Array }
+const savedSelections = [];
+
+// Swatches: { id, hex }
+const swatches = [];
+/** True after "pick from splat" — next left-click on canvas samples a splat into swatches. */
+let awaitingSwatchSplatPick = false;
+let layerIdCounter = 1;
+let baseModelName = '';         // filename of the loaded model
+/** Viewport-only: base gsplat alpha multiplier 0–100 (not baked into splats). */
+let baseLayerOpacityPct = 100;
+
+/** Default { position, rotation, scale } for base model (not stored on a layer row). */
+const createDefaultLayerTransform = () => ({
+    position: { x: 0, y: 0, z: 0 },
+    rotation: { x: 0, y: 0, z: 0 },
+    scale: { x: 1, y: 1, z: 1 },
+});
+let baseTransform = createDefaultLayerTransform();
+
+const ensureUserLayerTransform = (layer) => {
+    if (!layer || typeof layer !== 'object') return;
+    if (!layer.position) layer.position = { x: 0, y: 0, z: 0 };
+    if (!layer.rotation) layer.rotation = { x: 0, y: 0, z: 0 };
+    if (!layer.scale) layer.scale = { x: 1, y: 1, z: 1 };
+};
+
+/** Reusable scratch for export baking (world TRS applied to splat attributes). */
+const _bakeWorldMat = new pc.Mat4();
+const _bakeInvWorld = new pc.Mat4();
+const _bakePt = new pc.Vec3();
+const _bakeN = new pc.Vec3();
+const _bakeQWorld = new pc.Quat();
+const _bakeQSplat = new pc.Quat();
+const _bakeQOut = new pc.Quat();
+
+/**
+ * PLY stores quaternion as rot_0=w, rot_1=x, rot_2=y, rot_3=z (PlayCanvas Quat is x,y,z,w).
+ * Bakes entity world TRS into position, rotation, scale, normals for export.
+ */
+const bakeSplatAttributesForExport = (entity, x, y, z, nx, ny, nz, r0, r1, r2, r3, s0, s1, s2, out) => {
+    _bakeWorldMat.copy(entity.getWorldTransform());
+    _bakePt.set(x, y, z);
+    _bakeWorldMat.transformPoint(_bakePt, _bakePt);
+    out.x = _bakePt.x;
+    out.y = _bakePt.y;
+    out.z = _bakePt.z;
+
+    _bakeQWorld.copy(entity.getRotation());
+    _bakeQSplat.set(r1, r2, r3, r0);
+    _bakeQOut.mul2(_bakeQWorld, _bakeQSplat).normalize();
+    out.rot_0 = _bakeQOut.w;
+    out.rot_1 = _bakeQOut.x;
+    out.rot_2 = _bakeQOut.y;
+    out.rot_3 = _bakeQOut.z;
+
+    const ws = entity.getScale();
+    const vol = Math.cbrt(Math.max(1e-12, Math.abs(ws.x * ws.y * ws.z)));
+    const dLog = Math.log(vol);
+    out.scale_0 = s0 + dLog;
+    out.scale_1 = s1 + dLog;
+    out.scale_2 = s2 + dLog;
+
+    _bakeInvWorld.copy(_bakeWorldMat).invert();
+    const im = _bakeInvWorld.data;
+    // Normal: upper 3×3 of inverse-transpose · n  →  dot columns of inv with n
+    let nnx = im[0] * nx + im[4] * ny + im[8] * nz;
+    let nny = im[1] * nx + im[5] * ny + im[9] * nz;
+    let nnz = im[2] * nx + im[6] * ny + im[10] * nz;
+    const nlen = Math.max(1e-8, Math.hypot(nnx, nny, nnz));
+    out.nx = nnx / nlen;
+    out.ny = nny / nlen;
+    out.nz = nnz / nlen;
+};
+
+// ── Active-layer helpers ──────────────────────────────────────────────────────
+// Returns the user Layer object if one is selected, or null for the base model.
+const getActiveLayer = () => {
+    if (selectedLayerId === 'base' || !selectedLayerId) return null;
+    return layers.find(l => l.id === selectedLayerId) ?? null;
+};
+
+// Returns a gsplatDataCache-compatible object for the active target:
+// - base model  → the real gsplatDataCache
+// - user layer  → built on-demand from layer.splats
+const getActiveDataCache = () => {
+    const layer = getActiveLayer();
+    if (!layer) return gsplatDataCache;
+    if (!layer.splats.length) return null;
+    const n = layer.splats.length;
+    const x    = new Float32Array(n), y = new Float32Array(n), z = new Float32Array(n);
+    const fdc0 = new Float32Array(n), fdc1 = new Float32Array(n), fdc2 = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const s = layer.splats[i];
+        x[i] = s.x; y[i] = s.y; z[i] = s.z;
+        fdc0[i] = s.f_dc_0 ?? 0; fdc1[i] = s.f_dc_1 ?? 0; fdc2[i] = s.f_dc_2 ?? 0;
+    }
+    return { numSplats: n, x, y, z, fdc0, fdc1, fdc2, isLayerData: true };
+};
+
+// Returns (and lazily creates) the selection mask for the currently active target.
+const getActiveSelectionMask = (n) => {
+    const layer = getActiveLayer();
+    if (!layer) {
+        if (!selectionMask || selectionMask.length !== n) selectionMask = new Uint8Array(n);
+        return selectionMask;
+    }
+    if (!layer.selectionMask || layer.selectionMask.length !== n) layer.selectionMask = new Uint8Array(n);
+    return layer.selectionMask;
+};
+
+// Returns the active selection mask (or null) without allocating.
+const peekActiveSelectionMask = () => {
+    const layer = getActiveLayer();
+    return layer ? (layer.selectionMask ?? null) : (selectionMask ?? null);
+};
+
+const captureSelectionSnapshot = () => {
+    const snap = {
+        selectedLayerId: selectedLayerId ?? 'base',
+        baseMask: null,
+        layers: [],
+    };
+    const nBase = gsplatDataCache?.numSplats ?? 0;
+    if (nBase > 0) {
+        snap.baseMask = new Uint8Array(nBase);
+        if (selectionMask && selectionMask.length === nBase) snap.baseMask.set(selectionMask);
+    }
+    for (const lyr of layers) {
+        const n = lyr.splats?.length ?? 0;
+        if (!n) {
+            snap.layers.push({ id: lyr.id, mask: null });
+            continue;
+        }
+        const m = new Uint8Array(n);
+        if (lyr.selectionMask && lyr.selectionMask.length === n) m.set(lyr.selectionMask);
+        snap.layers.push({ id: lyr.id, mask: m });
+    }
+    return snap;
+};
+
+const restoreSelectionSnapshot = (snap) => {
+    if (!snap) return;
+    let wantId = snap.selectedLayerId ?? 'base';
+    if (wantId !== 'base' && wantId && !layers.some((l) => l.id === wantId)) wantId = 'base';
+
+    const nBase = gsplatDataCache?.numSplats ?? 0;
+    if (nBase > 0) {
+        if (!selectionMask || selectionMask.length !== nBase) selectionMask = new Uint8Array(nBase);
+        if (snap.baseMask && snap.baseMask.length === nBase) selectionMask.set(snap.baseMask);
+        else selectionMask.fill(0);
+    }
+
+    const byId = new Map((snap.layers || []).map((e) => [e.id, e.mask]));
+    for (const lyr of layers) {
+        const n = lyr.splats?.length ?? 0;
+        if (!n) {
+            lyr.selectionMask = null;
+            continue;
+        }
+        const saved = byId.get(lyr.id);
+        if (saved && saved.length === n) {
+            if (!lyr.selectionMask || lyr.selectionMask.length !== n) lyr.selectionMask = new Uint8Array(n);
+            lyr.selectionMask.set(saved);
+        } else {
+            if (!lyr.selectionMask || lyr.selectionMask.length !== n) lyr.selectionMask = new Uint8Array(n);
+            lyr.selectionMask.fill(0);
+        }
+    }
+
+    selectedLayerId = wantId;
+    if (wantId === 'base' || !wantId) {
+        hasSelection = !!(selectionMask?.some((v) => v > 0));
+    } else {
+        const layer = layers.find((l) => l.id === wantId);
+        hasSelection = !!(layer?.selectionMask?.some((v) => v > 0));
+    }
+    renderLayersUI();
+    refreshLayerGizmoAttachment();
+    recomputeSelectionSphere();
+    updateSelectionUI();
+};
+
+const pushSelectionUndoFromBefore = (before) => {
+    if (!before) return;
+    redoStack.length = 0;
+    strokes.push({
+        ops: [],
+        cpuOps: [],
+        selectionBefore: before,
+        selectionAfter: captureSelectionSnapshot(),
+    });
+    updateUndoRedoUI();
+};
+
+/** Entity for world/model transforms of the active paint/selection target (layer entity or base). */
+const getWorldMatEntityForActiveTarget = () => {
+    const lyr = getActiveLayer();
+    if (lyr) {
+        const ent = layersContainer.findByName(`layer-${lyr.id}`);
+        if (ent) return ent;
+    }
+    return paintables[0]?.entity ?? null;
+};
+
+/** First splat entity for hover / depth reference when there is no base model. */
+const getPrimarySplatEntity = () => {
+    if (paintables.length) return paintables[0].entity;
+    for (const layer of layers) {
+        if (!layer.splats.length) continue;
+        const ent = layersContainer.findByName(`layer-${layer.id}`);
+        if (ent) return ent;
+    }
+    return null;
+};
+
+const hasRenderableSplats = () => !!getPrimarySplatEntity();
+
+/** While non-zero, hide empty-scene placeholder (e.g. during load / import). */
+let emptySceneLoadingDepth = 0;
+
+const updateEmptyScenePlaceholder = () => {
+    const el = g('empty-scene-placeholder');
+    if (!el) return;
+    const show = !hasRenderableSplats() && emptySceneLoadingDepth === 0;
+    el.classList.toggle('hidden', !show);
+    el.setAttribute('aria-hidden', show ? 'false' : 'true');
+};
+
+// ── Ring-aware selection (splat mode + rings — precise elliptical ring hit test) ──
+const _ringW0 = new pc.Vec3();
+const _ringS0 = new pc.Vec3();
+const _ringAxW = [new pc.Vec3(), new pc.Vec3()];
+const _ringAxS = [new pc.Vec3(), new pc.Vec3()];
+
+const useRingHitSelection = () => splatMode && splatViewStyle === 'rings';
+
+/** 0 = foreground only … 100 = include deep splats stacked behind along the view (same screen overlap). */
+const LS_SELECTION_DEPTH = 'photoshock-selection-depth';
+const parseSelectionDepth = (raw) => {
+    const n = parseInt(raw, 10);
+    if (!Number.isFinite(n)) return 50;
+    return Math.max(0, Math.min(100, n));
+};
+let selectionDepthControl = 50;
+try {
+    const s = localStorage.getItem(LS_SELECTION_DEPTH);
+    if (s != null) selectionDepthControl = parseSelectionDepth(s);
+} catch (_) { /* ignore */ }
+
+/**
+ * World-space depth band beyond the nearest hit: splats with camera distance in [minD, minD+eps]
+ * stay selected when they overlap the region in screen space. Low slider → tiny eps (front only);
+ * high slider → large eps (same pixel column, farther from camera).
+ */
+const selectionDepthEpsilon = (minDistCam) => {
+    const minD = Math.max(minDistCam, 1e-5);
+    const u = selectionDepthControl / 100;
+    const curve = u * u;
+    const tight = Math.max(minD * 0.002, 0.005);
+    const loose = Math.max(minD * 0.52, minD * 0.12 + 0.4);
+    return tight + (loose - tight) * curve;
+};
+
+/** hits: { i, d } with d = distance from splat center to camera (world units). */
+const filterHitsBySelectionDepth = (hits) => {
+    if (!hits?.length) return new Set();
+    const minD = Math.min(...hits.map((h) => h.d));
+    const eps = selectionDepthEpsilon(minD);
+    return new Set(hits.filter((h) => h.d <= minD + eps).map((h) => h.i));
+};
+
+const syncSelectionDepthUI = () => {
+    const range = document.getElementById('selection-depth-range');
+    const label = document.getElementById('selection-depth-label');
+    if (range) range.value = String(selectionDepthControl);
+    if (label) label.textContent = String(selectionDepthControl);
+};
+
+const getSplatScalesAt = (data, layer, i) => {
+    if (data.isLayerData && layer?.splats?.[i]) {
+        const s = layer.splats[i];
+        return { s0: s.scale_0 ?? -5, s1: s.scale_1 ?? -5, s2: s.scale_2 ?? -5 };
+    }
+    if (!data.isLayerData && gsplatDataCache?.extra) {
+        const ex = gsplatDataCache.extra;
+        return {
+            s0: ex.scale_0?.[i] ?? -5,
+            s1: ex.scale_1?.[i] ?? -5,
+            s2: ex.scale_2?.[i] ?? -5,
+        };
+    }
+    return { s0: -5, s1: -5, s2: -5 };
+};
+
+const getSplatRotationAt = (data, layer, i) => {
+    if (data.isLayerData && layer?.splats?.[i]) {
+        const s = layer.splats[i];
+        return { rw: s.rot_0 ?? 1, rx: s.rot_1 ?? 0, ry: s.rot_2 ?? 0, rz: s.rot_3 ?? 0 };
+    }
+    if (!data.isLayerData && gsplatDataCache?.extra) {
+        const ex = gsplatDataCache.extra;
+        return {
+            rw: ex.rot_0?.[i] ?? 1,
+            rx: ex.rot_1?.[i] ?? 0,
+            ry: ex.rot_2?.[i] ?? 0,
+            rz: ex.rot_3?.[i] ?? 0,
+        };
+    }
+    return { rw: 1, rx: 0, ry: 0, rz: 0 };
+};
+
+/**
+ * Compute screen-space ellipse for splat i using Jacobian-based 2D covariance
+ * projection — the same math the GPU vertex shader uses.
+ * Returns { cx, cy, distCam, a, b, cos, sin } where a/b are 1-sigma semi-axes
+ * in pixels and cos/sin define the orientation of semi-axis a.
+ * Returns null if behind camera.
+ */
+const getSplatScreenEllipse = (data, layer, i, wEnt) => {
+    const cam = cameraEntity.camera;
+    const wm = wEnt.getWorldTransform();
+    const px = data.x[i], py = data.y[i], pz = data.z[i];
+    const { s0, s1, s2 } = getSplatScalesAt(data, layer, i);
+    const { rw, rx, ry, rz } = getSplatRotationAt(data, layer, i);
+
+    _ringW0.set(px, py, pz);
+    wm.transformPoint(_ringW0, _ringW0);
+    const distCam = _ringW0.distance(cameraEntity.getPosition());
+    cam.worldToScreen(_ringW0, _ringS0);
+    if (_ringS0.z <= 0) return null;
+    const cx = _ringS0.x, cy = _ringS0.y;
+
+    const sx = Math.exp(s0), sy = Math.exp(s1), sz = Math.exp(s2);
+
+    const len2 = rw * rw + rx * rx + ry * ry + rz * rz;
+    const inv = len2 > 1e-10 ? 1 / Math.sqrt(len2) : 1;
+    const qw = rw * inv, qx = rx * inv, qy = ry * inv, qz = rz * inv;
+    const r00 = 1 - 2*(qy*qy + qz*qz), r01 = 2*(qx*qy - qz*qw), r02 = 2*(qx*qz + qy*qw);
+    const r10 = 2*(qx*qy + qz*qw), r11 = 1 - 2*(qx*qx + qz*qz), r12 = 2*(qy*qz - qx*qw);
+    const r20 = 2*(qx*qz - qy*qw), r21 = 2*(qy*qz + qx*qw), r22 = 1 - 2*(qx*qx + qy*qy);
+
+    // M = R * S  (columns of the 3×3 model-space matrix)
+    const m00 = r00*sx, m01 = r01*sy, m02 = r02*sz;
+    const m10 = r10*sx, m11 = r11*sy, m12 = r12*sz;
+    const m20 = r20*sx, m21 = r21*sy, m22 = r22*sz;
+
+    // World transform 3×3 (column-major .data)
+    const wd = wm.data;
+    const w00 = wd[0], w01 = wd[4], w02 = wd[8];
+    const w10 = wd[1], w11 = wd[5], w12 = wd[9];
+    const w20 = wd[2], w21 = wd[6], w22 = wd[10];
+
+    // M_world = W * M_local
+    const mw00 = w00*m00+w01*m10+w02*m20, mw01 = w00*m01+w01*m11+w02*m21, mw02 = w00*m02+w01*m12+w02*m22;
+    const mw10 = w10*m00+w11*m10+w12*m20, mw11 = w10*m01+w11*m11+w12*m21, mw12 = w10*m02+w11*m12+w12*m22;
+    const mw20 = w20*m00+w21*m10+w22*m20, mw21 = w20*m01+w21*m11+w22*m21, mw22 = w20*m02+w21*m12+w22*m22;
+
+    // View matrix 3×3 (column-major)
+    const vd = cam.viewMatrix.data;
+    const v00 = vd[0], v01 = vd[4], v02 = vd[8];
+    const v10 = vd[1], v11 = vd[5], v12 = vd[9];
+    const v20 = vd[2], v21 = vd[6], v22 = vd[10];
+
+    // T = V * M_world  (3×3, columns of the splat axes in camera space)
+    const t00 = v00*mw00+v01*mw10+v02*mw20, t01 = v00*mw01+v01*mw11+v02*mw21, t02 = v00*mw02+v01*mw12+v02*mw22;
+    const t10 = v10*mw00+v11*mw10+v12*mw20, t11 = v10*mw01+v11*mw11+v12*mw21, t12 = v10*mw02+v11*mw12+v12*mw22;
+    const t20 = v20*mw00+v21*mw10+v22*mw20, t21 = v20*mw01+v21*mw11+v22*mw21, t22 = v20*mw02+v21*mw12+v22*mw22;
+
+    // Camera-space center
+    const tx = vd[0]*_ringW0.x + vd[4]*_ringW0.y + vd[8]*_ringW0.z  + vd[12];
+    const ty = vd[1]*_ringW0.x + vd[5]*_ringW0.y + vd[9]*_ringW0.z  + vd[13];
+    const tz = vd[2]*_ringW0.x + vd[6]*_ringW0.y + vd[10]*_ringW0.z + vd[14];
+    if (tz >= 0) return null;
+    const ntz = -tz;
+
+    // Focal lengths in pixels from the projection matrix
+    const pd = cam.projectionMatrix.data;
+    const canvasW = app.graphicsDevice.width, canvasH = app.graphicsDevice.height;
+    const fx = pd[0] * canvasW * 0.5;
+    const fy = pd[5] * canvasH * 0.5;
+
+    // Jacobian of screen projection (y-down screen space):
+    //   J = [ fx/ntz,   0,       fx*tx/ntz² ]
+    //       [ 0,       -fy/ntz, -fy*ty/ntz² ]
+    const ntz2 = ntz * ntz;
+    const j00v = fx / ntz,  j02v = fx * tx / ntz2;
+    const j11v = -fy / ntz, j12v = -fy * ty / ntz2;
+
+    // JT = J * T  (2×3)
+    const jt00 = j00v*t00 + j02v*t20, jt01 = j00v*t01 + j02v*t21, jt02 = j00v*t02 + j02v*t22;
+    const jt10 = j11v*t10 + j12v*t20, jt11 = j11v*t11 + j12v*t21, jt12 = j11v*t12 + j12v*t22;
+
+    // Σ_2D = JT * JT^T  (2×2 symmetric)
+    const s00 = jt00*jt00 + jt01*jt01 + jt02*jt02;
+    const s01 = jt00*jt10 + jt01*jt11 + jt02*jt12;
+    const s11 = jt10*jt10 + jt11*jt11 + jt12*jt12;
+
+    // Eigendecompose 2×2 symmetric → semi-axes
+    const tr = s00 + s11;
+    const det = s00 * s11 - s01 * s01;
+    const disc = Math.max(0, tr * tr * 0.25 - det);
+    const sqD = Math.sqrt(disc);
+    const lambda1 = tr * 0.5 + sqD;
+    const lambda2 = Math.max(0, tr * 0.5 - sqD);
+    const a = Math.max(3, Math.sqrt(lambda1));
+    const b = Math.max(1, Math.sqrt(lambda2));
+
+    let ex, ey;
+    if (Math.abs(s01) > 1e-10) {
+        ex = lambda1 - s11;
+        ey = s01;
+    } else {
+        ex = s00 >= s11 ? 1 : 0;
+        ey = s00 >= s11 ? 0 : 1;
+    }
+    const eLen = Math.hypot(ex, ey) || 1;
+    return { cx, cy, distCam, a, b, cos: ex / eLen, sin: ey / eLen };
+};
+
+/**
+ * Test if screen point (px, py) is inside the visible area of a splat ellipse.
+ * Matches SuperSplat behaviour: selection in ring mode tests against the full
+ * splat footprint (not just the ring stroke). The ring is purely visual.
+ * A generous outer pad accounts for CPU/GPU projection differences.
+ */
+const screenHitsSplatEllipse = (px, py, e) => {
+    if (!e) return false;
+    const dx = px - e.cx, dy = py - e.cy;
+    const lx = (dx * e.cos + dy * e.sin) / e.a;
+    const ly = (-dx * e.sin + dy * e.cos) / e.b;
+    const r = Math.hypot(lx, ly);
+    return r <= 1.35;
+};
+
+/**
+ * Test if a splat ellipse intersects an axis-aligned screen rectangle.
+ * Tests the full splat area (not just the ring band), matching SuperSplat.
+ */
+const splatEllipseIntersectsRect = (e, minX, maxX, minY, maxY) => {
+    if (!e) return false;
+    const pad = 1.35;
+    const maxR = Math.max(e.a, e.b) * pad;
+    const ecx = e.cx, ecy = e.cy;
+    if (ecx + maxR < minX || ecx - maxR > maxX || ecy + maxR < minY || ecy - maxR > maxY) return false;
+    const N = 24;
+    for (let k = 0; k < N; k++) {
+        const angle = (k / N) * Math.PI * 2;
+        const cosA = Math.cos(angle), sinA = Math.sin(angle);
+        for (const frac of [0.5, 0.85, 1.0, pad]) {
+            const lx = cosA * frac, ly = sinA * frac;
+            const sx = ecx + (lx * e.cos - ly * e.sin) * e.a;
+            const sy = ecy + (lx * e.sin + ly * e.cos) * e.b;
+            if (sx >= minX && sx <= maxX && sy >= minY && sy <= maxY) return true;
+        }
+    }
+    for (const [rx, ry] of [[minX,minY],[maxX,minY],[minX,maxY],[maxX,maxY]]) {
+        const dx = rx - ecx, dy = ry - ecy;
+        const lx = (dx * e.cos + dy * e.sin) / e.a;
+        const ly = (-dx * e.sin + dy * e.cos) / e.b;
+        if (Math.hypot(lx, ly) <= pad) return true;
+    }
+    return false;
+};
+
+/** Screen-space point-in-polygon (non-zero winding / ray cast). `poly` is closed implicitly. */
+const pointInPolygon = (px, py, poly) => {
+    if (!poly || poly.length < 3) return false;
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const xi = poly[i].x, yi = poly[i].y;
+        const xj = poly[j].x, yj = poly[j].y;
+        const denom = (yj - yi) || 1e-20;
+        const inter = ((yi > py) !== (yj > py)) && (px < ((xj - xi) * (py - yi)) / denom + xi);
+        if (inter) inside = !inside;
+    }
+    return inside;
+};
+
+const splatEllipseIntersectsPolygon = (e, poly) => {
+    if (!e || !poly || poly.length < 3) return false;
+    const pad = 1.35;
+    if (pointInPolygon(e.cx, e.cy, poly)) return true;
+    const N = 32;
+    for (let k = 0; k < N; k++) {
+        const angle = (k / N) * Math.PI * 2;
+        const cosA = Math.cos(angle), sinA = Math.sin(angle);
+        const sx = e.cx + (cosA * e.cos - sinA * e.sin) * e.a * pad;
+        const sy = e.cy + (cosA * e.sin + sinA * e.cos) * e.b * pad;
+        if (pointInPolygon(sx, sy, poly)) return true;
+    }
+    for (const p of poly) {
+        const dx = p.x - e.cx, dy = p.y - e.cy;
+        const lx = (dx * e.cos + dy * e.sin) / e.a;
+        const ly = (-dx * e.sin + dy * e.cos) / e.b;
+        if (Math.hypot(lx, ly) <= pad) return true;
+    }
+    return false;
+};
+
+/** Closest-to-camera splat whose ellipse covers (screenX, screenY), or null. */
+const pickFrontSplatAtScreen = (screenX, screenY, data, layer, wEnt) => {
+    const hits = [];
+    for (let i = 0; i < data.numSplats; i++) {
+        const e = getSplatScreenEllipse(data, layer, i, wEnt);
+        if (e && screenHitsSplatEllipse(screenX, screenY, e)) hits.push({ i, d: e.distCam });
+    }
+    if (!hits.length) return null;
+    hits.sort((a, b) => a.d - b.d);
+    return hits[0].i;
+};
+
+/** Parent for the loaded base splat; global model rotation applies here. */
+const baseContainer = new pc.Entity('baseContainer');
+app.root.addChild(baseContainer);
+const layersContainer = new pc.Entity('layersContainer');
+app.root.addChild(layersContainer);
+
+// ── Layer transform gizmos (viewport handles for selected layer or base) ──────
+const LS_LAYER_GIZMO_VISIBLE = 'photoshock-layer-gizmo-visible';
+const LS_LAYER_GIZMO_MODE = 'photoshock-layer-gizmo-mode';
+const LS_RIGHT_PANEL_TAB = 'photoshock-right-panel-tab';
+
+let layerGizmoVisible = true;
+try {
+    if (localStorage.getItem(LS_LAYER_GIZMO_VISIBLE) === '0') layerGizmoVisible = false;
+} catch (_) { /* ignore */ }
+
+let layerGizmoMode = 'translate';
+try {
+    const m = localStorage.getItem(LS_LAYER_GIZMO_MODE);
+    if (m === 'rotate' || m === 'scale' || m === 'translate') layerGizmoMode = m;
+} catch (_) { /* ignore */ }
+
+const layerTransformGizmoLayer = pc.Gizmo.createLayer(app);
+const layerTranslateGizmo = new pc.TranslateGizmo(cameraEntity.camera, layerTransformGizmoLayer);
+const layerRotateGizmo = new pc.RotateGizmo(cameraEntity.camera, layerTransformGizmoLayer);
+const layerScaleGizmo = new pc.ScaleGizmo(cameraEntity.camera, layerTransformGizmoLayer);
+
+/** Wireframe preview for Shape layer tool (world root + mesh child). */
+let shapePreviewRoot = null;
+let shapePreviewMeshEntity = null;
+/** True after Add (orbit target); false after drag-place — only locked preview follows orbit.target. */
+let shapePreviewOrbitLock = false;
+/** @type {{ active: boolean, startX: number, startY: number, depth: number|null, world0: pc.Vec3|null, session: number }|null} */
+let shapePlacementDrag = null;
+let shapePlaceSession = 0;
+let syncingShapeUIFromPreview = false;
+let gizmoTargetIsShapePreview = false;
+
+/** Local-space centroid of base splats (mean xyz); translate gizmo attaches here. */
+const baseGizmoPivotCentroidLocal = new pc.Vec3(0, 0, 0);
+
+for (const gz of [layerTranslateGizmo, layerRotateGizmo, layerScaleGizmo]) {
+    gz.coordSpace = 'local';
+    gz.size = 1.15;
+}
+
+const foldBaseGizmoPivotDeltaIntoParent = () => {
+    if (!paintables.length) return;
+    const parent = paintables[0].entity;
+    const pivot = parent.findByName('base-gizmo-mass-pivot');
+    if (!pivot) return;
+    const C = baseGizmoPivotCentroidLocal;
+    const lp = pivot.getLocalPosition();
+    const dx = lp.x - C.x;
+    const dy = lp.y - C.y;
+    const dz = lp.z - C.z;
+    if (Math.hypot(dx, dy, dz) < 1e-8) return;
+    const p = parent.getLocalPosition();
+    parent.setLocalPosition(p.x + dx, p.y + dy, p.z + dz);
+    pivot.setLocalPosition(C.x, C.y, C.z);
+};
+
+/** Reposition (or create) empty child at splat center-of-mass for base translate gizmo. */
+const refreshBaseGizmoMassPivotChild = () => {
+    if (!paintables.length || !gsplatDataCache?.numSplats) return;
+    const parent = paintables[0].entity;
+    let pivot = parent.findByName('base-gizmo-mass-pivot');
+    if (!pivot) {
+        pivot = new pc.Entity('base-gizmo-mass-pivot');
+        parent.addChild(pivot);
+    }
+    const { x, y, z, numSplats } = gsplatDataCache;
+    let sx = 0;
+    let sy = 0;
+    let sz = 0;
+    for (let i = 0; i < numSplats; i++) {
+        sx += x[i];
+        sy += y[i];
+        sz += z[i];
+    }
+    const inv = 1 / numSplats;
+    const cx = sx * inv;
+    const cy = sy * inv;
+    const cz = sz * inv;
+    baseGizmoPivotCentroidLocal.set(cx, cy, cz);
+    pivot.setLocalPosition(cx, cy, cz);
+};
+
+const syncActiveTargetTransformFromGizmoEntity = () => {
+    let ent = null;
+    const isBase = selectedLayerId === 'base' || !selectedLayerId;
+    if (isBase) {
+        foldBaseGizmoPivotDeltaIntoParent();
+        ent = paintables[0]?.entity ?? null;
+    } else {
+        const lyr = layers.find((l) => l.id === selectedLayerId);
+        if (lyr) ent = layersContainer.findByName(`layer-${lyr.id}`);
+    }
+    if (!ent) return;
+    const p = ent.getLocalPosition();
+    const eAng = ent.getLocalEulerAngles();
+    const s = ent.getLocalScale();
+    const clampPos = (v) => Math.max(-1000, Math.min(1000, v));
+    const clampRot = (v) => Math.max(-360, Math.min(360, v));
+    const clampScl = (v) => Math.max(0.01, Math.min(10, v));
+    if (isBase) {
+        baseTransform.position.x = clampPos(p.x);
+        baseTransform.position.y = clampPos(p.y);
+        baseTransform.position.z = clampPos(p.z);
+        baseTransform.rotation.x = clampRot(eAng.x);
+        baseTransform.rotation.y = clampRot(eAng.y);
+        baseTransform.rotation.z = clampRot(eAng.z);
+        baseTransform.scale.x = clampScl(s.x);
+        baseTransform.scale.y = clampScl(s.y);
+        baseTransform.scale.z = clampScl(s.z);
+    } else {
+        const lyr = layers.find((l) => l.id === selectedLayerId);
+        if (!lyr) return;
+        ensureUserLayerTransform(lyr);
+        lyr.position.x = clampPos(p.x);
+        lyr.position.y = clampPos(p.y);
+        lyr.position.z = clampPos(p.z);
+        lyr.rotation.x = clampRot(eAng.x);
+        lyr.rotation.y = clampRot(eAng.y);
+        lyr.rotation.z = clampRot(eAng.z);
+        lyr.scale.x = clampScl(s.x);
+        lyr.scale.y = clampScl(s.y);
+        lyr.scale.z = clampScl(s.z);
+    }
+    syncLayerTransformUI();
+};
+
+const onLayerGizmoTransformChanged = () => {
+    if (gizmoTargetIsShapePreview && shapePreviewRoot?.parent) {
+        syncingShapeUIFromPreview = true;
+        if (layerGizmoMode === 'scale') {
+            const s = shapePreviewRoot.getLocalScale();
+            const clampS = (v) => Math.max(SHAPE_DIM_MIN, Math.min(SHAPE_DIM_MAX, v));
+            if (g('shape-size-x')) g('shape-size-x').value = String(Math.round(clampS(s.x) * 10000) / 10000);
+            if (g('shape-size-y')) g('shape-size-y').value = String(Math.round(clampS(s.y) * 10000) / 10000);
+            if (g('shape-size-z')) g('shape-size-z').value = String(Math.round(clampS(s.z) * 10000) / 10000);
+        } else if (layerGizmoMode === 'rotate') {
+            const eAng = shapePreviewRoot.getLocalEulerAngles();
+            const fmt = (v) => String(Math.round(v * 100) / 100);
+            if (g('shape-rot-x')) g('shape-rot-x').value = fmt(eAng.x);
+            if (g('shape-rot-y')) g('shape-rot-y').value = fmt(eAng.y);
+            if (g('shape-rot-z')) g('shape-rot-z').value = fmt(eAng.z);
+        }
+        syncingShapeUIFromPreview = false;
+        saveShapeToolPrefs();
+        return;
+    }
+    syncActiveTargetTransformFromGizmoEntity();
+};
+
+layerTranslateGizmo.on(pc.TransformGizmo.EVENT_TRANSFORMMOVE, onLayerGizmoTransformChanged);
+layerTranslateGizmo.on(pc.TransformGizmo.EVENT_TRANSFORMEND, onLayerGizmoTransformChanged);
+layerRotateGizmo.on(pc.TransformGizmo.EVENT_TRANSFORMMOVE, onLayerGizmoTransformChanged);
+layerRotateGizmo.on(pc.TransformGizmo.EVENT_TRANSFORMEND, onLayerGizmoTransformChanged);
+layerScaleGizmo.on(pc.TransformGizmo.EVENT_TRANSFORMMOVE, onLayerGizmoTransformChanged);
+layerScaleGizmo.on(pc.TransformGizmo.EVENT_TRANSFORMEND, onLayerGizmoTransformChanged);
+
+const updateLayerGizmoToggleButton = () => {
+    const btn = g('toggle-layer-gizmo-btn');
+    if (!btn) return;
+    btn.classList.toggle('gizmo-shown', layerGizmoVisible);
+};
+
+const updateLayerGizmoModeButtons = () => {
+    document.querySelectorAll('.gizmo-mode-btn').forEach((b) => {
+        b.classList.toggle('active', b.dataset.gizmoMode === layerGizmoMode);
+    });
+    document.querySelectorAll('.transform-label[data-gizmo-label]').forEach((el) => {
+        el.classList.toggle('gizmo-label-active', el.dataset.gizmoLabel === layerGizmoMode);
+    });
+};
+
+const updateFloatingGizmoBarVisibility = () => {
+    const bar = g('floating-gizmo-bar');
+    if (!bar) return;
+    const loaded = paintables.length > 0 || layers.some((l) => l.splats.length > 0);
+    const userSel = selectedLayerId !== 'base' && selectedLayerId && layers.some((l) => l.id === selectedLayerId);
+    const shapeGizmo = activeTool === 'shapeLayer' && shapePreviewRoot?.parent;
+    const show = shapeGizmo || (loaded && (selectedLayerId === 'base' || !selectedLayerId || userSel));
+    bar.classList.toggle('hidden', !show);
+};
+
+const refreshLayerGizmoAttachment = () => {
+    refreshBaseGizmoMassPivotChild();
+    layerTranslateGizmo.detach();
+    layerRotateGizmo.detach();
+    layerScaleGizmo.detach();
+    updateLayerGizmoToggleButton();
+    updateFloatingGizmoBarVisibility();
+    if (!layerGizmoVisible) return;
+
+    if (activeTool === 'shapeLayer' && shapePreviewRoot?.parent) {
+        gizmoTargetIsShapePreview = true;
+        if (layerGizmoMode === 'rotate') layerRotateGizmo.attach([shapePreviewRoot]);
+        else if (layerGizmoMode === 'scale') layerScaleGizmo.attach([shapePreviewRoot]);
+        else layerTranslateGizmo.attach([shapePreviewRoot]);
+        return;
+    }
+    gizmoTargetIsShapePreview = false;
+
+    let ent = null;
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        const baseEnt = paintables[0]?.entity ?? null;
+        if (baseEnt && layerGizmoMode === 'translate') {
+            const pivot = baseEnt.findByName('base-gizmo-mass-pivot');
+            ent = pivot ?? baseEnt;
+        } else {
+            ent = baseEnt;
+        }
+    } else {
+        const lyr = layers.find((l) => l.id === selectedLayerId);
+        if (lyr?.splats?.length)
+            ent = layersContainer.findByName(`layer-${lyr.id}`);
+    }
+    if (!ent) return;
+
+    if (layerGizmoMode === 'rotate') layerRotateGizmo.attach([ent]);
+    else if (layerGizmoMode === 'scale') layerScaleGizmo.attach([ent]);
+    else layerTranslateGizmo.attach([ent]);
+};
+
+// Minimal valid GSplat: 1 dummy splat for PlayCanvas (invisible, off to side)
+const createDummySplat = () => ({
+    x: -1e6, y: -1e6, z: -1e6,
+    scale_0: -10, scale_1: -10, scale_2: -10,  // tiny (log scale)
+    rot_0: 1, rot_1: 0, rot_2: 0, rot_3: 0,
+    f_dc_0: 0, f_dc_1: 0, f_dc_2: 0,
+    opacity: -20,  // nearly invisible (logit)
+    nx: 0, ny: 1, nz: 0,
+});
+
+// Generate Splats tool state
+let generateSplatsSampledColor = [0.5, 0.5, 0.5];  // RGB 0-1, default gray
+let isGenerateSplatsPainting = false;
+let lastGenerateSplatsWorld = null;
+let layerUpdateTimeout = null;
+
+// Additive blend state (for erase accumulation)
+const ADDITIVE_BLEND = new pc.BlendState(
+    true,
+    pc.BLENDEQUATION_ADD, pc.BLENDMODE_ONE, pc.BLENDMODE_ONE,
+    pc.BLENDEQUATION_ADD, pc.BLENDMODE_ONE, pc.BLENDMODE_ONE,
+);
+// Reset blend: result = dst * (1 - src.a). Write (0,0,0,falloff) — no read needed.
+const RESET_BLEND = new pc.BlendState(
+    true,
+    pc.BLENDEQUATION_ADD, pc.BLENDMODE_ZERO, pc.BLENDMODE_ONE_MINUS_SRC_ALPHA,
+    pc.BLENDEQUATION_ADD, pc.BLENDMODE_ZERO, pc.BLENDMODE_ONE_MINUS_SRC_ALPHA,
+);
+
+// ── UI refs ───────────────────────────────────────────────────────────────────
+const brushCursor     = document.getElementById('brush-cursor');
+const boxSelectRect   = document.getElementById('box-select-rect');
+const selectionOverlaySvg = document.getElementById('selection-overlay-svg');
+const instructions    = document.getElementById('instructions');
+
+const syncSelectionModeToolbar = () => {
+    document.querySelectorAll('.sel-mode-toolbar-btn').forEach((btn) => {
+        const m = btn.dataset.selMode;
+        const on = m === selectionMode;
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+};
+
+const setSelectionMode = (mode) => {
+    if (mode !== 'new' && mode !== 'add' && mode !== 'subtract') return;
+    selectionMode = mode;
+    syncSelectionModeToolbar();
+};
+
+const refreshCursorCameraHint = () => {
+    if (activeTool !== 'cursor') return;
+    if (!hasRenderableSplats()) {
+        instructions.innerHTML = '';
+        return;
+    }
+    const orbitMsg = 'WASD pan target · Q up / E down · Drag orbit · Right-drag pan · Scroll zoom · Double-click focus · ` Fly camera';
+    const flyMsg = 'WASD fly forward/strafe · Q world up / E world down · Drag look · Right-drag pan · Scroll along view · Double-click toward surface · ` Orbit camera';
+    instructions.innerHTML = `<p>${cameraNavMode === 'orbit' ? orbitMsg : flyMsg}</p>`;
+};
+
+const syncCameraNavToolbar = () => {
+    document.querySelectorAll('.camera-nav-btn').forEach((btn) => {
+        const on = btn.dataset.cameraNav === cameraNavMode;
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+};
+
+const setCameraNavMode = (mode) => {
+    if (mode !== 'orbit' && mode !== 'fly') return;
+    if (mode === cameraNavMode) return;
+    if (mode === 'fly') {
+        flyCam.pos.copy(cameraEntity.getPosition());
+        flyCam.yaw = orbit.yaw;
+        flyCam.pitch = orbit.pitch;
+    } else {
+        const yr = (flyCam.yaw * Math.PI) / 180;
+        const pr = (flyCam.pitch * Math.PI) / 180;
+        const ox = orbit.distance * Math.sin(yr) * Math.cos(pr);
+        const oy = orbit.distance * Math.sin(pr);
+        const oz = orbit.distance * Math.cos(yr) * Math.cos(pr);
+        orbit.target.set(flyCam.pos.x - ox, flyCam.pos.y - oy, flyCam.pos.z - oz);
+        orbit.yaw = flyCam.yaw;
+        orbit.pitch = flyCam.pitch;
+    }
+    cameraNavMode = mode;
+    try { localStorage.setItem(LS_CAMERA_NAV, mode); } catch (_) {}
+    syncCameraNavToolbar();
+    updateCamera();
+    refreshCursorCameraHint();
+};
+
+// ── Tool management ───────────────────────────────────────────────────────────
+const setTool = (tool) => {
+    if (tool === 'sphereSelect') tool = 'boxSelect';
+    if (tool !== 'lassoSelect') {
+        lassoDragActive = false;
+        lassoPoints.length = 0;
+        lassoEffectiveMode = null;
+    }
+    if (tool !== 'vectorSelect') {
+        vectorPolyPoints.length = 0;
+        vectorHoverScreen = null;
+    }
+
+    activeTool = tool;
+    if (tool === 'shapeLayer') {
+        updateShapeSplatButtonEnabled();
+    } else if (tool !== 'cursor' || !shapePreviewRoot) {
+        destroyShapePreview();
+        shapePlacementDrag = null;
+    }
+    redrawSelectionOverlays();
+    clearHoverSphere();
+    cancelSwatchSplatPick();
+
+    const toolBtnMap = {
+        cursor: 'tool-cursor', brush: 'tool-brush', eraser: 'tool-eraser', resetBrush: 'tool-resetBrush',
+        paintBucket: 'tool-paint-bucket',
+        boxSelect: 'tool-box-select',
+        lassoSelect: 'tool-lasso-select',
+        vectorSelect: 'tool-vector-select',
+        brushSelect: 'tool-brush-select', colorSelect: 'tool-color-select',
+        generateSplats: 'tool-generate-splats', splatSelect: 'tool-splat-select',
+        shapeLayer: 'tool-shape-layer',
+    };
+    Object.entries(toolBtnMap).forEach(([t, id]) => {
+        document.getElementById(id)?.classList.toggle('active', t === tool);
+    });
+
+    document.querySelectorAll('.tool-options').forEach(el => el.classList.add('hidden'));
+    const optMap = {
+        cursor: 'options-cursor', brush: 'options-brush', eraser: 'options-eraser', resetBrush: 'options-resetBrush',
+        paintBucket: 'options-paint-bucket',
+        boxSelect: 'options-box-select',
+        lassoSelect: 'options-lasso-select',
+        vectorSelect: 'options-vector-select',
+        brushSelect: 'options-brush-select', colorSelect: 'options-color-select',
+        generateSplats: 'options-generate-splats', splatSelect: 'options-splat-select',
+        shapeLayer: 'options-shape-layer',
+    };
+    const selTools = ['boxSelect', 'lassoSelect', 'vectorSelect', 'brushSelect', 'colorSelect', 'splatSelect'];
+    const selStripTools = [...selTools, 'brush', 'eraser', 'resetBrush', 'paintBucket'];
+    document.getElementById('selection-options-strip')?.classList.toggle('hidden', !selStripTools.includes(tool));
+    const showFloatingSelCmds = selTools.includes(tool);
+    g('floating-gizmo-selection-commands')?.classList.toggle('hidden', !showFloatingSelCmds);
+    if (showFloatingSelCmds) syncSelectionModeToolbar();
+    document.getElementById(optMap[tool])?.classList.remove('hidden');
+    if (tool === 'paintBucket') g('options-brush')?.classList.remove('hidden');
+    g('brush-bake-paint-group')?.classList.toggle('hidden', tool === 'paintBucket');
+
+    canvasContainer.classList.remove(
+        'mode-cursor','mode-brush','mode-eraser','mode-resetBrush','mode-paintBucket','mode-boxSelect',
+        'mode-lassoSelect','mode-vectorSelect',
+        'mode-brushSelect','mode-colorSelect','mode-generateSplats','mode-splatSelect',
+        'mode-shapeLayer',
+    );
+    canvasContainer.classList.add(`mode-${tool}`);
+    brushCursor.classList.toggle('eraser-mode', tool === 'eraser' || tool === 'resetBrush');
+    if (tool === 'paintBucket') brushCursor.style.cssText = '';
+
+    const msgs = {
+        cursor:       'WASD move · Q up / E down · Drag orbit · Right-drag pan · Scroll zoom · Double-click focus',
+        brush:        'Click & drag to paint · Scroll to zoom',
+        eraser:       'Click & drag to erase opacity · Depth = thickness along view · Scroll to zoom',
+        resetBrush:   'Click & drag to restore original colors (clears paint & erase)',
+        paintBucket:  'Click to fill all selected splats · Uses brush color, blend & intensity (B) · K',
+        boxSelect:    'Drag to draw selection rectangle (O) · In splat + ring mode, selects ring hits (front-most)',
+        lassoSelect:  'Drag freehand loop (L) · Release to select enclosed splats · Alt inverts add/subtract',
+        vectorSelect: 'Click polygon corners (Y) · Press Enter to close (≥3 points) · Backspace removes last point · Green dot = first vertex',
+        brushSelect:  'Click & drag to paint selection with brush · Scroll to zoom',
+        colorSelect:  'Click a splat to select all splats of similar color · Loupe shows magnified pixels under the cursor',
+        generateSplats: 'Alt+click to sample color · Click & drag to generate splats in gaps',
+        splatSelect:  'Click/drag — nearest splat; with splat + ring mode, picks the front ring under the cursor',
+        shapeLayer:   '',
+    };
+    if (tool === 'cursor') {
+        refreshCursorCameraHint();
+    } else {
+        const hint = msgs[tool] || '';
+        instructions.innerHTML = hint ? `<p>${hint}</p>` : '';
+    }
+    if (tool !== 'colorSelect') hideColorPixelLoupe();
+    refreshLayerGizmoAttachment();
+};
+
+// ── Inline math evaluation for number inputs ────────────────────────────────
+// On focus: switch to text so the user can type +, *, /, (, ) etc.
+// On blur:  evaluate the expression, clamp, restore to number type.
+const MATH_EXPR_RE = /^[\d+\-*/().,%^ e]+$/;
+const tryEvalMathExpr = (raw) => {
+    const s = raw.trim().replace(/,/g, '.').replace(/\^/g, '**');
+    if (!MATH_EXPR_RE.test(raw.trim().replace(/,/g, '.'))) return null;
+    if (/^-?\d*\.?\d+$/.test(s)) return null;
+    try {
+        const val = new Function(`"use strict"; return (${s});`)();
+        return Number.isFinite(val) ? val : null;
+    } catch { return null; }
+};
+const _mathInputMeta = new WeakMap();
+document.addEventListener('focusin', (e) => {
+    const inp = e.target;
+    if (!(inp instanceof HTMLInputElement) || inp.type !== 'number') return;
+    _mathInputMeta.set(inp, { min: inp.min, max: inp.max, step: inp.step });
+    inp.type = 'text';
+    inp.select();
+}, true);
+document.addEventListener('focusout', (e) => {
+    const inp = e.target;
+    if (!(inp instanceof HTMLInputElement) || !_mathInputMeta.has(inp)) return;
+    const meta = _mathInputMeta.get(inp);
+    _mathInputMeta.delete(inp);
+    const result = tryEvalMathExpr(inp.value);
+    if (result != null) {
+        const min = meta.min !== '' ? parseFloat(meta.min) : -Infinity;
+        const max = meta.max !== '' ? parseFloat(meta.max) : Infinity;
+        const step = meta.step !== '' ? parseFloat(meta.step) : 1;
+        let clamped = Math.max(min, Math.min(max, result));
+        if (step && Number.isFinite(step) && step > 0) {
+            const decimals = (step.toString().split('.')[1] || '').length;
+            clamped = parseFloat(clamped.toFixed(Math.max(decimals, 4)));
+        }
+        inp.value = String(clamped);
+    }
+    inp.type = 'number';
+    Object.assign(inp, { min: meta.min, max: meta.max, step: meta.step });
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+    inp.dispatchEvent(new Event('change', { bubbles: true }));
+}, true);
+
+// ── Settings getters ──────────────────────────────────────────────────────────
+const g = (id) => document.getElementById(id);
+const getF = (id) => parseFloat(g(id).value);
+const getI = (id) => parseInt(g(id).value);
+
+const brushSize      = () => getF('brush-size');
+const brushHardness  = () => getF('brush-hardness');
+const brushIntensity = () => getF('brush-intensity');
+const brushSpacing   = () => getF('brush-spacing');
+const blendMode      = () => getI('blend-mode');
+/** User choice when a selection exists: paint everywhere except selected vs only selected. */
+const getSelectionPaintScope = () => (g('sel-paint-scope-only')?.checked ? 'only' : 'exclude');
+/** 0 = no mask · 1 = exclude selected · 2 = only selected */
+const selectionConstraintForPaintTools = () => {
+    const mask = peekActiveSelectionMask();
+    if (!mask?.some((v) => v)) return 0;
+    return getSelectionPaintScope() === 'only' ? 2 : 1;
+};
+const selectionConstraintForOp = (op) => {
+    if (op.selectionConstraint != null) return op.selectionConstraint;
+    const mask = peekActiveSelectionMask();
+    return mask?.some((v) => v) ? 1 : 0;
+};
+const eraserSize     = () => getF('eraser-size');
+const eraserHardness = () => getF('eraser-hardness');
+const eraserIntensity= () => getF('eraser-intensity');
+const eraserSpacing  = () => getF('eraser-spacing');
+/** World-space full thickness along view; 0 = spherical erase. */
+const eraserDepth    = () => getF('eraser-depth');
+const paintColorHex    = () => g('paint-color')?.value ?? '#ff0000';
+
+/** Normalize user hex to #rrggbb for <input type="color"> */
+const normalizeBrushHex = (raw) => {
+    let s = (raw ?? '').trim();
+    if (!s) return null;
+    if (s[0] !== '#') s = `#${s}`;
+    const m3 = /^#([0-9a-fA-F]{3})$/.exec(s);
+    if (m3) {
+        const x = m3[1];
+        return `#${x[0]}${x[0]}${x[1]}${x[1]}${x[2]}${x[2]}`.toLowerCase();
+    }
+    if (/^#[0-9a-fA-F]{6}$/.test(s)) return s.toLowerCase();
+    return null;
+};
+
+const syncBrushHexFieldFromPicker = () => {
+    const picker = g('paint-color');
+    const hexEl = g('paint-color-hex');
+    if (picker && hexEl) hexEl.value = picker.value.toLowerCase();
+};
+
+const applyBrushHexFromTextField = () => {
+    const picker = g('paint-color');
+    const hexEl = g('paint-color-hex');
+    if (!picker || !hexEl) return;
+    const norm = normalizeBrushHex(hexEl.value);
+    if (norm) {
+        picker.value = norm;
+        hexEl.value = norm;
+    } else {
+        hexEl.value = picker.value.toLowerCase();
+    }
+    persistBrushColor();
+};
+
+// ── Cached UI colors (localStorage) ───────────────────────────────────────────
+const LS_BRUSH_COLOR_KEY = 'photoshock-brush-color';
+const LS_BG_COLOR_KEY = 'photoshock-bg-color';
+const LS_SWATCHES_KEY = 'photoshock-swatches-v1';
+
+const persistSwatches = () => {
+    try {
+        const data = swatches
+            .map((s) => {
+                const hex = normalizeBrushHex(s.hex);
+                return hex ? { id: String(s.id || ''), hex } : null;
+            })
+            .filter(Boolean);
+        localStorage.setItem(LS_SWATCHES_KEY, JSON.stringify(data));
+    } catch (_) { /* private mode / quota */ }
+};
+
+const loadCachedSwatches = () => {
+    try {
+        const raw = localStorage.getItem(LS_SWATCHES_KEY);
+        if (!raw) return;
+        const data = JSON.parse(raw);
+        if (!Array.isArray(data)) return;
+        swatches.length = 0;
+        for (const item of data) {
+            const hex = normalizeBrushHex(item?.hex);
+            if (!hex) continue;
+            const id =
+                typeof item?.id === 'string' && item.id
+                    ? item.id
+                    : `swatch-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+            swatches.push({ id, hex });
+        }
+    } catch (_) { /* ignore corrupt storage */ }
+};
+
+const persistBrushColor = () => {
+    try {
+        const norm = normalizeBrushHex(g('paint-color')?.value);
+        if (norm) localStorage.setItem(LS_BRUSH_COLOR_KEY, norm);
+    } catch (_) { /* private mode / quota */ }
+};
+
+const loadCachedBrushColor = () => {
+    try {
+        const norm = normalizeBrushHex(localStorage.getItem(LS_BRUSH_COLOR_KEY));
+        if (!norm) return;
+        const picker = g('paint-color');
+        const hexEl = g('paint-color-hex');
+        if (picker) picker.value = norm;
+        if (hexEl) hexEl.value = norm;
+    } catch (_) { /* ignore */ }
+};
+
+// Power-curve so the slider gives fine control at low end:
+// slider 0→1 maps to tolerance 0→0.25 via cubic (0.5^3*2=0.0625 at midpoint)
+const colorTolerance   = () => Math.pow(getF('color-tolerance'), 3) * 0.25;
+const brushSelectSize     = () => getF('brush-select-size');
+const brushSelectHardness = () => getF('brush-select-hardness');
+const brushSelectSpacing  = () => getF('brush-select-spacing');
+const generateSplatsSize  = () => getF('generate-splats-size');
+const generateSplatsDensity = () => getI('generate-splats-density');
+const resetSize    = () => parseFloat(g('reset-size')?.value ?? g('reset-size-num')?.value ?? '0.15');
+const resetHardness= () => getF('reset-hardness');
+const resetSpacing = () => getF('reset-spacing');
+
+const hexToRgb = (hex) => [
+    parseInt(hex.slice(1,3),16)/255,
+    parseInt(hex.slice(3,5),16)/255,
+    parseInt(hex.slice(5,7),16)/255,
+];
+
+/** Generator points (shape space) → world via preview root matrix → base or layersContainer local. */
+const buildShapeSplatsForLayer = ({
+    worldMat,
+    shapeType,
+    dims,
+    density,
+    hollowEdges,
+    colorHex,
+}) => {
+    const gen = shapeGenerators[shapeType];
+    if (!gen) return null;
+    const [cr, cg, cb] = hexToRgb(colorHex);
+    const points = gen(density, dims, hollowEdges);
+    const avgDim = (dims.sx + dims.sy + dims.sz) / 3;
+    const logScale = Math.max(-6, Math.min(-1.5, Math.log(avgDim / (Math.sqrt(density) * 1.8))));
+    const mkSplat = (lx, ly, lz) => ({
+        x: lx, y: ly, z: lz,
+        f_dc_0: (cr - 0.5) / SH_C0,
+        f_dc_1: (cg - 0.5) / SH_C0,
+        f_dc_2: (cb - 0.5) / SH_C0,
+        opacity: invSigmoid(0.92),
+        scale_0: logScale,
+        scale_1: logScale,
+        scale_2: logScale,
+        rot_0: 1, rot_1: 0, rot_2: 0, rot_3: 0,
+        nx: 0, ny: 1, nz: 0,
+    });
+    const dx = dims.sx || 1e-8;
+    const dy = dims.sy || 1e-8;
+    const dz = dims.sz || 1e-8;
+    const baseEnt = paintables.length > 0 ? paintables[0].entity : null;
+    const splats = [];
+    if (baseEnt) {
+        _shapeInvBaseScratch.copy(baseEnt.getWorldTransform()).invert();
+        for (const p of points) {
+            _shapeNormScratch.set(p.x / dx, p.y / dy, p.z / dz);
+            worldMat.transformPoint(_shapeNormScratch, _shapeWorldTmp);
+            _shapeInvBaseScratch.transformPoint(_shapeWorldTmp, _shapeLocalTmp);
+            splats.push(mkSplat(_shapeLocalTmp.x, _shapeLocalTmp.y, _shapeLocalTmp.z));
+        }
+    } else {
+        _shapeInvParent.copy(layersContainer.getWorldTransform()).invert();
+        for (const p of points) {
+            _shapeNormScratch.set(p.x / dx, p.y / dy, p.z / dz);
+            worldMat.transformPoint(_shapeNormScratch, _shapeWorldTmp);
+            _shapeInvParent.transformPoint(_shapeWorldTmp, _shapeLocalTmp);
+            splats.push(mkSplat(_shapeLocalTmp.x, _shapeLocalTmp.y, _shapeLocalTmp.z));
+        }
+    }
+    return splats;
+};
+
+const splatShapePreviewToLayer = () => {
+    if (!shapePreviewRoot?.parent) return;
+    const shapeType = g('shape-type')?.value ?? 'cube';
+    const color = g('shape-color')?.value ?? '#cccccc';
+    const dims = readShapeDimsFromUI();
+    const density = readShapeDensityFromUI();
+    const hollowEdges = !!g('shape-hollow-edges')?.checked;
+    saveShapeToolPrefs();
+    const worldMat = shapePreviewRoot.getWorldTransform();
+    const splats = buildShapeSplatsForLayer({
+        worldMat,
+        shapeType,
+        dims,
+        density,
+        hollowEdges,
+        colorHex: color,
+    });
+    if (!splats) {
+        alert(`Unknown shape: ${shapeType}`);
+        return;
+    }
+    const layer = {
+        id: `layer-${layerIdCounter++}`,
+        name: `${shapeType.charAt(0).toUpperCase() + shapeType.slice(1)}${hollowEdges ? ' (hollow)' : ''}`,
+        visible: true,
+        opacityPct: 100,
+        colorGrade: cloneColorGrade(),
+        ...createDefaultLayerTransform(),
+        splats,
+        selectionMask: null,
+    };
+    layers.push(layer);
+    selectedLayerId = layer.id;
+    hasSelection = false;
+    destroyShapePreview();
+    renderLayersUI();
+    void updateLayerEntity(layer)
+        .then(() => {
+            applyModelRotation();
+            if (!paintables.length) frameOrbitOnLayerSplats(layer);
+            updateSelectionUI();
+            refreshLayerGizmoAttachment();
+        })
+        .catch((err) => {
+            console.error('[shape layer]', err);
+            instructions.innerHTML =
+                `<p style="color:#f88">Could not build shape layer: ${err?.message || err}</p>`;
+        });
+};
+
+const createDefaultColorGrade = () => ({
+    exposure: 0,
+    contrast: 1,
+    blackPoint: 0,
+    whitePoint: 1,
+    saturation: 1,
+    temperature: 0,
+    tint: 0,
+    wheelShadowHex: '#808080',
+    wheelShadowAmt: 0,
+    wheelMidHex: '#808080',
+    wheelMidAmt: 0,
+    wheelHighHex: '#808080',
+    wheelHighAmt: 0,
+    sectors: Array.from({ length: 8 }, () => ({ h: 0, s: 0, l: 0 })),
+});
+
+let baseColorGrade = createDefaultColorGrade();
+
+const cloneColorGrade = (src = null) => JSON.parse(JSON.stringify(src ?? createDefaultColorGrade()));
+
+const ensureLayerColorGrade = (layer) => {
+    if (!layer || typeof layer !== 'object') return;
+    if (!layer.colorGrade?.sectors || layer.colorGrade.sectors.length !== 8) {
+        layer.colorGrade = cloneColorGrade();
+    }
+};
+
+const wheelRgbOffset = (hex, amt) => {
+    const h = typeof hex === 'string' && hex.length >= 7 ? hex : '#808080';
+    const [r, gr, b] = hexToRgb(h);
+    const a = Math.max(0, Math.min(1, Number(amt) || 0));
+    return [(r - 0.5) * 2 * a, (gr - 0.5) * 2 * a, (b - 0.5) * 2 * a];
+};
+
+/** Matches GLSL `sp_rgb2hsv` / `sp_hsv2rgb` / `sp_grade_sectors` / `sp_color_grade` for export + bake. */
+const spRgb2hsvCpu = (c) => {
+    const cr = c[0], cg = c[1], cb = c[2];
+    const mix = (a, b, t) => a * (1 - t) + b * t;
+    const step = (e, x) => (x < e ? 0 : 1);
+    // p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g))
+    //   components:  x    y    z    w
+    const t1 = step(cb, cg);
+    const px = mix(cb, cg, t1);
+    const py = mix(cg, cb, t1);
+    const pz = mix(-1, 0, t1);
+    const pw = mix(2 / 3, -1 / 3, t1);
+    // q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r))
+    const t2 = step(px, cr);
+    const qx = mix(px, cr, t2);
+    const qy = py;
+    const qz = mix(pw, pz, t2);
+    const qw = mix(cr, px, t2);
+    const d = qx - Math.min(qw, qy);
+    const e = 1e-10;
+    return [
+        Math.abs(qz + (qw - qy) / (6 * d + e)),
+        d / (qx + e),
+        qx,
+    ];
+};
+
+const spHsv2rgbCpu = (c) => {
+    const h = c[0], s = c[1], v = c[2];
+    const p = [h + 1, h + 2 / 3, h + 1 / 3].map((u) => {
+        const f = u - Math.floor(u);
+        return Math.abs(f * 6 - 3);
+    });
+    return [0, 1, 2].map((i) => {
+        const t = Math.max(0, Math.min(1, p[i] - 1));
+        const mixed = (1 - s) + s * t;
+        return v * mixed;
+    });
+};
+
+const spGradeSectorsCpu = (rgb, grade) => {
+    let hsv = spRgb2hsvCpu([Math.max(0, Math.min(1, rgb[0])), Math.max(0, Math.min(1, rgb[1])), Math.max(0, Math.min(1, rgb[2]))]);
+    const fsec = hsv[0] * 8;
+    const sectors = grade.sectors || [];
+    let adj = [sectors[0]?.h ?? 0, sectors[0]?.s ?? 0, sectors[0]?.l ?? 0];
+    for (let k = 1; k < 8; k++) {
+        if (fsec >= k) adj = [sectors[k]?.h ?? 0, sectors[k]?.s ?? 0, sectors[k]?.l ?? 0];
+    }
+    hsv[0] = (hsv[0] + adj[0]) - Math.floor(hsv[0] + adj[0]);
+    hsv[1] = Math.max(0, Math.min(1, hsv[1] * (1 + adj[1])));
+    hsv[2] = Math.max(0, Math.min(1, hsv[2] + adj[2]));
+    return spHsv2rgbCpu(hsv);
+};
+
+const cpuSpColorGrade = (col, grade) => {
+    const g = grade || createDefaultColorGrade();
+    const Lsplit = Math.max(0, Math.min(1, 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]));
+    const ba = [
+        Math.max(-4, Math.min(4, Number(g.exposure) || 0)),
+        Math.max(0.1, Math.min(3, Number(g.contrast) || 1)),
+        Math.max(0, Math.min(0.95, Number(g.blackPoint) || 0)),
+        Math.max(0.05, Math.min(1, Number(g.whitePoint) || 1)),
+    ];
+    const bb = [
+        Math.max(0, Math.min(2, Number(g.saturation) ?? 1)),
+        Math.max(-1, Math.min(1, Number(g.temperature) || 0)),
+        Math.max(-1, Math.min(1, Number(g.tint) || 0)),
+    ];
+    const cross = [0.2, 0.45, 0.55, 0.8];
+    const whSh = wheelRgbOffset(g.wheelShadowHex, g.wheelShadowAmt);
+    const whMd = wheelRgbOffset(g.wheelMidHex, g.wheelMidAmt);
+    const whHi = wheelRgbOffset(g.wheelHighHex, g.wheelHighAmt);
+
+    let rgb = [col[0] * 2 ** ba[0], col[1] * 2 ** ba[0], col[2] * 2 ** ba[0]];
+    const bp = ba[2];
+    const wp = Math.max(ba[3], bp + 1e-4);
+    rgb = rgb.map((x) => (x - bp) / Math.max(wp - bp, 1e-4));
+    rgb = rgb.map((x) => (x - 0.5) * ba[1] + 0.5);
+    rgb = rgb.map((x) => Math.max(0, Math.min(1, x)));
+    rgb = spGradeSectorsCpu(rgb, g);
+    const lu = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+    const sat = Math.max(0, Math.min(4, bb[0]));
+    rgb = rgb.map((c) => lu + (c - lu) * sat);
+    rgb[0] += bb[1] * 0.14;
+    rgb[2] -= bb[1] * 0.14;
+    rgb[0] += bb[2] * 0.10;
+    rgb[1] -= bb[2] * 0.10;
+    const sw = 1 - smoothstepJS(cross[0], cross[1], Lsplit);
+    const mw = smoothstepJS(cross[0], cross[1], Lsplit) * (1 - smoothstepJS(cross[2], cross[3], Lsplit));
+    const hw = smoothstepJS(cross[2], cross[3], Lsplit);
+    rgb[0] += whSh[0] * sw + whMd[0] * mw + whHi[0] * hw;
+    rgb[1] += whSh[1] * sw + whMd[1] * mw + whHi[1] * hw;
+    rgb[2] += whSh[2] * sw + whMd[2] * mw + whHi[2] * hw;
+    return rgb.map((x) => Math.max(0, Math.min(1, x)));
+};
+
+const rgbFromShDc = (f0, f1, f2) => [
+    Math.max(0, Math.min(1, 0.5 + f0 * SH_C0)),
+    Math.max(0, Math.min(1, 0.5 + f1 * SH_C0)),
+    Math.max(0, Math.min(1, 0.5 + f2 * SH_C0)),
+];
+
+const shDcFromRgb = (r, g, b) => [
+    (Math.max(0, Math.min(1, r)) - 0.5) / SH_C0,
+    (Math.max(0, Math.min(1, g)) - 0.5) / SH_C0,
+    (Math.max(0, Math.min(1, b)) - 0.5) / SH_C0,
+];
+
+/** In-place f_dc triplets [i..i+count) with `grade`. */
+/** True when grade matches defaults (export can skip CPU round-trip / HSV). */
+const colorGradeIsIdentity = (grade) => {
+    const gd = grade || createDefaultColorGrade();
+    if (Math.abs(Number(gd.exposure) || 0) > 1e-5) return false;
+    if (Math.abs(Number(gd.contrast) - 1) > 1e-5) return false;
+    if (Math.abs(Number(gd.blackPoint) || 0) > 1e-5) return false;
+    if (Math.abs(Number(gd.whitePoint) - 1) > 1e-5) return false;
+    if (Math.abs(Number(gd.saturation) - 1) > 1e-5) return false;
+    if (Math.abs(Number(gd.temperature) || 0) > 1e-5) return false;
+    if (Math.abs(Number(gd.tint) || 0) > 1e-5) return false;
+    if ((Number(gd.wheelShadowAmt) || 0) > 1e-5 || (Number(gd.wheelMidAmt) || 0) > 1e-5 || (Number(gd.wheelHighAmt) || 0) > 1e-5) return false;
+    const secs = gd.sectors || [];
+    for (let i = 0; i < 8; i++) {
+        const s = secs[i] || {};
+        if (Math.abs(Number(s.h) || 0) > 1e-5) return false;
+        if (Math.abs(Number(s.s) || 0) > 1e-5) return false;
+        if (Math.abs(Number(s.l) || 0) > 1e-5) return false;
+    }
+    return true;
+};
+
+const applyGradeToFdcTriplets = (f0, f1, f2, i0, count, grade) => {
+    if (colorGradeIsIdentity(grade)) return;
+    for (let i = i0; i < i0 + count; i++) {
+        const rgb = rgbFromShDc(f0[i], f1[i], f2[i]);
+        const gRgb = cpuSpColorGrade(rgb, grade);
+        const dc = shDcFromRgb(gRgb[0], gRgb[1], gRgb[2]);
+        f0[i] = dc[0];
+        f1[i] = dc[1];
+        f2[i] = dc[2];
+    }
+};
+
+const clampLayerOpacityPct = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 100;
+    return Math.max(0, Math.min(100, Math.round(n)));
+};
+const opacityPctToUniform = (pct) => clampLayerOpacityPct(pct) / 100;
+/** Multiply Gaussian-splat alpha (stored as logit) by a 0..1 display factor, matching uLayerOpacity in the shader. */
+const applyDisplayOpacityMultToLogit = (logit, mult) => {
+    const m = Math.max(0, Math.min(1, mult));
+    if (m >= 1 - 1e-8) return logit;
+    if (m <= 1e-8) return invSigmoid(1e-7);
+    const a = sigmoid(logit);
+    const aNew = Math.min(1 - 1e-7, Math.max(1e-7, a * m));
+    return invSigmoid(aNew);
+};
+const ensureLayerOpacityPct = (layer) => {
+    if (!layer) return;
+    if (layer.opacityPct == null || !Number.isFinite(Number(layer.opacityPct))) layer.opacityPct = 100;
+    else layer.opacityPct = clampLayerOpacityPct(layer.opacityPct);
+};
+const pushLayerOpacityToGsplat = (gsplat, pct) => {
+    if (!gsplat?.setParameter) return;
+    gsplat.setParameter('uLayerOpacity', opacityPctToUniform(pct));
+};
+
+const applyColorGradeToGsplat = (gsplat, grade) => {
+    if (!gsplat?.setParameter) return;
+    const gd = grade || createDefaultColorGrade();
+    gsplat.setParameter('uGradeBasicA', [
+        Math.max(-4, Math.min(4, Number(gd.exposure) || 0)),
+        Math.max(0.1, Math.min(3, Number(gd.contrast) || 1)),
+        Math.max(0, Math.min(0.95, Number(gd.blackPoint) || 0)),
+        Math.max(0.05, Math.min(1, Number(gd.whitePoint) || 1)),
+    ]);
+    gsplat.setParameter('uGradeBasicB', [
+        Math.max(0, Math.min(2, Number(gd.saturation) ?? 1)),
+        Math.max(-1, Math.min(1, Number(gd.temperature) || 0)),
+        Math.max(-1, Math.min(1, Number(gd.tint) || 0)),
+        1,
+    ]);
+    gsplat.setParameter('uGradeWheelSh', wheelRgbOffset(gd.wheelShadowHex, gd.wheelShadowAmt));
+    gsplat.setParameter('uGradeWheelMd', wheelRgbOffset(gd.wheelMidHex, gd.wheelMidAmt));
+    gsplat.setParameter('uGradeWheelHi', wheelRgbOffset(gd.wheelHighHex, gd.wheelHighAmt));
+    gsplat.setParameter('uGradeCross', [0.2, 0.45, 0.55, 0.8]);
+    for (let i = 0; i < 8; i++) {
+        const s = gd.sectors[i] || { h: 0, s: 0, l: 0 };
+        gsplat.setParameter(`uGradeSec${i}`, [
+            Math.max(-0.25, Math.min(0.25, Number(s.h) || 0)),
+            Math.max(-0.9, Math.min(3, Number(s.s) || 0)),
+            Math.max(-0.5, Math.min(0.5, Number(s.l) || 0)),
+        ]);
+    }
+    gsplat.setParameter('uGradeSelectedOnly', g('cg-grade-selected-only')?.checked ? 1 : 0);
+    gsplat.workBufferUpdate = pc.WORKBUFFER_UPDATE_ONCE;
+};
+
+const pushAllColorGradesToGPU = () => {
+    if (paintables[0]) {
+        applyColorGradeToGsplat(paintables[0].gsplatComponent, baseColorGrade);
+        pushLayerOpacityToGsplat(paintables[0].gsplatComponent, baseLayerOpacityPct);
+    }
+    for (const layer of layers) {
+        ensureLayerColorGrade(layer);
+        ensureLayerOpacityPct(layer);
+        const ent = layersContainer.findByName(`layer-${layer.id}`);
+        if (ent?.gsplat) {
+            applyColorGradeToGsplat(ent.gsplat, layer.colorGrade);
+            pushLayerOpacityToGsplat(ent.gsplat, layer.opacityPct);
+        }
+    }
+};
+
+let _syncingColorGradeUI = false;
+
+const getActiveColorGradeBundle = () => {
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        return {
+            grade: baseColorGrade,
+            gsplat: paintables[0]?.gsplatComponent ?? null,
+            label: 'Base model',
+        };
+    }
+    const layer = layers.find((l) => l.id === selectedLayerId);
+    if (!layer) {
+        return {
+            grade: baseColorGrade,
+            gsplat: paintables[0]?.gsplatComponent ?? null,
+            label: 'Base model',
+        };
+    }
+    ensureLayerColorGrade(layer);
+    const ent = layersContainer.findByName(`layer-${layer.id}`);
+    return { grade: layer.colorGrade, gsplat: ent?.gsplat ?? null, label: layer.name };
+};
+
+const readColorGradeFromUIInto = (grade) => {
+    const rf = (rangeId, def) => {
+        const v = parseFloat(g(rangeId)?.value);
+        return Number.isFinite(v) ? v : def;
+    };
+    grade.exposure = rf('cg-exposure', 0);
+    grade.contrast = rf('cg-contrast', 1);
+    grade.blackPoint = rf('cg-black', 0);
+    grade.whitePoint = rf('cg-white', 1);
+    if (grade.blackPoint >= grade.whitePoint) {
+        grade.whitePoint = Math.min(1, grade.blackPoint + 0.05);
+    }
+    grade.saturation = rf('cg-sat', 1);
+    grade.temperature = rf('cg-temp', 0);
+    grade.tint = rf('cg-tint', 0);
+    grade.wheelShadowHex = g('cg-wheel-sh')?.value ?? '#808080';
+    grade.wheelShadowAmt = rf('cg-wheel-sh-amt', 0);
+    grade.wheelMidHex = g('cg-wheel-md')?.value ?? '#808080';
+    grade.wheelMidAmt = rf('cg-wheel-md-amt', 0);
+    grade.wheelHighHex = g('cg-wheel-hi')?.value ?? '#808080';
+    grade.wheelHighAmt = rf('cg-wheel-hi-amt', 0);
+    for (let i = 0; i < 8; i++) {
+        if (!grade.sectors[i]) grade.sectors[i] = { h: 0, s: 0, l: 0 };
+        grade.sectors[i].h = rf(`cg-s${i}-h`, 0);
+        grade.sectors[i].s = rf(`cg-s${i}-s`, 0);
+        grade.sectors[i].l = rf(`cg-s${i}-l`, 0);
+    }
+};
+
+const commitActiveColorGradeFromUI = () => {
+    if (_syncingColorGradeUI) return;
+    const { grade, gsplat } = getActiveColorGradeBundle();
+    readColorGradeFromUIInto(grade);
+    applyColorGradeToGsplat(gsplat, grade);
+};
+
+const refreshColorGradeUIFromSelection = () => {
+    _syncingColorGradeUI = true;
+    try {
+        const { grade } = getActiveColorGradeBundle();
+        const setR = (id, v) => {
+            const el = g(id);
+            if (el) el.value = String(v);
+        };
+        setR('cg-exposure', grade.exposure);
+        setR('cg-exposure-num', grade.exposure);
+        setR('cg-contrast', grade.contrast);
+        setR('cg-contrast-num', grade.contrast);
+        setR('cg-black', grade.blackPoint);
+        setR('cg-black-num', grade.blackPoint);
+        setR('cg-white', grade.whitePoint);
+        setR('cg-white-num', grade.whitePoint);
+        setR('cg-sat', grade.saturation);
+        setR('cg-sat-num', grade.saturation);
+        setR('cg-temp', grade.temperature);
+        setR('cg-temp-num', grade.temperature);
+        setR('cg-tint', grade.tint);
+        setR('cg-tint-num', grade.tint);
+        if (g('cg-wheel-sh')) g('cg-wheel-sh').value = grade.wheelShadowHex ?? '#808080';
+        setR('cg-wheel-sh-amt', grade.wheelShadowAmt ?? 0);
+        setR('cg-wheel-sh-amt-num', grade.wheelShadowAmt ?? 0);
+        if (g('cg-wheel-md')) g('cg-wheel-md').value = grade.wheelMidHex ?? '#808080';
+        setR('cg-wheel-md-amt', grade.wheelMidAmt ?? 0);
+        setR('cg-wheel-md-amt-num', grade.wheelMidAmt ?? 0);
+        if (g('cg-wheel-hi')) g('cg-wheel-hi').value = grade.wheelHighHex ?? '#808080';
+        setR('cg-wheel-hi-amt', grade.wheelHighAmt ?? 0);
+        setR('cg-wheel-hi-amt-num', grade.wheelHighAmt ?? 0);
+        for (let i = 0; i < 8; i++) {
+            const s = grade.sectors[i] || { h: 0, s: 0, l: 0 };
+            setR(`cg-s${i}-h`, s.h);
+            setR(`cg-s${i}-s`, s.s);
+            setR(`cg-s${i}-l`, s.l);
+        }
+    } finally {
+        _syncingColorGradeUI = false;
+        refreshCgGradeSliderTracks();
+    }
+};
+
+const resetActiveColorGrade = () => {
+    const { grade, gsplat } = getActiveColorGradeBundle();
+    const fresh = createDefaultColorGrade();
+    for (const k of Object.keys(fresh)) {
+        if (k === 'sectors') grade.sectors = fresh.sectors.map((x) => ({ ...x }));
+        else grade[k] = fresh[k];
+    }
+    refreshColorGradeUIFromSelection();
+    applyColorGradeToGsplat(gsplat, grade);
+};
+
+/** Bake current color grade (and optional GPU paint for base) into SH DC, reset grade UI. */
+const bakeColorGradeIntoActiveTarget = async () => {
+    commitActiveColorGradeFromUI();
+    const gradeOnlySel = !!g('cg-grade-selected-only')?.checked;
+
+    const activeLayer = getActiveLayer();
+    if (activeLayer) {
+        ensureLayerColorGrade(activeLayer);
+        const gSnap = cloneColorGrade(activeLayer.colorGrade);
+        const ent = layersContainer.findByName(`layer-${activeLayer.id}`);
+        const baked = ent?.gsplat ? await getLayerPaintFromGpu(activeLayer, ent.gsplat) : null;
+        const mask = activeLayer.selectionMask;
+        for (let i = 0; i < activeLayer.splats.length; i++) {
+            if (gradeOnlySel && mask && !mask[i]) continue;
+            const s = activeLayer.splats[i];
+            const f0 = baked ? baked.out0[i] : (s.f_dc_0 ?? 0);
+            const f1 = baked ? baked.out1[i] : (s.f_dc_1 ?? 0);
+            const f2 = baked ? baked.out2[i] : (s.f_dc_2 ?? 0);
+            const rgb = rgbFromShDc(f0, f1, f2);
+            const outRgb = cpuSpColorGrade(rgb, gSnap);
+            const dc = shDcFromRgb(outRgb[0], outRgb[1], outRgb[2]);
+            s.f_dc_0 = dc[0]; s.f_dc_1 = dc[1]; s.f_dc_2 = dc[2];
+            if (baked?.outOp) s.opacity = baked.outOp[i];
+        }
+        activeLayer.colorGrade = createDefaultColorGrade();
+        await updateLayerEntity(activeLayer);
+        refreshColorGradeUIFromSelection();
+        pushAllColorGradesToGPU();
+        return;
+    }
+
+    if (!gsplatDataCache || !paintables.length) {
+        alert('Nothing to bake.');
+        return;
+    }
+    const gSnap = cloneColorGrade(baseColorGrade);
+    const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
+    if (!painted) {
+        alert('Could not read colors for bake.');
+        return;
+    }
+    const n = gsplatDataCache.numSplats;
+    const o0 = new Float32Array(painted.out0);
+    const o1 = new Float32Array(painted.out1);
+    const o2 = new Float32Array(painted.out2);
+    const oOp = new Float32Array(painted.outOp);
+    const mask = selectionMask;
+    for (let i = 0; i < n; i++) {
+        if (gradeOnlySel && mask && !mask[i]) continue;
+        const rgb = rgbFromShDc(o0[i], o1[i], o2[i]);
+        const outRgb = cpuSpColorGrade(rgb, gSnap);
+        const dc = shDcFromRgb(outRgb[0], outRgb[1], outRgb[2]);
+        o0[i] = dc[0]; o1[i] = dc[1]; o2[i] = dc[2];
+    }
+    const { x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache;
+    const columns = [];
+    const addCol = (name, data) => { if (data) columns.push(new Column(name, data)); };
+    addCol('x', xA); addCol('y', yA); addCol('z', zA);
+    addCol('nx', extra.nx); addCol('ny', extra.ny); addCol('nz', extra.nz);
+    addCol('f_dc_0', o0); addCol('f_dc_1', o1); addCol('f_dc_2', o2);
+    for (const sh of shRest) addCol(sh.key, sh.data);
+    addCol('opacity', oOp);
+    addCol('scale_0', extra.scale_0); addCol('scale_1', extra.scale_1); addCol('scale_2', extra.scale_2);
+    addCol('rot_0', extra.rot_0); addCol('rot_1', extra.rot_1); addCol('rot_2', extra.rot_2); addCol('rot_3', extra.rot_3);
+
+    const table = new DataTable(columns);
+    const memFs = new MemoryFileSystem();
+    const filename = 'painted.ply';
+    await writePly(
+        { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
+        memFs,
+    );
+    const buffer = memFs.results?.get(filename);
+    if (!buffer) { alert('Bake failed.'); return; }
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const file = new File([blob], filename, { type: 'application/octet-stream' });
+    strokes.length = 0;
+    redoStack.length = 0;
+    activeStroke = null;
+    updateUndoRedoUI();
+    baseColorGrade = createDefaultColorGrade();
+    await loadSplat(file, { preserveCamera: true });
+    refreshColorGradeUIFromSelection();
+    pushAllColorGradesToGPU();
+};
+
+const strokeTouchesLayerId = (stroke, layerId) =>
+    (stroke.ops || []).some((o) => o.layerId === layerId)
+    || (stroke.cpuOps || []).some((o) => o.layerId === layerId);
+
+const strokeTouchesBaseModel = (stroke) =>
+    (stroke.ops || []).some((o) => !o.layerId)
+    || (stroke.cpuOps || []).some((o) => !o.layerId);
+
+/** Bake brush/bucket/erase GPU paint into splat SH + opacity; clear textures & undo for this target. Color grade is left as-is. */
+const bakeBrushPaintIntoModel = async () => {
+    const activeLayer = getActiveLayer();
+    if (activeLayer) {
+        const ent = layersContainer.findByName(`layer-${activeLayer.id}`);
+        const baked = ent?.gsplat ? await getLayerPaintFromGpu(activeLayer, ent.gsplat) : null;
+        if (!baked) {
+            alert('Could not read paint on this layer.');
+            return;
+        }
+        for (let i = 0; i < activeLayer.splats.length; i++) {
+            const s = activeLayer.splats[i];
+            s.f_dc_0 = baked.out0[i];
+            s.f_dc_1 = baked.out1[i];
+            s.f_dc_2 = baked.out2[i];
+            s.opacity = baked.outOp[i];
+        }
+        for (let i = strokes.length - 1; i >= 0; i--) {
+            if (strokeTouchesLayerId(strokes[i], activeLayer.id)) strokes.splice(i, 1);
+        }
+        redoStack.length = 0;
+        activeStroke = null;
+        updateUndoRedoUI();
+        await updateLayerEntity(activeLayer);
+        return;
+    }
+
+    if (!gsplatDataCache || !paintables.length) {
+        alert('Nothing to bake.');
+        return;
+    }
+    const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
+    if (!painted) {
+        alert('Could not read paint for bake.');
+        return;
+    }
+    const n = gsplatDataCache.numSplats;
+    const o0 = new Float32Array(painted.out0);
+    const o1 = new Float32Array(painted.out1);
+    const o2 = new Float32Array(painted.out2);
+    const oOp = new Float32Array(painted.outOp);
+    const { x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache;
+    const columns = [];
+    const addCol = (name, data) => { if (data) columns.push(new Column(name, data)); };
+    addCol('x', xA); addCol('y', yA); addCol('z', zA);
+    addCol('nx', extra.nx); addCol('ny', extra.ny); addCol('nz', extra.nz);
+    addCol('f_dc_0', o0); addCol('f_dc_1', o1); addCol('f_dc_2', o2);
+    for (const sh of shRest) addCol(sh.key, sh.data);
+    addCol('opacity', oOp);
+    addCol('scale_0', extra.scale_0); addCol('scale_1', extra.scale_1); addCol('scale_2', extra.scale_2);
+    addCol('rot_0', extra.rot_0); addCol('rot_1', extra.rot_1); addCol('rot_2', extra.rot_2); addCol('rot_3', extra.rot_3);
+
+    const table = new DataTable(columns);
+    const memFs = new MemoryFileSystem();
+    const filename = 'painted.ply';
+    await writePly(
+        { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
+        memFs,
+    );
+    const buffer = memFs.results?.get(filename);
+    if (!buffer) { alert('Bake failed.'); return; }
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const file = new File([blob], filename, { type: 'application/octet-stream' });
+    for (let i = strokes.length - 1; i >= 0; i--) {
+        if (strokeTouchesBaseModel(strokes[i])) strokes.splice(i, 1);
+    }
+    redoStack.length = 0;
+    activeStroke = null;
+    updateUndoRedoUI();
+    await loadSplat(file, { preserveCamera: true });
+    pushAllColorGradesToGPU();
+};
+
+const selectionHighlightColor = () => {
+    const hex = g('selection-highlight-color')?.value ?? '#2670e8';
+    const intensity = parseFloat(g('selection-highlight-intensity')?.value ?? g('selection-highlight-intensity-num')?.value ?? '0.45');
+    const [r, grn, b] = hexToRgb(hex);
+    return [r, grn, b, Math.max(0.1, Math.min(1, intensity))];
+};
+const getComputedPaintColor = () => hexToRgb(paintColorHex());
+
+// ── Brush cursor ──────────────────────────────────────────────────────────────
+// Per-tool hover tint colors [r, g, b, strength]
+const HOVER_COLORS = {
+    brush:         () => { const c = getComputedPaintColor(); return [c[0], c[1], c[2], 0.35]; },
+    eraser:        () => [1.0, 0.35, 0.1, 0.35],
+    resetBrush:    () => [0.2, 0.9, 0.4, 0.35],
+    brushSelect:   () => [0.3, 0.7, 1.0, 0.35],
+    generateSplats:() => { const [r,g,b] = generateSplatsSampledColor; return [r, g, b, 0.35]; },
+    splatSelect:   () => [0.3, 0.7, 1.0, 0.35],
+};
+
+const clearHoverSphere = () => {
+    for (const p of paintables) {
+        p.gsplatComponent.setParameter('uHoverSphere', [0, 0, 0, 0]);
+    }
+    for (const layer of layers) {
+        const ent = layersContainer.findByName(`layer-${layer.id}`);
+        if (ent?.gsplat) ent.gsplat.setParameter('uHoverSphere', [0, 0, 0, 0]);
+    }
+};
+
+const updateBrushCursorAt = (x, y) => {
+    brushCursor.style.left = `${x}px`;
+    brushCursor.style.top  = `${y}px`;
+    const wr   = activeTool === 'eraser' ? eraserSize()
+        : activeTool === 'resetBrush' ? resetSize()
+        : activeTool === 'brushSelect' ? brushSelectSize()
+        : activeTool === 'generateSplats' ? generateSplatsSize() : brushSize();
+    const fov  = (60 * Math.PI) / 180;
+    const px   = Math.max(4, (wr / (orbit.distance * Math.tan(fov / 2))) * (canvas.clientHeight / 2));
+    const d    = px * 2;
+    brushCursor.style.width  = `${d}px`;
+    brushCursor.style.height = `${d}px`;
+
+    // Update 3D hover sphere on the model surface (suppress during active strokes)
+    const prim = getPrimarySplatEntity();
+    if (!prim || isPainting || isGenerateSplatsPainting || isBrushSelecting) return;
+    const worldPt = getWorldPoint(x, y);
+    if (!worldPt) return;
+
+    const invMat = new pc.Mat4().copy(prim.getWorldTransform()).invert();
+    const modelPt = new pc.Vec3();
+    invMat.transformPoint(worldPt, modelPt);
+    const refM = new pc.Vec3();
+    invMat.transformPoint(new pc.Vec3(worldPt.x + wr, worldPt.y, worldPt.z), refM);
+    const modelRadius = modelPt.distance(refM);
+
+    const colorFn = HOVER_COLORS[activeTool];
+    const hoverColor = colorFn ? colorFn() : [1, 1, 1, 0.3];
+
+    // Apply hover to the base model and to any user layer entities.
+    for (const p of paintables) {
+        p.gsplatComponent.setParameter('uHoverSphere', [modelPt.x, modelPt.y, modelPt.z, modelRadius]);
+        p.gsplatComponent.setParameter('uHoverColor',  hoverColor);
+    }
+    for (const layer of layers) {
+        const ent = layersContainer.findByName(`layer-${layer.id}`);
+        if (ent?.gsplat) {
+            ent.gsplat.setParameter('uHoverSphere', [modelPt.x, modelPt.y, modelPt.z, modelRadius]);
+            ent.gsplat.setParameter('uHoverColor',  hoverColor);
+        }
+    }
+};
+
+// ── Processor uniforms ────────────────────────────────────────────────────────
+const setUniformsForPaint = (p, sphere, color, hardness, constraint) => {
+    p.paintProcessor.setParameter('uPaintSphere',   sphere);
+    p.paintProcessor.setParameter('uPaintColor',     color);
+    p.paintProcessor.setParameter('uHardness',      hardness);
+    p.paintProcessor.setParameter('uSelectionConstraint', constraint);
+};
+
+const setUniformsForErase = (p, sphere, color, hardness, eraseDepthHalfModel, eraseViewDirModel, constraint) => {
+    p.eraseProcessor.setParameter('uPaintSphere',   sphere);
+    p.eraseProcessor.setParameter('uPaintColor',     color);
+    p.eraseProcessor.setParameter('uHardness',      hardness);
+    p.eraseProcessor.setParameter('uSelectionConstraint', constraint);
+    p.eraseProcessor.setParameter('uEraseViewDir',   eraseViewDirModel);
+    p.eraseProcessor.setParameter('uEraseDepthHalf', eraseDepthHalfModel);
+};
+
+/**
+ * View-aligned erase cylinder in model space: half-length along ray and unit axis.
+ * depthWorldFull is total world thickness (0 → sphere mode, half-length derived inside).
+ */
+const computeEraseCylinderInModel = (worldPt, invMat, depthWorldFull) => {
+    const z = eraseViewModelScratch;
+    let halfModel = 0;
+    if (!depthWorldFull || depthWorldFull < 1e-8) {
+        z.set(0, 0, 1);
+        return { halfModel: 0, viewModel: z };
+    }
+    const camPos = cameraEntity.getPosition();
+    eraseRayWorldScratch.sub2(worldPt, camPos);
+    const rayLen = eraseRayWorldScratch.length();
+    if (rayLen < 1e-10) {
+        z.set(0, 0, 1);
+        return { halfModel: 0, viewModel: z };
+    }
+    eraseRayWorldScratch.mulScalar(1 / rayLen);
+    const halfW = depthWorldFull * 0.5;
+    eraseWorldEdgeScratch.set(
+        worldPt.x + eraseRayWorldScratch.x * halfW,
+        worldPt.y + eraseRayWorldScratch.y * halfW,
+        worldPt.z + eraseRayWorldScratch.z * halfW,
+    );
+    invMat.transformPoint(worldPt, eraseModelCenterScratch);
+    invMat.transformPoint(eraseWorldEdgeScratch, eraseModelEdgeScratch);
+    z.sub2(eraseModelEdgeScratch, eraseModelCenterScratch);
+    const ml = z.length();
+    if (ml < 1e-10) {
+        z.set(0, 0, 1);
+        return { halfModel: 0, viewModel: z };
+    }
+    halfModel = ml;
+    z.mulScalar(1 / ml);
+    return { halfModel, viewModel: z };
+};
+
+const syncDisplayUniforms = (p) => {
+    const baseActive = selectedLayerId === 'base' || !selectedLayerId;
+    p.gsplatComponent.setParameter('uBlendMode',     blendMode());
+    p.gsplatComponent.setParameter('uShowSelection', baseActive && hasSelection && showSelectionHighlight ? 1 : 0);
+    p.gsplatComponent.setParameter('uSelectionColor', selectionHighlightColor());
+    pushSplatViewShaderUniforms(p.gsplatComponent);
+    applyColorGradeToGsplat(p.gsplatComponent, baseColorGrade);
+    pushLayerOpacityToGsplat(p.gsplatComponent, baseLayerOpacityPct);
+};
+
+const syncSplatViewStyleToolbar = () => {
+    const grp = g('splat-view-style-group');
+    if (grp) grp.classList.toggle('hidden', !splatMode);
+    for (const btn of document.querySelectorAll('.splat-style-btn')) {
+        btn.classList.toggle('active', btn.dataset.splatStyle === splatViewStyle);
+    }
+};
+
+const setSplatViewStyle = (style) => {
+    if (style !== 'centers' && style !== 'rings') return;
+    splatViewStyle = style;
+    syncSplatViewStyleToolbar();
+    for (const p of paintables) pushSplatViewShaderUniforms(p.gsplatComponent);
+    for (const layer of layers) {
+        const entity = layersContainer.findByName(`layer-${layer.id}`);
+        if (entity?.gsplat) pushSplatViewShaderUniforms(entity.gsplat);
+    }
+};
+
+const setSplatMode = (active) => {
+    splatMode = active;
+    for (const p of paintables) {
+        pushSplatViewShaderUniforms(p.gsplatComponent);
+    }
+    for (const layer of layers) {
+        const entity = layersContainer.findByName(`layer-${layer.id}`);
+        if (entity?.gsplat) pushSplatViewShaderUniforms(entity.gsplat);
+    }
+    g('btn-splat-mode')?.classList.toggle('active', active);
+    g('btn-splat-mode')?.setAttribute(
+        'title',
+        active ? 'Splat mode ON (M) — ● cyan center dots · ○ splat-colored ring strokes (SuperSplat-style)' : 'Splat mode (M) — SuperSplat-style centers / rings',
+    );
+    syncSplatViewStyleToolbar();
+};
+
+// ── Model transform (global) + per-layer local TRS on each splat entity ───────
+// Global euler (degrees) on baseContainer + layersContainer (no UI; matches former defaults X=0,Y=0,Z=180).
+let globalModelRotation = { x: 0, y: 0, z: 180 };
+
+const applyBaseEntityTransform = () => {
+    if (!paintables.length) return;
+    const e = paintables[0].entity;
+    const t = baseTransform;
+    e.setLocalPosition(t.position.x, t.position.y, t.position.z);
+    e.setLocalEulerAngles(t.rotation.x, t.rotation.y, t.rotation.z);
+    e.setLocalScale(t.scale.x, t.scale.y, t.scale.z);
+};
+
+const applySingleLayerEntityTransform = (layer) => {
+    const ent = layersContainer.findByName(`layer-${layer.id}`);
+    if (!ent) return;
+    ensureUserLayerTransform(layer);
+    ent.setLocalPosition(layer.position.x, layer.position.y, layer.position.z);
+    ent.setLocalEulerAngles(layer.rotation.x, layer.rotation.y, layer.rotation.z);
+    ent.setLocalScale(layer.scale.x, layer.scale.y, layer.scale.z);
+};
+
+const applyAllLayerEntityTransforms = () => {
+    applyBaseEntityTransform();
+    for (const layer of layers) applySingleLayerEntityTransform(layer);
+};
+
+const applyModelRotation = () => {
+    const { x: rx, y: ry, z: rz } = globalModelRotation;
+    baseContainer.setLocalEulerAngles(rx, ry, rz);
+    layersContainer.setLocalEulerAngles(rx, ry, rz);
+    applyAllLayerEntityTransforms();
+};
+
+const snapshotCameraResetFromFramedView = () => {
+    cameraResetState.target.copy(orbit.target);
+    cameraResetState.distance = orbit.distance;
+    cameraResetState.yaw = orbit.yaw;
+    cameraResetState.pitch = orbit.pitch;
+    flyCamResetState.pos.copy(cameraEntity.getPosition());
+    flyCamResetState.yaw = orbit.yaw;
+    flyCamResetState.pitch = orbit.pitch;
+};
+
+const resetCamera = () => {
+    if (cameraNavMode === 'orbit') {
+        orbit.target.copy(cameraResetState.target);
+        orbit.distance = cameraResetState.distance;
+        orbit.yaw = cameraResetState.yaw;
+        orbit.pitch = cameraResetState.pitch;
+    } else {
+        flyCam.pos.copy(flyCamResetState.pos);
+        flyCam.yaw = flyCamResetState.yaw;
+        flyCam.pitch = flyCamResetState.pitch;
+    }
+    updateCamera();
+};
+
+const resetModelRotation = () => {
+    globalModelRotation = { x: 0, y: 0, z: 180 };
+    applyModelRotation();
+};
+
+// ── Layer helpers ────────────────────────────────────────────────────────────
+const getUniqueLayerName = () => {
+    const used = new Set(layers.map((l) => l.name));
+    let n = 1;
+    while (used.has(`Layer ${n}`)) n++;
+    return `Layer ${n}`;
+};
+
+const addLayer = () => {
+    const layer = {
+        id: `layer-${layerIdCounter++}`,
+        name: getUniqueLayerName(),
+        visible: true,
+        opacityPct: 100,
+        splats: [],
+        selectionMask: null,
+        colorGrade: cloneColorGrade(),
+        ...createDefaultLayerTransform(),
+    };
+    layers.push(layer);
+    selectedLayerId = layer.id;
+    hasSelection = false;
+    renderLayersUI();
+    updateLayerEntity(layer);
+};
+
+const deleteLayer = (layerId) => {
+    const idx = layers.findIndex((l) => l.id === layerId);
+    if (idx < 0) return;
+    const layer = layers[idx];
+    destroyLayerGsplatPaint(layer);
+    const child = layersContainer.findByName(`layer-${layerId}`);
+    if (child) child.destroy();
+    layers.splice(idx, 1);
+    if (selectedLayerId === layerId) {
+        selectedLayerId = layers.length ? layers[Math.min(idx, layers.length - 1)].id : 'base';
+        hasSelection = selectedLayerId === 'base'
+            ? !!(selectionMask?.some(v => v > 0))
+            : !!(layers.find(l => l.id === selectedLayerId)?.selectionMask?.some(v => v > 0));
+    }
+    renderLayersUI();
+    updateSelectionUI();
+};
+
+const duplicateLayerDisplayName = (baseName) => {
+    const used = new Set(layers.map((l) => l.name));
+    let name = `${baseName} copy`;
+    let n = 2;
+    while (used.has(name)) {
+        name = `${baseName} copy ${n}`;
+        n++;
+    }
+    return name;
+};
+
+/** Deep-copy splats + transform; bakes brush from GPU so the copy matches the viewport. */
+const duplicateLayer = async (layerId) => {
+    const idx = layers.findIndex((l) => l.id === layerId);
+    if (idx < 0) return;
+    const src = layers[idx];
+    ensureUserLayerTransform(src);
+
+    const splats = src.splats.map((s) => ({ ...s }));
+    const ent = layersContainer.findByName(`layer-${src.id}`);
+    if (ent?.gsplat && splats.length) {
+        const baked = await getLayerPaintFromGpu(src, ent.gsplat);
+        if (baked) {
+            for (let i = 0; i < splats.length; i++) {
+                splats[i].f_dc_0 = baked.out0[i];
+                splats[i].f_dc_1 = baked.out1[i];
+                splats[i].f_dc_2 = baked.out2[i];
+                splats[i].opacity = baked.outOp[i];
+            }
+        }
+    }
+
+    ensureLayerColorGrade(src);
+    ensureLayerOpacityPct(src);
+    const newLayer = {
+        id: `layer-${layerIdCounter++}`,
+        name: duplicateLayerDisplayName(src.name),
+        visible: src.visible,
+        opacityPct: src.opacityPct,
+        splats,
+        selectionMask:
+            src.selectionMask && src.selectionMask.length === splats.length
+                ? new Uint8Array(src.selectionMask)
+                : null,
+        colorGrade: cloneColorGrade(src.colorGrade),
+        ...createDefaultLayerTransform(),
+    };
+    newLayer.position = { ...src.position };
+    newLayer.rotation = { ...src.rotation };
+    newLayer.scale = { ...src.scale };
+
+    layers.splice(idx + 1, 0, newLayer);
+    selectedLayerId = newLayer.id;
+    hasSelection = !!(newLayer.selectionMask?.some((v) => v > 0));
+    renderLayersUI();
+    updateSelectionUI();
+
+    try {
+        await updateLayerEntity(newLayer);
+    } catch (e) {
+        console.error(e);
+        const fi = layers.findIndex((l) => l.id === newLayer.id);
+        if (fi >= 0) {
+            destroyLayerGsplatPaint(newLayer);
+            const ch = layersContainer.findByName(`layer-${newLayer.id}`);
+            if (ch) ch.destroy();
+            layers.splice(fi, 1);
+        }
+        selectedLayerId = src.id;
+        hasSelection = !!(src.selectionMask?.some((v) => v > 0));
+        renderLayersUI();
+        updateSelectionUI();
+        alert(`Duplicate layer failed: ${e?.message || e}`);
+        return;
+    }
+    renderLayersUI();
+    refreshLayerGizmoAttachment();
+};
+
+const separateSelectionDisplayName = (baseName) => {
+    const used = new Set(layers.map((l) => l.name));
+    let name = `${baseName} selection`;
+    let n = 2;
+    while (used.has(name)) {
+        name = `${baseName} selection ${n}`;
+        n++;
+    }
+    return name;
+};
+
+/** Move selected splats on the active user layer into a new layer (same transform & grade); remainder stays on the source. */
+const separateSelectionToNewLayer = async () => {
+    const src = getActiveLayer();
+    if (!src) {
+        alert('Select a user layer (not Base), select splats, then separate.');
+        return;
+    }
+    const mask = src.selectionMask;
+    if (!mask || mask.length !== src.splats.length || !mask.some((v) => v > 0)) {
+        alert('No selection on this layer.');
+        return;
+    }
+
+    const ent = layersContainer.findByName(`layer-${src.id}`);
+    const n = src.splats.length;
+    const bakedSplats = src.splats.map((s) => ({ ...s }));
+    if (ent?.gsplat && n) {
+        const baked = await getLayerPaintFromGpu(src, ent.gsplat);
+        if (baked) {
+            for (let i = 0; i < n; i++) {
+                bakedSplats[i].f_dc_0 = baked.out0[i];
+                bakedSplats[i].f_dc_1 = baked.out1[i];
+                bakedSplats[i].f_dc_2 = baked.out2[i];
+                bakedSplats[i].opacity = baked.outOp[i];
+            }
+        }
+    }
+
+    const fullBakedBackup = bakedSplats.map((s) => ({ ...s }));
+    const picked = [];
+    const remainder = [];
+    for (let i = 0; i < n; i++) {
+        if (mask[i]) picked.push(bakedSplats[i]);
+        else remainder.push(bakedSplats[i]);
+    }
+    if (!picked.length) {
+        alert('No splats in selection.');
+        return;
+    }
+
+    const srcIdx = layers.findIndex((l) => l.id === src.id);
+    if (srcIdx < 0) return;
+
+    const maskBackup = new Uint8Array(mask);
+    ensureLayerColorGrade(src);
+    ensureLayerOpacityPct(src);
+    const newLayer = {
+        id: `layer-${layerIdCounter++}`,
+        name: separateSelectionDisplayName(src.name),
+        visible: true,
+        opacityPct: src.opacityPct,
+        splats: picked,
+        selectionMask: null,
+        colorGrade: cloneColorGrade(src.colorGrade),
+        ...createDefaultLayerTransform(),
+    };
+    newLayer.position = { ...src.position };
+    newLayer.rotation = { ...src.rotation };
+    newLayer.scale = { ...src.scale };
+
+    src.splats = remainder;
+    src.selectionMask = null;
+    layers.splice(srcIdx + 1, 0, newLayer);
+
+    const rollback = async () => {
+        const ni = layers.findIndex((l) => l.id === newLayer.id);
+        if (ni >= 0) {
+            destroyLayerGsplatPaint(layers[ni]);
+            const ch = layersContainer.findByName(`layer-${layers[ni].id}`);
+            if (ch) ch.destroy();
+            layers.splice(ni, 1);
+        }
+        src.splats = fullBakedBackup;
+        src.selectionMask = new Uint8Array(maskBackup);
+        hasSelection = maskBackup.some((v) => v > 0);
+        selectionSphere = [0, 0, 0, hasSelection ? 9999 : -1];
+        selectedLayerId = src.id;
+        renderLayersUI();
+        updateSelectionUI();
+        try {
+            await updateLayerEntity(src);
+        } catch (_) { /* ignore */ }
+    };
+
+    hasSelection = false;
+    selectionSphere = [0, 0, 0, -1];
+    renderLayersUI();
+    updateSelectionUI();
+
+    try {
+        await updateLayerEntity(src);
+    } catch (e) {
+        console.error(e);
+        await rollback();
+        alert(`Could not update layer: ${e?.message || e}`);
+        return;
+    }
+
+    try {
+        await updateLayerEntity(newLayer);
+    } catch (e) {
+        console.error(e);
+        await rollback();
+        alert(`Could not create new layer: ${e?.message || e}`);
+        return;
+    }
+
+    selectedLayerId = newLayer.id;
+    const nn = newLayer.splats.length;
+    newLayer.selectionMask = new Uint8Array(nn);
+    newLayer.selectionMask.fill(1);
+    hasSelection = true;
+    recomputeSelectionSphere();
+
+    renderLayersUI();
+    updateSelectionUI();
+    refreshLayerGizmoAttachment();
+};
+
+const toggleLayerVisibility = (layerId) => {
+    const layer = layers.find((l) => l.id === layerId);
+    if (!layer) return;
+    layer.visible = !layer.visible;
+    const child = layersContainer.findByName(`layer-${layerId}`);
+    if (child) child.enabled = layer.visible;
+    renderLayersUI();
+};
+
+const selectLayer = (layerId) => {
+    selectedLayerId = layerId;
+    // Sync global hasSelection to reflect the newly active layer's state
+    if (layerId === 'base' || !layerId) {
+        hasSelection = !!(selectionMask?.some(v => v > 0));
+    } else {
+        const layer = layers.find(l => l.id === layerId);
+        hasSelection = !!(layer?.selectionMask?.some(v => v > 0));
+    }
+    renderLayersUI();
+    updateSelectionUI();
+};
+
+// ── Per-layer / base transform (local TRS on splat entity) ───────────────────
+let _syncingLayerTransformUI = false;
+
+const readLayerTransformInputsIntoModel = () => {
+    if (_syncingLayerTransformUI) return;
+    const num = (id, def = 0) => {
+        const v = parseFloat(g(id)?.value);
+        return Number.isFinite(v) ? v : def;
+    };
+    const clampPos = (v) => Math.max(-1000, Math.min(1000, v));
+    const clampRot = (v) => Math.max(-360, Math.min(360, v));
+    const clampScl = (v) => Math.max(0.01, Math.min(10, v));
+
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        baseTransform.position.x = clampPos(num('lt-pos-x', 0));
+        baseTransform.position.y = clampPos(num('lt-pos-y', 0));
+        baseTransform.position.z = clampPos(num('lt-pos-z', 0));
+        baseTransform.rotation.x = clampRot(num('lt-rot-x', 0));
+        baseTransform.rotation.y = clampRot(num('lt-rot-y', 0));
+        baseTransform.rotation.z = clampRot(num('lt-rot-z', 0));
+        baseTransform.scale.x = clampScl(num('lt-scl-x', 1));
+        baseTransform.scale.y = clampScl(num('lt-scl-y', 1));
+        baseTransform.scale.z = clampScl(num('lt-scl-z', 1));
+        applyAllLayerEntityTransforms();
+        return;
+    }
+    const layer = layers.find((l) => l.id === selectedLayerId);
+    if (!layer) return;
+    ensureUserLayerTransform(layer);
+    layer.position.x = clampPos(num('lt-pos-x', 0));
+    layer.position.y = clampPos(num('lt-pos-y', 0));
+    layer.position.z = clampPos(num('lt-pos-z', 0));
+    layer.rotation.x = clampRot(num('lt-rot-x', 0));
+    layer.rotation.y = clampRot(num('lt-rot-y', 0));
+    layer.rotation.z = clampRot(num('lt-rot-z', 0));
+    layer.scale.x = clampScl(num('lt-scl-x', 1));
+    layer.scale.y = clampScl(num('lt-scl-y', 1));
+    layer.scale.z = clampScl(num('lt-scl-z', 1));
+    applyAllLayerEntityTransforms();
+};
+
+const resetActiveLayerTransform = () => {
+    const d = createDefaultLayerTransform();
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        baseTransform.position = { ...d.position };
+        baseTransform.rotation = { ...d.rotation };
+        baseTransform.scale = { ...d.scale };
+    } else {
+        const layer = layers.find((l) => l.id === selectedLayerId);
+        if (layer) {
+            ensureUserLayerTransform(layer);
+            layer.position = { ...d.position };
+            layer.rotation = { ...d.rotation };
+            layer.scale = { ...d.scale };
+        }
+    }
+    syncLayerTransformUI();
+    applyAllLayerEntityTransforms();
+    refreshLayerGizmoAttachment();
+};
+
+const syncLayerTransformUI = () => {
+    const sec = g('layer-transform-section');
+    if (!sec) return;
+    const loaded = paintables.length > 0 || layers.some((l) => l.splats.length > 0);
+    const userSel = selectedLayerId !== 'base' && selectedLayerId && layers.some((l) => l.id === selectedLayerId);
+    const show = loaded && (selectedLayerId === 'base' || !selectedLayerId || userSel);
+    sec.classList.toggle('hidden', !show);
+    if (!show) return;
+
+    _syncingLayerTransformUI = true;
+    let pos;
+    let rot;
+    let scl;
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        pos = baseTransform.position;
+        rot = baseTransform.rotation;
+        scl = baseTransform.scale;
+    } else {
+        const ly = layers.find((l) => l.id === selectedLayerId);
+        if (!ly) {
+            _syncingLayerTransformUI = false;
+            return;
+        }
+        ensureUserLayerTransform(ly);
+        pos = ly.position;
+        rot = ly.rotation;
+        scl = ly.scale;
+    }
+    const setv = (id, v) => {
+        const el = g(id);
+        if (el) el.value = v;
+    };
+    setv('lt-pos-x', pos.x);
+    setv('lt-pos-y', pos.y);
+    setv('lt-pos-z', pos.z);
+    setv('lt-rot-x', rot.x);
+    setv('lt-rot-y', rot.y);
+    setv('lt-rot-z', rot.z);
+    setv('lt-scl-x', scl.x);
+    setv('lt-scl-y', scl.y);
+    setv('lt-scl-z', scl.z);
+    _syncingLayerTransformUI = false;
+};
+
+const layerVisIcon = (visible) => tablerIconHtmlSync(visible ? 'eye' : 'eye-off', { size: 14 });
+
+/** Keep gsplat entity order aligned with `layers` (draw / compositing order). */
+const syncLayersContainerChildOrder = () => {
+    const ents = layers.map((l) => layersContainer.findByName(`layer-${l.id}`)).filter(Boolean);
+    for (const e of ents) layersContainer.removeChild(e);
+    for (const e of ents) layersContainer.addChild(e);
+};
+
+const startLayerRename = (itemEl, layer) => {
+    const nameSpan = itemEl.querySelector('.layer-name');
+    if (!nameSpan) return;
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.className = 'layer-rename-input';
+    inp.value = layer.name;
+    inp.maxLength = 40;
+    const commit = () => {
+        const v = inp.value.trim();
+        if (v && v !== layer.name) layer.name = v;
+        renderLayersUI();
+    };
+    inp.addEventListener('blur', commit);
+    inp.addEventListener('keydown', (ke) => {
+        ke.stopPropagation();
+        if (ke.key === 'Enter') inp.blur();
+        if (ke.key === 'Escape') { inp.value = layer.name; inp.blur(); }
+    });
+    nameSpan.replaceWith(inp);
+    inp.focus();
+    inp.select();
+};
+
+const startBaseLayerRename = (itemEl) => {
+    const nameSpan = itemEl.querySelector('.layer-name');
+    if (!nameSpan) return;
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.className = 'layer-rename-input';
+    inp.value = baseModelName || 'Model';
+    inp.maxLength = 40;
+    const commit = () => {
+        const v = inp.value.trim();
+        if (v) baseModelName = v;
+        renderLayersUI();
+    };
+    inp.addEventListener('blur', commit);
+    inp.addEventListener('keydown', (ke) => {
+        ke.stopPropagation();
+        if (ke.key === 'Enter') inp.blur();
+        if (ke.key === 'Escape') { inp.value = baseModelName || 'Model'; inp.blur(); }
+    });
+    nameSpan.replaceWith(inp);
+    inp.focus();
+    inp.select();
+};
+
+const renderLayersUI = () => {
+    const list = g('layers-list');
+    if (!list) return;
+    list.innerHTML = '';
+
+    // ── User-created layers (painted on top) ──────────────────────────────────
+    for (const layer of layers) {
+        ensureLayerOpacityPct(layer);
+        const item = document.createElement('div');
+        item.className = `layer-item${selectedLayerId === layer.id ? ' selected' : ''}`;
+        item.dataset.layerId = layer.id;
+        item.innerHTML = `
+          <span class="layer-drag-handle" draggable="true" title="Drag to reorder">${tablerIconHtmlSync('grip-vertical', { size: 14 })}</span>
+          <button class="layer-visibility${layer.visible ? '' : ' hidden'}" title="${layer.visible ? 'Hide' : 'Show'}">${layerVisIcon(layer.visible)}</button>
+          <span class="layer-icon">${tablerIconHtmlSync('layout-grid', { size: 13 })}</span>
+          <span class="layer-name">${layer.name}</span>
+          <input type="number" class="layer-opacity-input" min="0" max="100" step="1" value="${layer.opacityPct}" title="Opacity %" aria-label="Layer opacity %" />
+          <button class="layer-duplicate" title="Duplicate layer">
+            ${tablerIconHtmlSync('copy', { size: 12 })}
+          </button>
+          <button class="layer-delete" title="Delete layer">
+            ${tablerIconHtmlSync('trash', { size: 12 })}
+          </button>
+        `;
+        {
+            let clickTimer = null;
+            item.addEventListener('click', (e) => {
+                if (e.target.closest('.layer-delete') || e.target.closest('.layer-duplicate') || e.target.closest('.layer-visibility') || e.target.closest('.layer-opacity-input') || e.target.closest('.layer-rename-input')) return;
+                const onName = !!e.target.closest('.layer-name');
+                if (onName && selectedLayerId === layer.id) {
+                    if (clickTimer) {
+                        clearTimeout(clickTimer);
+                        clickTimer = null;
+                        startLayerRename(item, layer);
+                        return;
+                    }
+                    clickTimer = setTimeout(() => { clickTimer = null; }, 350);
+                    return;
+                }
+                selectLayer(layer.id);
+            });
+        }
+        item.querySelector('.layer-visibility').addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleLayerVisibility(layer.id);
+        });
+        item.querySelector('.layer-duplicate').addEventListener('click', (e) => {
+            e.stopPropagation();
+            void duplicateLayer(layer.id);
+        });
+        item.querySelector('.layer-delete').addEventListener('click', (e) => {
+            e.stopPropagation();
+            deleteLayer(layer.id);
+        });
+        const opInp = item.querySelector('.layer-opacity-input');
+        opInp.addEventListener('click', (e) => e.stopPropagation());
+        opInp.addEventListener('keydown', (e) => e.stopPropagation());
+        opInp.addEventListener('input', () => {
+            layer.opacityPct = clampLayerOpacityPct(opInp.value);
+            opInp.value = String(layer.opacityPct);
+            const ent = layersContainer.findByName(`layer-${layer.id}`);
+            if (ent?.gsplat) pushLayerOpacityToGsplat(ent.gsplat, layer.opacityPct);
+        });
+        list.appendChild(item);
+    }
+
+    // ── Base model layer (bottom row; removable) ──────────────────────────────
+    const baseLoaded = paintables.length > 0;
+    const baseItem = document.createElement('div');
+    baseItem.className = `layer-item layer-item-base${selectedLayerId === 'base' ? ' selected' : ''}`;
+    const baseVisible = baseLoaded && paintables[0].entity.enabled;
+    baseLayerOpacityPct = clampLayerOpacityPct(baseLayerOpacityPct);
+    baseItem.innerHTML = `
+      <button class="layer-visibility${baseVisible ? '' : ' hidden'}" title="${baseVisible ? 'Hide' : 'Show'}">${layerVisIcon(baseVisible)}</button>
+      <span class="layer-icon">${tablerIconHtmlSync('stack-2', { size: 13 })}</span>
+      <span class="layer-name">${baseModelName || 'Model'}</span>
+      <input type="number" class="layer-opacity-input" min="0" max="100" step="1" value="${baseLayerOpacityPct}" title="Opacity %" aria-label="Base opacity %" ${baseLoaded ? '' : 'disabled'} />
+      ${baseLoaded ? `<button class="layer-delete" title="Remove base model (layers kept)">
+            ${tablerIconHtmlSync('trash', { size: 12 })}
+          </button>` : ''}
+    `;
+    {
+        let clickTimer = null;
+        baseItem.addEventListener('click', (e) => {
+            if (e.target.closest('.layer-visibility') || e.target.closest('.layer-delete') || e.target.closest('.layer-opacity-input') || e.target.closest('.layer-rename-input')) return;
+            const onName = !!e.target.closest('.layer-name');
+            if (onName && selectedLayerId === 'base') {
+                if (clickTimer) {
+                    clearTimeout(clickTimer);
+                    clickTimer = null;
+                    startBaseLayerRename(baseItem);
+                    return;
+                }
+                clickTimer = setTimeout(() => { clickTimer = null; }, 350);
+                return;
+            }
+            selectLayer('base');
+        });
+    }
+    baseItem.querySelector('.layer-visibility').addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (!baseLoaded) return;
+        const ent = paintables[0].entity;
+        ent.enabled = !ent.enabled;
+        renderLayersUI();
+    });
+    const baseDel = baseItem.querySelector('.layer-delete');
+    if (baseDel) {
+        baseDel.addEventListener('click', (e) => {
+            e.stopPropagation();
+            removeBaseModel();
+        });
+    }
+    const baseOpInp = baseItem.querySelector('.layer-opacity-input');
+    if (baseOpInp) {
+        baseOpInp.addEventListener('click', (e) => e.stopPropagation());
+        baseOpInp.addEventListener('keydown', (e) => e.stopPropagation());
+        baseOpInp.addEventListener('input', () => {
+            if (!baseLoaded) return;
+            baseLayerOpacityPct = clampLayerOpacityPct(baseOpInp.value);
+            baseOpInp.value = String(baseLayerOpacityPct);
+            const gsp = paintables[0]?.gsplatComponent;
+            if (gsp) pushLayerOpacityToGsplat(gsp, baseLayerOpacityPct);
+        });
+    }
+    list.appendChild(baseItem);
+    syncLayerTransformUI();
+    refreshLayerGizmoAttachment();
+    refreshColorGradeUIFromSelection();
+    updateEmptyScenePlaceholder();
+};
+
+const LAYER_REORDER_MIME = 'application/x-photoshock-layer';
+
+const clearLayerDropIndicators = () => {
+    const list = g('layers-list');
+    if (!list) return;
+    list.querySelectorAll('.layer-item').forEach((el) => {
+        el.classList.remove('layer-drop-before', 'layer-drop-after', 'layer-item-dragging');
+    });
+};
+
+let layersListDragReorderWired = false;
+const wireLayersListDragReorder = () => {
+    const list = g('layers-list');
+    if (!list || layersListDragReorderWired) return;
+    layersListDragReorderWired = true;
+
+    list.addEventListener('dragstart', (e) => {
+        const handle = e.target.closest('.layer-drag-handle');
+        if (!handle) return;
+        const row = handle.closest('.layer-item');
+        if (!row?.dataset.layerId) return;
+        const id = row.dataset.layerId;
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData(LAYER_REORDER_MIME, id);
+        e.dataTransfer.setData('text/plain', id);
+        row.classList.add('layer-item-dragging');
+    });
+
+    list.addEventListener('dragend', () => {
+        clearLayerDropIndicators();
+    });
+
+    list.addEventListener('dragover', (e) => {
+        if (![...e.dataTransfer.types].includes(LAYER_REORDER_MIME)) return;
+        const row = e.target.closest('.layer-item');
+        if (!row) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+
+        list.querySelectorAll('.layer-item').forEach((el) => {
+            el.classList.remove('layer-drop-before', 'layer-drop-after');
+        });
+
+        const rect = row.getBoundingClientRect();
+        const before = e.clientY < rect.top + rect.height * 0.5;
+        row.classList.add(before ? 'layer-drop-before' : 'layer-drop-after');
+    });
+
+    list.addEventListener('drop', (e) => {
+        const row = e.target.closest('.layer-item');
+        if (!row) return;
+        const draggedId = e.dataTransfer.getData(LAYER_REORDER_MIME)
+            || e.dataTransfer.getData('text/plain');
+        if (!draggedId) return;
+        e.preventDefault();
+        e.stopPropagation();
+        clearLayerDropIndicators();
+
+        const fromIdx = layers.findIndex((l) => l.id === draggedId);
+        if (fromIdx < 0) return;
+
+        let newIndex;
+        if (row.classList.contains('layer-item-base')) {
+            newIndex = layers.length;
+        } else {
+            const targetId = row.dataset.layerId;
+            const targetIdx = layers.findIndex((l) => l.id === targetId);
+            if (targetIdx < 0) return;
+            const rect = row.getBoundingClientRect();
+            const after = e.clientY > rect.top + rect.height * 0.5;
+            newIndex = after ? targetIdx + 1 : targetIdx;
+        }
+
+        if (fromIdx < newIndex) newIndex--;
+        if (newIndex === fromIdx) return;
+
+        const [item] = layers.splice(fromIdx, 1);
+        layers.splice(newIndex, 0, item);
+        syncLayersContainerChildOrder();
+        renderLayersUI();
+    });
+};
+
+// Build DataTable from layer splats — caller must ensure splats is non-empty.
+const splatsToDataTable = (splats, DataTable, Column) => {
+    const arr = splats;
+    const n = arr.length;
+    const addCol = (name, fn) => new Column(name, new Float32Array(arr.map(fn)));
+    const columns = [
+        addCol('x', (s) => s.x),
+        addCol('y', (s) => s.y),
+        addCol('z', (s) => s.z),
+        addCol('nx', (s) => s.nx ?? 0),
+        addCol('ny', (s) => s.ny ?? 1),
+        addCol('nz', (s) => s.nz ?? 0),
+        addCol('f_dc_0', (s) => s.f_dc_0 ?? 0),
+        addCol('f_dc_1', (s) => s.f_dc_1 ?? 0),
+        addCol('f_dc_2', (s) => s.f_dc_2 ?? 0),
+    ];
+    // Only include f_rest_* columns that exist on the base cache or on splat objects.
+    const shKeys = gsplatDataCache?.shRest?.length
+        ? gsplatDataCache.shRest.map((sh) => sh.key)
+        : collectShKeysFromSplatsArray(arr);
+    for (const key of shKeys) {
+        columns.push(new Column(key, new Float32Array(arr.map((s) => s[key] ?? 0))));
+    }
+    columns.push(
+        addCol('opacity', (s) => s.opacity ?? 0),
+        addCol('scale_0', (s) => s.scale_0 ?? -5),
+        addCol('scale_1', (s) => s.scale_1 ?? -5),
+        addCol('scale_2', (s) => s.scale_2 ?? -5),
+        addCol('rot_0', (s) => s.rot_0 ?? 1),
+        addCol('rot_1', (s) => s.rot_1 ?? 0),
+        addCol('rot_2', (s) => s.rot_2 ?? 0),
+        addCol('rot_3', (s) => s.rot_3 ?? 0),
+    );
+    return new DataTable(columns);
+};
+
+/** Minimum centroid magnitude to trigger re-origin (avoid jitter on already-centered layers). */
+const SPLAT_MASS_ORIGIN_EPS = 1e-5;
+
+const computeSplatsCentroidVec3 = (splats) => {
+    if (!splats?.length) return null;
+    let sx = 0;
+    let sy = 0;
+    let sz = 0;
+    for (const s of splats) {
+        sx += s.x;
+        sy += s.y;
+        sz += s.z;
+    }
+    const n = splats.length;
+    return new pc.Vec3(sx / n, sy / n, sz / n);
+};
+
+/**
+ * Shift all splat positions so their mean is at (0,0,0). Returns the former
+ * centroid in **world** space (for snapping the layer entity so the cloud
+ * stays in place), or null if no shift was applied.
+ *
+ * @param {object} layer
+ * @param {pc.Entity | null} existingEntity  Layer gsplat entity before rebuild, if any
+ */
+const shiftUserLayerSplatsToMassOrigin = (layer, existingEntity) => {
+    const splats = layer.splats;
+    if (!splats.length) return null;
+    const C = computeSplatsCentroidVec3(splats);
+    if (!C || C.length() < SPLAT_MASS_ORIGIN_EPS) return null;
+
+    const wc = new pc.Vec3();
+    if (existingEntity) {
+        existingEntity.getWorldTransform().transformPoint(C, wc);
+    } else {
+        ensureUserLayerTransform(layer);
+        const t = new pc.Vec3(layer.position.x, layer.position.y, layer.position.z);
+        const q = new pc.Quat().setFromEulerAngles(layer.rotation.x, layer.rotation.y, layer.rotation.z);
+        const s = new pc.Vec3(layer.scale.x, layer.scale.y, layer.scale.z);
+        const layerM = new pc.Mat4().setTRS(t, q, s);
+        const worldM = new pc.Mat4().mul2(layersContainer.getWorldTransform(), layerM);
+        worldM.transformPoint(C, wc);
+    }
+
+    for (const s of splats) {
+        s.x -= C.x;
+        s.y -= C.y;
+        s.z -= C.z;
+    }
+    return wc;
+};
+
+/** Position / attribute tolerance when matching `layer.splats` to loaded PLY order. */
+const SPLAT_MATCH_EPS = 1e-4;
+
+/**
+ * PlayCanvas may reorder splats when loading PLY; `layer.splats[i]` is then not
+ * the same Gaussian as GPU storage index `i`. Selection / highlight uploads must
+ * map CPU mask indices → GPU texel indices or the wrong splats appear selected.
+ */
+const buildLayerCpuToGpuSplatMap = (layer, resource) => {
+    layer._cpuToGpuSplat = null;
+    const n = layer.splats.length;
+    const raw = resource?.gsplatData;
+    const data = typeof raw?.decompress === 'function' ? raw.decompress() : raw;
+    if (!data?.getProp || data.numSplats !== n) return;
+
+    const gx = data.getProp('x');
+    const gy = data.getProp('y');
+    const gz = data.getProp('z');
+    if (!gx || !gy || !gz) return;
+
+    let identity = true;
+    for (let i = 0; i < n; i++) {
+        const s = layer.splats[i];
+        if (
+            Math.abs(s.x - gx[i]) > SPLAT_MATCH_EPS
+            || Math.abs(s.y - gy[i]) > SPLAT_MATCH_EPS
+            || Math.abs(s.z - gz[i]) > SPLAT_MATCH_EPS
+        ) {
+            identity = false;
+            break;
+        }
+    }
+    if (identity) return;
+
+    const f0 = data.getProp('f_dc_0');
+    const f1 = data.getProp('f_dc_1');
+    const f2 = data.getProp('f_dc_2');
+    const r0 = data.getProp('rot_0');
+    const r1 = data.getProp('rot_1');
+    const r2 = data.getProp('rot_2');
+    const r3 = data.getProp('rot_3');
+
+    const qk = (x, y, z, a0, a1, a2, q0, q1, q2, q3) =>
+        [
+            Math.round(x / SPLAT_MATCH_EPS),
+            Math.round(y / SPLAT_MATCH_EPS),
+            Math.round(z / SPLAT_MATCH_EPS),
+            Math.round((a0 ?? 0) / SPLAT_MATCH_EPS),
+            Math.round((a1 ?? 0) / SPLAT_MATCH_EPS),
+            Math.round((a2 ?? 0) / SPLAT_MATCH_EPS),
+            Math.round((q0 ?? 1) / SPLAT_MATCH_EPS),
+            Math.round((q1 ?? 0) / SPLAT_MATCH_EPS),
+            Math.round((q2 ?? 0) / SPLAT_MATCH_EPS),
+            Math.round((q3 ?? 0) / SPLAT_MATCH_EPS),
+        ].join(',');
+
+    const buckets = new Map();
+    for (let i = 0; i < n; i++) {
+        const s = layer.splats[i];
+        const k = qk(
+            s.x, s.y, s.z,
+            s.f_dc_0, s.f_dc_1, s.f_dc_2,
+            s.rot_0, s.rot_1, s.rot_2, s.rot_3,
+        );
+        if (!buckets.has(k)) buckets.set(k, []);
+        buckets.get(k).push(i);
+    }
+
+    const cpuToGpu = new Int32Array(n);
+    cpuToGpu.fill(-1);
+    const usedGpu = new Uint8Array(n);
+
+    for (let g = 0; g < n; g++) {
+        const k = qk(
+            gx[g], gy[g], gz[g],
+            f0 ? f0[g] : 0, f1 ? f1[g] : 0, f2 ? f2[g] : 0,
+            r0 ? r0[g] : 1, r1 ? r1[g] : 0, r2 ? r2[g] : 0, r3 ? r3[g] : 0,
+        );
+        const q = buckets.get(k);
+        if (!q || !q.length) {
+            console.warn('[layer] Could not match loaded splat order to layer.splats; selection highlight may be wrong.');
+            return;
+        }
+        const cpuIdx = q.shift();
+        if (usedGpu[g]) {
+            console.warn('[layer] GPU splat index collision while mapping selection.');
+            return;
+        }
+        usedGpu[g] = 1;
+        cpuToGpu[cpuIdx] = g;
+    }
+
+    for (let i = 0; i < n; i++) {
+        if (cpuToGpu[i] < 0) {
+            console.warn('[layer] Incomplete CPU→GPU splat map; selection highlight may be wrong.');
+            return;
+        }
+    }
+
+    layer._cpuToGpuSplat = cpuToGpu;
+};
+
+/** Write `layer.selectionMask` into customSelection using optional `_cpuToGpuSplat` remap. */
+const writeLayerSelectionMaskToInstanceTexture = (layer, gsplat) => {
+    if (!layer.selectionMask?.length) return;
+    const tex = gsplat.getInstanceTexture('customSelection');
+    if (!tex) return;
+    const d = tex.lock();
+    if (!d) return;
+    const numTexels = tex.width * tex.height;
+    const map = layer._cpuToGpuSplat;
+    const n = layer.selectionMask.length;
+    for (let i = 0; i < numTexels; i++) {
+        const off = i * 4;
+        d[off] = 0;
+        d[off + 1] = 0;
+        d[off + 2] = 0;
+        d[off + 3] = 255;
+    }
+    for (let cpu = 0; cpu < n; cpu++) {
+        const gpu = map ? map[cpu] : cpu;
+        if (gpu < 0 || gpu >= numTexels) continue;
+        if (!layer.selectionMask[cpu]) continue;
+        const off = gpu * 4;
+        d[off] = 255;
+        d[off + 1] = 0;
+        d[off + 2] = 0;
+        d[off + 3] = 255;
+    }
+    tex.unlock();
+    gsplat.workBufferUpdate = pc.WORKBUFFER_UPDATE_ONCE;
+};
+
+/** One rebuild pass: keep the previous gsplat visible until the new asset loads (no blink gap). */
+const runSingleLayerEntityUpdate = async (layer) => {
+    const existing = layersContainer.findByName(`layer-${layer.id}`);
+
+    // Don't create a gsplat entity for an empty layer — a dummy splat entity
+    // sitting in the scene causes PlayCanvas to disrupt the base model's
+    // depth-sort / alpha-compositing, making the model look wrong.
+    if (!layer.splats.length) {
+        layer._cpuToGpuSplat = null;
+        if (existing) {
+            destroyLayerGsplatPaint(layer);
+            existing.destroy();
+        }
+        return;
+    }
+
+    // Put layer pivot / gizmo at center of mass: zero mean positions, adjust transform.
+    const massWorldSnap = shiftUserLayerSplatsToMassOrigin(layer, existing);
+
+    const oldEnt = existing;
+    const oldPb = layer._gsplatPaint;
+    if (oldEnt) {
+        oldEnt.name = `__layer_rebuild_${layer.id}`;
+    }
+
+    console.log(`[layer] updateLayerEntity: ${layer.id}, splats=${layer.splats.length}`);
+
+    const table = splatsToDataTable(layer.splats, DataTable, Column);
+    const memFs = new MemoryFileSystem();
+    const filename = `layer-${layer.id}.ply`;
+    await writePly(
+        { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
+        memFs,
+    );
+    const buffer = memFs.results?.get(filename);
+    console.log(`[layer] PLY buffer size: ${buffer?.byteLength}`);
+    if (!buffer) {
+        console.error('[layer] writePly produced no buffer');
+        if (oldEnt) oldEnt.name = `layer-${layer.id}`;
+        return;
+    }
+
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const file = new File([blob], filename, { type: 'application/octet-stream' });
+    const loadUrl = URL.createObjectURL(file);
+
+    return new Promise((resolve, reject) => {
+        const asset = new pc.Asset(`layer-${layer.id}`, 'gsplat', { url: loadUrl, filename });
+        app.assets.add(asset);
+        asset.once('load', (a) => {
+            URL.revokeObjectURL(loadUrl);
+            const entity = new pc.Entity(`layer-${layer.id}`);
+            const gsplat = entity.addComponent('gsplat', { asset: a, unified: true });
+            entity.enabled = layer.visible;
+            layersContainer.addChild(entity);
+            applyModelRotation();
+
+            // After zeroing mean splat position, snap entity so world-space pose is unchanged
+            // and the transform gizmo sits at the cloud’s center of mass.
+            if (massWorldSnap) {
+                entity.setPosition(massWorldSnap.x, massWorldSnap.y, massWorldSnap.z);
+                const lp = entity.getLocalPosition();
+                ensureUserLayerTransform(layer);
+                layer.position.x = lp.x;
+                layer.position.y = lp.y;
+                layer.position.z = lp.z;
+                applySingleLayerEntityTransform(layer);
+                syncLayerTransformUI();
+            }
+
+            // Add all three extra streams the modifier shader expects so the
+            // compiled shader program matches the base model's exactly.  Without
+            // customColor + customOpacity the shader references null textures and
+            // corrupts the GPU pipeline (model disappears when layer is visible).
+            const fmt = a.resource.format;
+            if (!fmt.extraStreams?.find(s => s.name === 'customColor')) {
+                fmt.addExtraStreams([
+                    { name: 'customColor',    format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+                    { name: 'customOpacity',  format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+                    { name: 'customSelection', format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+                ]);
+            }
+            const initTex = (name) => {
+                const t = gsplat.getInstanceTexture(name);
+                if (t) { const d = t.lock(); if (d) d.fill(0); t.unlock(); }
+            };
+            initTex('customColor'); initTex('customOpacity'); initTex('customSelection');
+
+            buildLayerCpuToGpuSplatMap(layer, a.resource);
+
+            gsplat.setWorkBufferModifier({ glsl: MODIFIER_GLSL, wgsl: MODIFIER_WGSL });
+            gsplat.setParameter('uBlendMode',     blendMode());
+            gsplat.setParameter('uShowSelection', 0);
+            gsplat.setParameter('uSelectionColor', selectionHighlightColor());
+            pushSplatViewShaderUniforms(gsplat);
+            gsplat.setParameter('uHoverSphere',   [0, 0, 0, 0]);
+            gsplat.setParameter('uHoverColor',    [1, 1, 1, 0]);
+            ensureLayerColorGrade(layer);
+            ensureLayerOpacityPct(layer);
+            applyColorGradeToGsplat(gsplat, layer.colorGrade);
+            pushLayerOpacityToGsplat(gsplat, layer.opacityPct);
+
+            layer._gsplatPaint = {
+                entity,
+                gsplatComponent: gsplat,
+                ...createGsplatPaintProcessors(gsplat),
+            };
+
+            // Re-upload selection if this layer already has one (uses CPU→GPU splat map)
+            if (layer.selectionMask?.some(v => v > 0)) {
+                writeLayerSelectionMaskToInstanceTexture(layer, gsplat);
+                if (selectedLayerId === layer.id && showSelectionHighlight) {
+                    gsplat.setParameter('uShowSelection', 1);
+                }
+            }
+
+            if (oldEnt) {
+                destroyGsplatPaintBundle(oldPb);
+                oldEnt.destroy();
+            }
+
+            console.log(`[layer] entity created: ${layer.id}, enabled=${entity.enabled}`);
+            syncLayersContainerChildOrder();
+            refreshLayerGizmoAttachment();
+            resolve();
+        });
+        asset.once('error', (msg) => {
+            URL.revokeObjectURL(loadUrl);
+            console.error(`[layer] asset load error: ${msg}`);
+            if (oldEnt) oldEnt.name = `layer-${layer.id}`;
+            reject(new Error(msg));
+        });
+        app.assets.load(asset);
+    });
+};
+
+const updateLayerEntity = async (layer) => {
+    if (!layer) return;
+    if (layer._layerEntityUpdateInFlight) {
+        layer._layerEntityUpdatePending = true;
+        return;
+    }
+    layer._layerEntityUpdateInFlight = true;
+    try {
+        await runSingleLayerEntityUpdate(layer);
+    } finally {
+        layer._layerEntityUpdateInFlight = false;
+        if (layer._layerEntityUpdatePending) {
+            layer._layerEntityUpdatePending = false;
+            void updateLayerEntity(layer);
+        }
+    }
+};
+
+// ── Selection ─────────────────────────────────────────────────────────────────
+const uploadSelectionToTexture = () => {
+    // Base model
+    if (selectionMask && paintables.length) {
+        const n = selectionMask.length;
+        for (const p of paintables) {
+            const tex = p.gsplatComponent.getInstanceTexture('customSelection');
+            if (!tex) continue;
+            const d = tex.lock();
+            if (!d) continue;
+            const numTexels = tex.width * tex.height;
+            for (let i = 0; i < Math.min(n, numTexels); i++) {
+                const off = i * 4;
+                const v = selectionMask[i] ? 255 : 0;
+                d[off] = v; d[off+1] = 0; d[off+2] = 0; d[off+3] = 255;
+            }
+            tex.unlock();
+        }
+    }
+    // User layers (remap mask indices → GPU storage order when PLY load reordered splats)
+    for (const layer of layers) {
+        if (!layer.selectionMask) continue;
+        const entity = layersContainer.findByName(`layer-${layer.id}`);
+        if (!entity?.gsplat) continue;
+        writeLayerSelectionMaskToInstanceTexture(layer, entity.gsplat);
+    }
+};
+
+const updateSelectionUI = () => {
+    uploadSelectionToTexture();
+
+    const activeMask = peekActiveSelectionMask();
+    const count = hasSelection && activeMask ? activeMask.reduce((s, v) => s + v, 0) : 0;
+    const label = hasSelection ? `${count.toLocaleString()} splats selected` : 'No selection';
+
+    g('floating-gizmo-clear-wrap')?.classList.toggle('hidden', !hasSelection);
+    g('floating-sel-clear')?.classList.toggle('sel-active', hasSelection);
+    ['sel-count-label2','sel-count-label3','sel-count-label-brush','sel-count-label-lasso','sel-count-label-vector'].forEach(id => {
+        const el = g(id); if (el) el.textContent = label;
+    });
+
+    // Base model paintables: show selection only when base is active
+    const baseActive = selectedLayerId === 'base' || !selectedLayerId;
+    const selColor = selectionHighlightColor();
+    for (const p of paintables) {
+        p.gsplatComponent.setParameter('uBlendMode',     blendMode());
+        p.gsplatComponent.setParameter('uShowSelection', baseActive && hasSelection && showSelectionHighlight ? 1 : 0);
+        p.gsplatComponent.setParameter('uSelectionColor', selColor);
+        pushSplatViewShaderUniforms(p.gsplatComponent);
+        pushLayerOpacityToGsplat(p.gsplatComponent, baseLayerOpacityPct);
+    }
+
+    // User layer entities: show selection only on the active layer
+    for (const layer of layers) {
+        const entity = layersContainer.findByName(`layer-${layer.id}`);
+        if (!entity?.gsplat) continue;
+        ensureLayerOpacityPct(layer);
+        const isActive = selectedLayerId === layer.id;
+        const layerHasSel = isActive && layer.selectionMask?.some(v => v > 0) && showSelectionHighlight;
+        entity.gsplat.setParameter('uBlendMode',     blendMode());
+        entity.gsplat.setParameter('uShowSelection', layerHasSel ? 1 : 0);
+        entity.gsplat.setParameter('uSelectionColor', selColor);
+        pushSplatViewShaderUniforms(entity.gsplat);
+        pushLayerOpacityToGsplat(entity.gsplat, layer.opacityPct);
+    }
+};
+
+const saveSelection = () => {
+    const name = (g('save-sel-name')?.value || '').trim();
+    if (!name) return;
+    const layer = getActiveLayer();
+    const layerId = layer ? layer.id : 'base';
+    const data = getActiveDataCache();
+    if (!data) return;
+    const n = data.numSplats;
+    const mask = getActiveSelectionMask(n);
+    const count = mask.reduce((s, v) => s + v, 0);
+    if (count === 0) { alert('No selection to save.'); return; }
+    const id = 'sel-' + Date.now();
+    savedSelections.push({
+        id, name, layerId, numSplats: n,
+        mask: new Uint8Array(mask),
+    });
+    g('save-sel-name').value = '';
+    renderSavedSelectionsList();
+};
+
+const loadSelection = (sel) => {
+    const layer = getActiveLayer();
+    const layerId = layer ? layer.id : 'base';
+    if (sel.layerId !== layerId || sel.numSplats !== (getActiveDataCache()?.numSplats ?? 0)) {
+        alert(`Selection "${sel.name}" was saved for a different layer or model (${sel.numSplats} splats).`);
+        return;
+    }
+    const before = captureSelectionSnapshot();
+    const n = sel.numSplats;
+    const dest = getActiveSelectionMask(n);
+    dest.set(sel.mask);
+    hasSelection = sel.mask.some(v => v > 0);
+    selectionSphere = [0, 0, 0, hasSelection ? 9999 : -1];
+    updateSelectionUI();
+    pushSelectionUndoFromBefore(before);
+};
+
+const deleteSavedSelection = (id) => {
+    const i = savedSelections.findIndex(s => s.id === id);
+    if (i >= 0) savedSelections.splice(i, 1);
+    renderSavedSelectionsList();
+};
+
+const exportSelections = () => {
+    if (savedSelections.length === 0) { alert('No selections to export.'); return; }
+    const data = savedSelections.map(s => ({
+        id: s.id,
+        name: s.name,
+        layerId: s.layerId,
+        numSplats: s.numSplats,
+        mask: Array.from(s.mask),
+    }));
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    void triggerBlobDownload(blob, `splat-selections-${Date.now()}.json`);
+};
+
+const importSelections = () => {
+    const input = g('import-sel-file');
+    if (!input) return;
+    input.value = '';
+    input.onchange = async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        try {
+            const text = await file.text();
+            const data = JSON.parse(text);
+            const arr = Array.isArray(data) ? data : [data];
+            for (const item of arr) {
+                if (!item.mask || !item.name) continue;
+                const mask = new Uint8Array(item.mask);
+                savedSelections.push({
+                    id: 'sel-' + Date.now() + '-' + Math.random().toString(36).slice(2),
+                    name: item.name,
+                    layerId: item.layerId ?? 'base',
+                    numSplats: item.numSplats ?? mask.length,
+                    mask,
+                });
+            }
+            renderSavedSelectionsList();
+        } catch (err) {
+            alert('Failed to load file: ' + (err?.message || String(err)));
+        }
+        input.onchange = null;
+    };
+    input.click();
+};
+
+const renderSavedSelectionsList = () => {
+    const list = g('saved-selections-list');
+    if (!list) return;
+    list.innerHTML = savedSelections.map(s => `
+        <div class="saved-sel-item">
+            <span class="saved-sel-name" title="Load">${s.name}</span>
+            <span class="saved-sel-count">${s.mask.reduce((a,b)=>a+b,0).toLocaleString()}</span>
+            <button class="opt-btn small-btn" data-load="${s.id}" title="Load">Load</button>
+            <button class="opt-btn small-btn" data-delete="${s.id}" title="Delete">×</button>
+        </div>
+    `).join('') || '<span class="opt-hint">No saved selections</span>';
+    list.querySelectorAll('[data-load]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const sel = savedSelections.find(s => s.id === btn.dataset.load);
+            if (sel) loadSelection(sel);
+        });
+    });
+    list.querySelectorAll('[data-delete]').forEach(btn => {
+        btn.addEventListener('click', () => deleteSavedSelection(btn.dataset.delete));
+    });
+};
+
+const addSwatch = () => {
+    const hex = paintColorHex();
+    if (!hex) return;
+    swatches.push({ id: 'swatch-' + Date.now(), hex });
+    persistSwatches();
+    renderSwatchesList();
+};
+
+const useSwatch = (hex) => {
+    const norm = normalizeBrushHex(hex);
+    const input = g('paint-color');
+    if (input && norm) input.value = norm;
+    syncBrushHexFieldFromPicker();
+    persistBrushColor();
+};
+
+const deleteSwatch = (id) => {
+    const i = swatches.findIndex(s => s.id === id);
+    if (i >= 0) swatches.splice(i, 1);
+    persistSwatches();
+    renderSwatchesList();
+};
+
+const renderSwatchesList = () => {
+    const list = g('swatches-list');
+    if (!list) return;
+    list.innerHTML = swatches.map(s => `
+        <div class="swatch-item" data-hex="${s.hex}" title="${s.hex}">
+            <div class="swatch-color" style="background:${s.hex}"></div>
+            <button class="opt-btn small-btn swatch-delete" data-id="${s.id}" title="Remove">×</button>
+        </div>
+    `).join('') || '<span class="opt-hint">No swatches</span>';
+    list.querySelectorAll('.swatch-item').forEach(el => {
+        el.addEventListener('click', (e) => {
+            if (!e.target.closest('.swatch-delete')) useSwatch(el.dataset.hex);
+        });
+    });
+    list.querySelectorAll('.swatch-delete').forEach(btn => {
+        btn.addEventListener('click', (e) => { e.stopPropagation(); deleteSwatch(btn.dataset.id); });
+    });
+};
+
+// ── Pixel loupe (magnified framebuffer) for color select & swatch pick-from-splat ──
+const COLOR_LOUPE_GRID = 13;
+const COLOR_LOUPE_ZOOM = 10;
+let colorLoupeRaf = 0;
+/** @type {{ cx: number, cy: number, clientX: number, clientY: number } | null} */
+let colorLoupePending = null;
+/** @type {HTMLCanvasElement | null} */
+let colorLoupeScratch = null;
+
+const colorLoupeShouldShow = () =>
+    hasRenderableSplats() &&
+    (activeTool === 'colorSelect' || awaitingSwatchSplatPick);
+
+const hideColorPixelLoupe = () => {
+    colorLoupePending = null;
+    const el = g('color-pixel-loupe');
+    if (el) {
+        el.classList.add('hidden');
+        el.setAttribute('aria-hidden', 'true');
+    }
+};
+
+const flushColorPixelLoupe = () => {
+    const p = colorLoupePending;
+    colorLoupePending = null;
+    if (!p || !colorLoupeShouldShow()) return;
+
+    const wrap = g('color-pixel-loupe');
+    const loupeCanvas = g('color-pixel-loupe-canvas');
+    const hexEl = g('color-pixel-loupe-hex');
+    if (!wrap || !loupeCanvas || !hexEl) return;
+
+    const dev = app.graphicsDevice;
+    const gsz = COLOR_LOUPE_GRID;
+    const z = COLOR_LOUPE_ZOOM;
+    const half = (gsz - 1) >> 1;
+    const cw = dev.width;
+    const ch = dev.height;
+
+    let mx = (p.cx / canvas.clientWidth) * cw;
+    let my = (p.cy / canvas.clientHeight) * ch;
+    mx = Math.max(0, Math.min(cw - 1, mx));
+    my = Math.max(0, Math.min(ch - 1, my));
+
+    let gx = Math.floor(mx - half);
+    let gy = Math.floor(my - half);
+    gx = Math.max(0, Math.min(cw - gsz, gx));
+    gy = Math.max(0, Math.min(ch - gsz, gy));
+
+    if (!colorLoupeScratch) {
+        colorLoupeScratch = document.createElement('canvas');
+        colorLoupeScratch.width = gsz;
+        colorLoupeScratch.height = gsz;
+    }
+    const sctx = colorLoupeScratch.getContext('2d');
+    if (!sctx) return;
+    try {
+        sctx.imageSmoothingEnabled = false;
+        sctx.drawImage(canvas, gx, gy, gsz, gsz, 0, 0, gsz, gsz);
+    } catch (_) {
+        return;
+    }
+
+    const sample = sctx.getImageData(half, half, 1, 1).data;
+    const rh = sample[0];
+    const gh = sample[1];
+    const bh = sample[2];
+    hexEl.textContent = `#${[rh, gh, bh].map((x) => x.toString(16).padStart(2, '0')).join('')}`;
+
+    const wPx = gsz * z;
+    if (loupeCanvas.width !== wPx || loupeCanvas.height !== wPx) {
+        loupeCanvas.width = wPx;
+        loupeCanvas.height = wPx;
+    }
+    const lctx = loupeCanvas.getContext('2d');
+    if (!lctx) return;
+    lctx.imageSmoothingEnabled = false;
+    lctx.clearRect(0, 0, wPx, wPx);
+    lctx.drawImage(colorLoupeScratch, 0, 0, gsz, gsz, 0, 0, wPx, wPx);
+
+    const cx = half * z;
+    const cy = half * z;
+    lctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    lctx.lineWidth = 2;
+    lctx.strokeRect(cx + 0.5, cy + 0.5, z - 1, z - 1);
+    lctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    lctx.lineWidth = 1;
+    lctx.strokeRect(cx + 0.5, cy + 0.5, z - 1, z - 1);
+
+    const pad = 18;
+    const estW = wPx + 48;
+    const estH = wPx + 52;
+    let left = p.clientX + pad;
+    let top = p.clientY + pad;
+    if (left + estW > window.innerWidth - 6) left = p.clientX - estW - pad;
+    if (top + estH > window.innerHeight - 6) top = p.clientY - estH - pad;
+    left = Math.max(6, Math.min(left, window.innerWidth - estW));
+    top = Math.max(6, Math.min(top, window.innerHeight - estH));
+    wrap.style.left = `${left}px`;
+    wrap.style.top = `${top}px`;
+    wrap.classList.remove('hidden');
+    wrap.setAttribute('aria-hidden', 'false');
+};
+
+function cancelSwatchSplatPick() {
+    if (!awaitingSwatchSplatPick) return;
+    awaitingSwatchSplatPick = false;
+    canvasContainer.classList.remove('swatch-splat-pick-armed');
+    g('pick-swatch-splat-btn')?.classList.remove('accent-btn');
+    hideColorPixelLoupe();
+}
+
+canvasContainer.addEventListener('mousemove', (e) => {
+    if (!colorLoupeShouldShow()) {
+        hideColorPixelLoupe();
+        return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    if (
+        e.clientX < rect.left ||
+        e.clientX >= rect.right ||
+        e.clientY < rect.top ||
+        e.clientY >= rect.bottom
+    ) {
+        hideColorPixelLoupe();
+        return;
+    }
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    colorLoupePending = { cx, cy, clientX: e.clientX, clientY: e.clientY };
+    if (!colorLoupeRaf) {
+        colorLoupeRaf = requestAnimationFrame(() => {
+            colorLoupeRaf = 0;
+            if (colorLoupeShouldShow() && colorLoupePending) flushColorPixelLoupe();
+        });
+    }
+});
+
+const splatDcToHex = (fdc0, fdc1, fdc2, idx) => {
+    const sr = Math.max(0, Math.min(1, 0.5 + fdc0[idx] * SH_C0));
+    const sg = Math.max(0, Math.min(1, 0.5 + fdc1[idx] * SH_C0));
+    const sb = Math.max(0, Math.min(1, 0.5 + fdc2[idx] * SH_C0));
+    const raw = `#${[sr, sg, sb]
+        .map((c) => Math.round(c * 255).toString(16).padStart(2, '0'))
+        .join('')}`;
+    return normalizeBrushHex(raw);
+};
+
+/** Uses active layer/base data; respects ring hit test when enabled. Call after strokeDepth is set for depth-based fallback. */
+const addSwatchFromSplatAtScreen = (screenX, screenY) => {
+    const data = getActiveDataCache();
+    const wEnt = getWorldMatEntityForActiveTarget();
+    const layer = getActiveLayer();
+    if (!data || !wEnt) return false;
+    const { numSplats, x: xA, y: yA, z: zA, fdc0, fdc1, fdc2 } = data;
+    let idx = -1;
+    if (useRingHitSelection()) {
+        const pr = pickFrontSplatAtScreen(screenX, screenY, data, layer, wEnt);
+        if (pr != null) idx = pr;
+    }
+    if (idx < 0) {
+        const worldPt = getWorldPoint(screenX, screenY);
+        if (!worldPt) return false;
+        const invMat = new pc.Mat4().copy(wEnt.getWorldTransform()).invert();
+        const modelPt = new pc.Vec3();
+        invMat.transformPoint(worldPt, modelPt);
+        let nearestD2 = Infinity;
+        for (let i = 0; i < numSplats; i++) {
+            const dx = xA[i] - modelPt.x;
+            const dy = yA[i] - modelPt.y;
+            const dz = zA[i] - modelPt.z;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < nearestD2) { nearestD2 = d2; idx = i; }
+        }
+    }
+    if (idx < 0) return false;
+    const hex = splatDcToHex(fdc0, fdc1, fdc2, idx);
+    if (!hex) return false;
+    swatches.push({ id: 'swatch-' + Date.now(), hex });
+    persistSwatches();
+    renderSwatchesList();
+    useSwatch(hex);
+    return true;
+};
+
+const clearSelection = (opts = {}) => {
+    const recordUndo = opts.recordUndo === true;
+    const before = recordUndo ? captureSelectionSnapshot() : null;
+    const layer = getActiveLayer();
+    if (layer) {
+        if (layer.selectionMask) layer.selectionMask.fill(0);
+    } else {
+        selectionMask?.fill(0);
+    }
+    hasSelection = false;
+    selectionSphere = [0, 0, 0, -1];
+    updateSelectionUI();
+    if (recordUndo) pushSelectionUndoFromBefore(before);
+};
+
+const yieldToMain = () => new Promise((r) => requestAnimationFrame(r));
+
+/** Copy `src[kept[j]]` into a dense Float32Array; optional rAF yields for huge clouds. */
+const filterArrayByKeptIndices = async (src, kept) => {
+    if (!src || !kept.length) return null;
+    const out = new Float32Array(kept.length);
+    const chunk = 200_000;
+    const useYield = kept.length >= 120_000;
+    for (let j0 = 0; j0 < kept.length; j0 += chunk) {
+        const j1 = Math.min(j0 + chunk, kept.length);
+        for (let j = j0; j < j1; j++) out[j] = src[kept[j]];
+        if (useYield && j1 < kept.length) await yieldToMain();
+    }
+    return out;
+};
+
+let removeSelectedSplatsBusy = false;
+
+const removeSelectedSplats = async () => {
+    if (removeSelectedSplatsBusy) return;
+    removeSelectedSplatsBusy = true;
+    try {
+        // ── User layer: CPU removal ──────────────────────────────────────────────
+        const activeLayer = getActiveLayer();
+        if (activeLayer) {
+            if (!hasSelection || !activeLayer.selectionMask) return;
+            const before = activeLayer.splats.length;
+            activeLayer.splats = activeLayer.splats.filter((_, i) => !activeLayer.selectionMask[i]);
+            if (activeLayer.splats.length === before) { clearSelection(); return; }
+            activeLayer.selectionMask = null;
+            hasSelection = false;
+            selectionSphere = [0, 0, 0, -1];
+            updateSelectionUI();
+            await yieldToMain();
+            await updateLayerEntity(activeLayer);
+            return;
+        }
+
+        // ── Base model: PLY rebuild ──────────────────────────────────────────────
+        if (!gsplatDataCache || !hasSelection || !selectionMask) return;
+        const keep = (i) => !selectionMask[i];
+        const n = gsplatDataCache.numSplats;
+        const kept = [];
+        for (let i = 0; i < n; i++) if (keep(i)) kept.push(i);
+        if (kept.length === n) { clearSelection(); return; }
+        if (kept.length === 0) { alert('Cannot remove all splats.'); return; }
+
+        const { x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache;
+        // GPU read is async and matches the viewport without replaying every stroke × every splat.
+        const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
+        const out0 = painted?.out0 ?? gsplatDataCache.fdc0;
+        const out1 = painted?.out1 ?? gsplatDataCache.fdc1;
+        const out2 = painted?.out2 ?? gsplatDataCache.fdc2;
+        const outOp = painted?.outOp ?? gsplatDataCache.opacity;
+
+        const columns = [];
+        const addCol = async (name, data) => {
+            if (!data) return;
+            const colData = await filterArrayByKeptIndices(data, kept);
+            if (colData) columns.push(new Column(name, colData));
+        };
+        await addCol('x', xA);
+        await addCol('y', yA);
+        await addCol('z', zA);
+        await addCol('nx', extra.nx);
+        await addCol('ny', extra.ny);
+        await addCol('nz', extra.nz);
+        await addCol('f_dc_0', out0);
+        await addCol('f_dc_1', out1);
+        await addCol('f_dc_2', out2);
+        for (const sh of shRest) await addCol(sh.key, sh.data);
+        await addCol('opacity', outOp);
+        await addCol('scale_0', extra.scale_0);
+        await addCol('scale_1', extra.scale_1);
+        await addCol('scale_2', extra.scale_2);
+        await addCol('rot_0', extra.rot_0);
+        await addCol('rot_1', extra.rot_1);
+        await addCol('rot_2', extra.rot_2);
+        await addCol('rot_3', extra.rot_3);
+
+        hasSelection = false;
+        selectionSphere = [0, 0, 0, -1];
+        selectionMask = null;
+        updateSelectionUI();
+        await yieldToMain();
+
+        const table = new DataTable(columns);
+        const memFs = new MemoryFileSystem();
+        const filename = 'painted.ply';
+        await writePly(
+            { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
+            memFs,
+        );
+        const buffer = memFs.results?.get(filename);
+        if (!buffer) { alert('Remove failed.'); return; }
+        const blob = new Blob([buffer], { type: 'application/octet-stream' });
+        const file = new File([blob], 'painted.ply', { type: 'application/octet-stream' });
+        await loadSplat(file, { preserveCamera: true });
+    } finally {
+        removeSelectedSplatsBusy = false;
+    }
+};
+
+const sharpenSelectedSplats = async () => {
+    // All three sharpen sliders are kept in sync; read from whichever is non-zero.
+    const sharpenStrength = parseFloat(
+        g('sharpen-strength')?.value ?? g('sharpen-strength2')?.value ?? g('sharpen-strength3')?.value ?? '0.5'
+    );
+    // sharpenStrength ∈ [0, 1]: 0 = no change, 1 = maximum shrink
+    // In log-scale a negative delta makes the Gaussian smaller:
+    //   new_scale = old_scale - delta   (delta > 0 → smaller Gaussian)
+    // We map strength [0,1] to a log-space reduction of [0, 3.5] (3.5 covers
+    // the full clamped range from -2 to -5.5 used when generating fill splats).
+    const delta = sharpenStrength * 3.5;
+
+    // ── User layer: in-memory modification + rebuild ────────────────────────
+    const activeLayer = getActiveLayer();
+    if (activeLayer) {
+        if (!hasSelection || !activeLayer.selectionMask) return;
+        let changed = false;
+        activeLayer.splats.forEach((s, i) => {
+            if (!activeLayer.selectionMask[i]) return;
+            s.scale_0 = Math.max(-6.0, s.scale_0 - delta);
+            s.scale_1 = Math.max(-6.0, s.scale_1 - delta);
+            s.scale_2 = Math.max(-6.0, s.scale_2 - delta);
+            changed = true;
+        });
+        if (!changed) return;
+        await updateLayerEntity(activeLayer);
+        return;
+    }
+
+    // ── Base model: PLY rebuild ─────────────────────────────────────────────
+    if (!gsplatDataCache || !hasSelection || !selectionMask) return;
+
+    const { x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache;
+    const n = gsplatDataCache.numSplats;
+    const painted = applyAllCpuStrokes();
+    const out0  = painted?.out0  ?? gsplatDataCache.fdc0;
+    const out1  = painted?.out1  ?? gsplatDataCache.fdc1;
+    const out2  = painted?.out2  ?? gsplatDataCache.fdc2;
+    const outOp = painted?.outOp ?? gsplatDataCache.opacity;
+
+    // Build modified scale arrays: reduce log-scale for selected splats
+    const mkScale = (src) => {
+        const arr = new Float32Array(src);
+        for (let i = 0; i < n; i++) {
+            if (selectionMask[i]) arr[i] = Math.max(-6.0, arr[i] - delta);
+        }
+        return arr;
+    };
+    const newScale0 = mkScale(extra.scale_0);
+    const newScale1 = mkScale(extra.scale_1);
+    const newScale2 = mkScale(extra.scale_2);
+
+    const columns = [];
+    const addCol = (name, data) => { if (data) columns.push(new Column(name, new Float32Array(data))); };
+    addCol('x', xA); addCol('y', yA); addCol('z', zA);
+    addCol('nx', extra.nx); addCol('ny', extra.ny); addCol('nz', extra.nz);
+    addCol('f_dc_0', out0); addCol('f_dc_1', out1); addCol('f_dc_2', out2);
+    for (const sh of shRest) addCol(sh.key, sh.data);
+    addCol('opacity', outOp);
+    columns.push(new Column('scale_0', newScale0));
+    columns.push(new Column('scale_1', newScale1));
+    columns.push(new Column('scale_2', newScale2));
+    addCol('rot_0', extra.rot_0); addCol('rot_1', extra.rot_1);
+    addCol('rot_2', extra.rot_2); addCol('rot_3', extra.rot_3);
+
+    const table = new DataTable(columns);
+    const memFs = new MemoryFileSystem();
+    const filename = 'painted.ply';
+    await writePly(
+        { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
+        memFs,
+    );
+    const buffer = memFs.results?.get(filename);
+    if (!buffer) { alert('Sharpen failed.'); return; }
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const file = new File([blob], 'painted.ply', { type: 'application/octet-stream' });
+    await loadSplat(file, { preserveCamera: true });
+};
+
+const selectAll = (opts = {}) => {
+    const recordUndo = opts.recordUndo === true;
+    const before = recordUndo ? captureSelectionSnapshot() : null;
+    const data = getActiveDataCache();
+    if (!data) return;
+    const n = data.numSplats;
+    const mask = getActiveSelectionMask(n);
+    mask.fill(1);
+    hasSelection = true;
+    selectionSphere = [0, 0, 0, 9999];
+    updateSelectionUI();
+    if (recordUndo) pushSelectionUndoFromBefore(before);
+};
+
+/** Closed screen polygon (≥3 points). Same depth / ring rules as box select. */
+const applyPolygonSelection = (poly, mode = selectionMode) => {
+    if (!poly || poly.length < 3) return;
+    const data = getActiveDataCache();
+    const wEnt = getWorldMatEntityForActiveTarget();
+    const layer = getActiveLayer();
+    if (!data || !wEnt) return;
+    const { numSplats, x: xA, y: yA, z: zA } = data;
+    const mask = getActiveSelectionMask(numSplats);
+
+    const worldMat = wEnt.getWorldTransform();
+    const worldPt = new pc.Vec3();
+    const screenPt = new pc.Vec3();
+    let sumX = 0;
+    let sumY = 0;
+    let sumZ = 0;
+    let cnt = 0;
+
+    const applyInRegion = (inside, i) => {
+        if (mode === 'new') mask[i] = inside ? 1 : 0;
+        else if (mode === 'add') { if (inside) mask[i] = 1; }
+        else if (mode === 'subtract') { if (inside) mask[i] = 0; }
+        if (mask[i]) {
+            sumX += xA[i]; sumY += yA[i]; sumZ += zA[i]; cnt++;
+        }
+    };
+
+    const camPos = cameraEntity.getPosition();
+    const collectCenterHits = () => {
+        const hits = [];
+        for (let i = 0; i < numSplats; i++) {
+            worldMat.transformPoint(new pc.Vec3(xA[i], yA[i], zA[i]), worldPt);
+            cameraEntity.camera.worldToScreen(worldPt, screenPt);
+            if (screenPt.z < 0) continue;
+            if (!pointInPolygon(screenPt.x, screenPt.y, poly)) continue;
+            hits.push({ i, d: worldPt.distance(camPos) });
+        }
+        return hits;
+    };
+
+    let hits = [];
+    if (useRingHitSelection()) {
+        for (let i = 0; i < numSplats; i++) {
+            const e = getSplatScreenEllipse(data, layer, i, wEnt);
+            if (!e) continue;
+            if (splatEllipseIntersectsPolygon(e, poly)) hits.push({ i, d: e.distCam });
+        }
+        if (!hits.length) hits = collectCenterHits();
+    } else {
+        hits = collectCenterHits();
+    }
+
+    const selected = filterHitsBySelectionDepth(hits);
+    for (let i = 0; i < numSplats; i++) {
+        applyInRegion(selected.has(i), i);
+    }
+
+    hasSelection = mask.some(v => v > 0);
+    if (hasSelection && cnt > 0) {
+        const cx = sumX/cnt, cy = sumY/cnt, cz = sumZ/cnt;
+        let maxD = 0;
+        for (let i = 0; i < numSplats; i++) {
+            if (!mask[i]) continue;
+            const dx = xA[i]-cx, dy = yA[i]-cy, dz = zA[i]-cz;
+            const d = Math.sqrt(dx*dx+dy*dy+dz*dz);
+            if (d > maxD) maxD = d;
+        }
+        selectionSphere = [cx, cy, cz, maxD];
+    } else if (mode === 'new') {
+        selectionSphere = [0, 0, 0, -1];
+    }
+    updateSelectionUI();
+};
+
+const applyBoxSelection = (x1, y1, x2, y2, mode = selectionMode) => {
+    const minX = Math.min(x1, x2);
+    const maxX = Math.max(x1, x2);
+    const minY = Math.min(y1, y2);
+    const maxY = Math.max(y1, y2);
+    applyPolygonSelection(
+        [{ x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY }],
+        mode,
+    );
+};
+
+/** Close poly by repeating first vertex if needed (for point-in-polygon). */
+const closeSelectionPoly = (pts) => {
+    if (!pts || pts.length < 3) return null;
+    const out = pts.map((p) => ({ x: p.x, y: p.y }));
+    const a = out[0], b = out[out.length - 1];
+    if ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 > 9) out.push({ ...a });
+    return out;
+};
+
+let lassoEffectiveMode = null;
+
+const redrawSelectionOverlays = () => {
+    if (!selectionOverlaySvg) return;
+    let html = '';
+    if (activeTool === 'lassoSelect' && lassoDragActive && lassoPoints.length >= 2) {
+        const d = lassoPoints.map((p, i) => `${i ? 'L' : 'M'}${p.x},${p.y}`).join(' ');
+        html += `<path d="${d}" fill="none" stroke="rgba(170,210,255,0.95)" stroke-width="1.5"/>`;
+    }
+    if (activeTool === 'vectorSelect' && vectorPolyPoints.length) {
+        const pts = vectorPolyPoints.map((p) => `${p.x},${p.y}`).join(' ');
+        html += `<polyline points="${pts}" fill="none" stroke="rgba(170,210,255,0.95)" stroke-width="1.5"/>`;
+        if (vectorHoverScreen) {
+            const last = vectorPolyPoints[vectorPolyPoints.length - 1];
+            html += `<line x1="${last.x}" y1="${last.y}" x2="${vectorHoverScreen.x}" y2="${vectorHoverScreen.y}" stroke="rgba(170,210,255,0.45)" stroke-width="1" stroke-dasharray="4 3"/>`;
+        }
+        const f = vectorPolyPoints[0];
+        html += `<circle cx="${f.x}" cy="${f.y}" r="4" fill="none" stroke="rgba(140,230,170,0.9)" stroke-width="1.2"/>`;
+    }
+    selectionOverlaySvg.innerHTML = html;
+};
+
+// ── Shared selection helpers ──────────────────────────────────────────────────
+// Recompute selectionSphere to the bounding sphere of all selected splats.
+const recomputeSelectionSphere = () => {
+    const data = getActiveDataCache();
+    const mask = peekActiveSelectionMask();
+    if (!data || !mask) { hasSelection = false; selectionSphere = [0,0,0,-1]; return; }
+    const { numSplats, x: xA, y: yA, z: zA } = data;
+    hasSelection = mask.some(v => v > 0);
+    if (!hasSelection) { selectionSphere = [0, 0, 0, -1]; return; }
+
+    let cnt = 0, sumX = 0, sumY = 0, sumZ = 0;
+    for (let i = 0; i < numSplats; i++) {
+        if (mask[i]) { sumX += xA[i]; sumY += yA[i]; sumZ += zA[i]; cnt++; }
+    }
+    const cx = sumX/cnt, cy = sumY/cnt, cz = sumZ/cnt;
+    let maxD = 0;
+    for (let i = 0; i < numSplats; i++) {
+        if (!mask[i]) continue;
+        const dx = xA[i]-cx, dy = yA[i]-cy, dz = zA[i]-cz;
+        const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (d > maxD) maxD = d;
+    }
+    selectionSphere = [cx, cy, cz, maxD];
+};
+
+// Select all splats whose color is within tolerance of the splat nearest worldPt.
+const applyColorSelection = (worldPt, mode = selectionMode, screenX, screenY) => {
+    const data = getActiveDataCache();
+    const wEnt = getWorldMatEntityForActiveTarget();
+    const layer = getActiveLayer();
+    if (!data || !wEnt) return;
+    const { numSplats, x: xA, y: yA, z: zA, fdc0, fdc1, fdc2 } = data;
+    const mask = getActiveSelectionMask(numSplats);
+
+    const invMat = new pc.Mat4().copy(wEnt.getWorldTransform()).invert();
+    const modelPt = new pc.Vec3();
+    invMat.transformPoint(worldPt, modelPt);
+
+    let nearestIdx = -1;
+    if (useRingHitSelection() && screenX != null && screenY != null) {
+        const pr = pickFrontSplatAtScreen(screenX, screenY, data, layer, wEnt);
+        if (pr != null) nearestIdx = pr;
+    }
+    if (nearestIdx < 0) {
+        let nearestD2 = Infinity;
+        for (let i = 0; i < numSplats; i++) {
+            const dx = xA[i] - modelPt.x;
+            const dy = yA[i] - modelPt.y;
+            const dz = zA[i] - modelPt.z;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < nearestD2) { nearestD2 = d2; nearestIdx = i; }
+        }
+    }
+    if (nearestIdx < 0) return;
+
+    const tR = Math.max(0, 0.5 + fdc0[nearestIdx] * SH_C0);
+    const tG = Math.max(0, 0.5 + fdc1[nearestIdx] * SH_C0);
+    const tB = Math.max(0, 0.5 + fdc2[nearestIdx] * SH_C0);
+    const tol = colorTolerance();
+
+    for (let i = 0; i < numSplats; i++) {
+        const r = Math.max(0, 0.5 + fdc0[i] * SH_C0);
+        const g = Math.max(0, 0.5 + fdc1[i] * SH_C0);
+        const b = Math.max(0, 0.5 + fdc2[i] * SH_C0);
+        const dist = Math.sqrt((r-tR)**2 + (g-tG)**2 + (b-tB)**2);
+        const inside = dist <= tol;
+        if      (mode === 'new')      mask[i] = inside ? 1 : 0;
+        else if (mode === 'add')      { if (inside) mask[i] = 1; }
+        else if (mode === 'subtract') { if (inside) mask[i] = 0; }
+    }
+
+    recomputeSelectionSphere();
+    updateSelectionUI();
+};
+
+// Paint selection with brush: select/deselect splats under the brush sphere.
+let brushSelectEffectiveMode = null;  // Set at mousedown when Alt; used for whole drag
+const brushSelectAt = (screenX, screenY, mode = brushSelectEffectiveMode ?? selectionMode) => {
+    const data = getActiveDataCache();
+    const wEnt = getWorldMatEntityForActiveTarget();
+    if (!data || !wEnt) return;
+    const { numSplats, x: xA, y: yA, z: zA } = data;
+    const mask = getActiveSelectionMask(numSplats);
+
+    const worldPt = getWorldPoint(screenX, screenY);
+    if (!worldPt) return;
+
+    const worldRadius = brushSelectSize();
+    const spacing    = brushSelectSpacing();
+    if (lastBrushSelectWorld && worldPt.distance(lastBrushSelectWorld) < worldRadius * 2 * spacing)
+        return;
+    lastBrushSelectWorld = worldPt.clone();
+
+    if (mode === 'new' && brushSelectFirstDab) {
+        mask.fill(0);
+        brushSelectFirstDab = false;
+    }
+
+    const invMat = new pc.Mat4().copy(wEnt.getWorldTransform()).invert();
+    const modelPt = new pc.Vec3();
+    invMat.transformPoint(worldPt, modelPt);
+
+    const refW = new pc.Vec3(worldPt.x + worldRadius, worldPt.y, worldPt.z);
+    const refM = new pc.Vec3();
+    invMat.transformPoint(refW, refM);
+    const modelRadius = modelPt.distance(refM);
+    const r2 = modelRadius * modelRadius;
+
+    const layer = getActiveLayer();
+    if (useRingHitSelection()) {
+        const ringHits = [];
+        for (let i = 0; i < numSplats; i++) {
+            const e = getSplatScreenEllipse(data, layer, i, wEnt);
+            if (e && screenHitsSplatEllipse(screenX, screenY, e)) {
+                ringHits.push({ i, d: e.distCam });
+            }
+        }
+        if (ringHits.length) {
+            const sel = filterHitsBySelectionDepth(ringHits);
+            for (const h of ringHits) {
+                if (!sel.has(h.i)) continue;
+                if (mode === 'new' || mode === 'add') mask[h.i] = 1;
+                else if (mode === 'subtract') mask[h.i] = 0;
+            }
+        }
+    } else {
+        for (let i = 0; i < numSplats; i++) {
+            const dx = xA[i] - modelPt.x;
+            const dy = yA[i] - modelPt.y;
+            const dz = zA[i] - modelPt.z;
+            if (dx * dx + dy * dy + dz * dz > r2) continue;
+            if (mode === 'new' || mode === 'add') mask[i] = 1;
+            else if (mode === 'subtract') mask[i] = 0;
+        }
+    }
+
+    hasSelection = mask.some(v => v > 0);
+    recomputeSelectionSphere();
+    updateSelectionUI();
+};
+
+// ── Splat Select tool ────────────────────────────────────────────────────────
+// Click to select the single nearest splat, or drag to select all within a radius.
+let isSplatSelecting = false;
+
+const splatPickAt = (screenX, screenY, addToSel) => {
+    const data = getActiveDataCache();
+    const wEnt = getWorldMatEntityForActiveTarget();
+    const layer = getActiveLayer();
+    if (!data || !wEnt) return;
+    const { numSplats, x: xA, y: yA, z: zA } = data;
+    const worldPt = getWorldPoint(screenX, screenY);
+    if (!worldPt) return;
+
+    const invMat = new pc.Mat4().copy(wEnt.getWorldTransform()).invert();
+    const modelPt = new pc.Vec3();
+    invMat.transformPoint(worldPt, modelPt);
+
+    const mask = getActiveSelectionMask(numSplats);
+    if (!addToSel) mask.fill(0);
+
+    let nearestIdx = -1;
+    if (useRingHitSelection()) {
+        const pr = pickFrontSplatAtScreen(screenX, screenY, data, layer, wEnt);
+        if (pr != null) nearestIdx = pr;
+    }
+    if (nearestIdx < 0) {
+        let nearestD2 = Infinity;
+        for (let i = 0; i < numSplats; i++) {
+            const dx = xA[i] - modelPt.x;
+            const dy = yA[i] - modelPt.y;
+            const dz = zA[i] - modelPt.z;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < nearestD2) { nearestD2 = d2; nearestIdx = i; }
+        }
+    }
+    if (nearestIdx < 0) return;
+
+    mask[nearestIdx] = 1;
+    hasSelection = true;
+    recomputeSelectionSphere();
+    updateSelectionUI();
+};
+
+// Drag-select: select all splats within world radius of a point
+const splatDragSelectAt = (screenX, screenY, addToSel) => {
+    const data = getActiveDataCache();
+    const wEnt = getWorldMatEntityForActiveTarget();
+    const layer = getActiveLayer();
+    if (!data || !wEnt) return;
+    const { numSplats, x: xA, y: yA, z: zA } = data;
+    const worldPt = getWorldPoint(screenX, screenY);
+    if (!worldPt) return;
+
+    const invMat = new pc.Mat4().copy(wEnt.getWorldTransform()).invert();
+    const modelPt = new pc.Vec3();
+    invMat.transformPoint(worldPt, modelPt);
+
+    const refW = new pc.Vec3(worldPt.x + brushSize(), worldPt.y, worldPt.z);
+    const refM = new pc.Vec3();
+    invMat.transformPoint(refW, refM);
+    const modelRadius = modelPt.distance(refM);
+    const r2 = modelRadius * modelRadius;
+
+    const mask = getActiveSelectionMask(numSplats);
+    if (!addToSel) mask.fill(0);
+
+    const picks = [];
+    for (let i = 0; i < numSplats; i++) {
+        if (useRingHitSelection()) {
+            const e = getSplatScreenEllipse(data, layer, i, wEnt);
+            if (!e || !screenHitsSplatEllipse(screenX, screenY, e)) continue;
+            picks.push({ i, d: e.distCam });
+        } else {
+            const dx = xA[i] - modelPt.x;
+            const dy = yA[i] - modelPt.y;
+            const dz = zA[i] - modelPt.z;
+            if (dx * dx + dy * dy + dz * dz > r2) continue;
+            picks.push({ i, d: 0 });
+        }
+    }
+
+    let any = false;
+    if (useRingHitSelection() && picks.length) {
+        const sel = filterHitsBySelectionDepth(picks);
+        for (const p of picks) {
+            if (!sel.has(p.i)) continue;
+            mask[p.i] = 1;
+            any = true;
+        }
+    } else {
+        for (const p of picks) {
+            mask[p.i] = 1;
+            any = true;
+        }
+    }
+    if (any) {
+        hasSelection = true;
+        recomputeSelectionSphere();
+        updateSelectionUI();
+    }
+};
+
+// ── Generate Splats tool ─────────────────────────────────────────────────────
+// Sample color from base splat at world point (nearest splat's f_dc)
+const sampleColorAt = (worldPt) => {
+    if (!gsplatDataCache || !paintables.length) return;
+    const { numSplats, x: xA, y: yA, z: zA, fdc0, fdc1, fdc2 } = gsplatDataCache;
+    const invMat = new pc.Mat4().copy(paintables[0].entity.getWorldTransform()).invert();
+    const modelPt = new pc.Vec3();
+    invMat.transformPoint(worldPt, modelPt);
+
+    let nearestIdx = -1, nearestD2 = Infinity;
+    for (let i = 0; i < numSplats; i++) {
+        const dx = xA[i] - modelPt.x, dy = yA[i] - modelPt.y, dz = zA[i] - modelPt.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < nearestD2) { nearestD2 = d2; nearestIdx = i; }
+    }
+    if (nearestIdx < 0) return;
+
+    const sr = Math.max(0, Math.min(1, 0.5 + fdc0[nearestIdx] * SH_C0));
+    const sg = Math.max(0, Math.min(1, 0.5 + fdc1[nearestIdx] * SH_C0));
+    const sb = Math.max(0, Math.min(1, 0.5 + fdc2[nearestIdx] * SH_C0));
+    generateSplatsSampledColor = [sr, sg, sb];
+    const colorBox = g('generate-splats-color');
+    if (colorBox) colorBox.style.background = `rgb(${Math.round(sr*255)},${Math.round(sg*255)},${Math.round(sb*255)})`;
+};
+
+// Count existing splats (base + all layers) within model-space radius of center
+const countSplatsInRadius = (modelCenter, modelRadius) => {
+    let count = 0;
+    const r2 = modelRadius * modelRadius;
+    if (gsplatDataCache) {
+        const { numSplats, x: xA, y: yA, z: zA } = gsplatDataCache;
+        for (let i = 0; i < numSplats; i++) {
+            const dx = xA[i] - modelCenter.x, dy = yA[i] - modelCenter.y, dz = zA[i] - modelCenter.z;
+            if (dx * dx + dy * dy + dz * dz <= r2) count++;
+        }
+    }
+    for (const layer of layers) {
+        for (const s of layer.splats) {
+            const dx = s.x - modelCenter.x, dy = s.y - modelCenter.y, dz = s.z - modelCenter.z;
+            if (dx * dx + dy * dy + dz * dz <= r2) count++;
+        }
+    }
+    return count;
+};
+
+// ── Parametric shape generators ───────────────────────────────────────────────
+// Each returns an array of {x,y,z} points, centred at origin.
+// hollow: true → wireframe / edges only. false → filled shell or solid volume (per shape).
+
+/** Distribute n points along 3D segments {a,b}; count per edge scales with edge length. */
+const distributeOnEdges = (edges, n) => {
+    if (!edges.length || n <= 0) return [];
+    const lens = edges.map((e) => {
+        const dx = e.b.x - e.a.x, dy = e.b.y - e.a.y, dz = e.b.z - e.a.z;
+        return Math.max(1e-8, Math.hypot(dx, dy, dz));
+    });
+    const sum = lens.reduce((a, b) => a + b, 0);
+    const counts = lens.map((len) => Math.max(1, Math.floor((n * len) / sum)));
+    let tot = counts.reduce((a, b) => a + b, 0);
+    let k = 0;
+    while (tot < n) {
+        counts[k % counts.length]++;
+        tot++;
+        k++;
+    }
+    while (tot > n) {
+        const j = counts.findIndex((c) => c > 1);
+        if (j < 0) break;
+        counts[j]--;
+        tot--;
+    }
+    const pts = [];
+    for (let ei = 0; ei < edges.length; ei++) {
+        const { a, b } = edges[ei];
+        const c = counts[ei];
+        for (let i = 0; i < c; i++) {
+            const t = c <= 1 ? 0.5 : i / (c - 1);
+            pts.push({
+                x: a.x + (b.x - a.x) * t,
+                y: a.y + (b.y - a.y) * t,
+                z: a.z + (b.z - a.z) * t,
+            });
+        }
+    }
+    return pts;
+};
+
+const torusPoint = (R, rr, u, v) => ({
+    x: (R + rr * Math.cos(v)) * Math.cos(u),
+    y: rr * Math.sin(v),
+    z: (R + rr * Math.cos(v)) * Math.sin(u),
+});
+
+/** Per-axis sizes in model units (sx, sy, sz). */
+const shapeGenerators = {
+    cube: (n, dims, hollow) => {
+        const hx = dims.sx / 2, hy = dims.sy / 2, hz = dims.sz / 2;
+        if (hollow) {
+            const P = (x, y, z) => ({ x, y, z });
+            const edges = [];
+            for (const syy of [-1, 1]) for (const szz of [-1, 1])
+                edges.push({ a: P(-hx, syy * hy, szz * hz), b: P(hx, syy * hy, szz * hz) });
+            for (const sxx of [-1, 1]) for (const szz of [-1, 1])
+                edges.push({ a: P(sxx * hx, -hy, szz * hz), b: P(sxx * hx, hy, szz * hz) });
+            for (const sxx of [-1, 1]) for (const syy of [-1, 1])
+                edges.push({ a: P(sxx * hx, syy * hy, -hz), b: P(sxx * hx, syy * hy, hz) });
+            return distributeOnEdges(edges, n);
+        }
+        const ex = [dims.sx, dims.sy, dims.sz];
+        const h = [hx, hy, hz];
+        const pts = [];
+        const perFace = Math.max(1, Math.ceil(n / 6));
+        const faces = [
+            { axis: 0, sign: 1 }, { axis: 0, sign: -1 },
+            { axis: 1, sign: 1 }, { axis: 1, sign: -1 },
+            { axis: 2, sign: 1 }, { axis: 2, sign: -1 },
+        ];
+        for (const f of faces) {
+            for (let i = 0; i < perFace; i++) {
+                const a1 = (f.axis + 1) % 3, a2 = (f.axis + 2) % 3;
+                const p = [0, 0, 0];
+                p[f.axis] = h[f.axis] * f.sign;
+                p[a1] = (Math.random() - 0.5) * ex[a1];
+                p[a2] = (Math.random() - 0.5) * ex[a2];
+                pts.push({ x: p[0], y: p[1], z: p[2] });
+            }
+        }
+        return pts;
+    },
+    sphere: (n, dims, hollow) => {
+        const rx = dims.sx / 2, ry = dims.sy / 2, rz = dims.sz / 2;
+        const pts = [];
+        if (hollow) {
+            for (let i = 0; i < n; i++) {
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                const dx = Math.sin(phi) * Math.cos(theta);
+                const dy = Math.sin(phi) * Math.sin(theta);
+                const dz = Math.cos(phi);
+                pts.push({ x: rx * dx, y: ry * dy, z: rz * dz });
+            }
+            return pts;
+        }
+        for (let i = 0; i < n; i++) {
+            const rad = Math.cbrt(Math.random());
+            const theta = Math.random() * Math.PI * 2;
+            const phi = Math.acos(2 * Math.random() - 1);
+            const dx = Math.sin(phi) * Math.cos(theta);
+            const dy = Math.sin(phi) * Math.sin(theta);
+            const dz = Math.cos(phi);
+            pts.push({ x: rad * rx * dx, y: rad * ry * dy, z: rad * rz * dz });
+        }
+        return pts;
+    },
+    cylinder: (n, dims, hollow) => {
+        const rx = dims.sx / 2, rz = dims.sz / 2, hh = dims.sy / 2;
+        if (hollow) {
+            const edges = [];
+            const rimSegs = Math.max(8, Math.floor(Math.sqrt(Math.max(n, 64))));
+            for (let i = 0; i < rimSegs; i++) {
+                const t0 = (i / rimSegs) * Math.PI * 2;
+                const t1 = ((i + 1) / rimSegs) * Math.PI * 2;
+                edges.push({
+                    a: { x: rx * Math.cos(t0), y: -hh, z: rz * Math.sin(t0) },
+                    b: { x: rx * Math.cos(t1), y: -hh, z: rz * Math.sin(t1) },
+                });
+                edges.push({
+                    a: { x: rx * Math.cos(t0), y: hh, z: rz * Math.sin(t0) },
+                    b: { x: rx * Math.cos(t1), y: hh, z: rz * Math.sin(t1) },
+                });
+            }
+            const K = Math.max(4, Math.min(48, Math.floor(n / Math.max(rimSegs * 2, 1))));
+            for (let k = 0; k < K; k++) {
+                const th = (k / K) * Math.PI * 2;
+                const x0 = rx * Math.cos(th), z0 = rz * Math.sin(th);
+                edges.push({ a: { x: x0, y: -hh, z: z0 }, b: { x: x0, y: hh, z: z0 } });
+            }
+            return distributeOnEdges(edges, n);
+        }
+        const pts = [];
+        const h = dims.sy;
+        const nCap = Math.max(1, Math.floor(n * 0.15));
+        const nSide = n - nCap * 2;
+        for (let i = 0; i < nSide; i++) {
+            const theta = Math.random() * Math.PI * 2;
+            pts.push({
+                x: rx * Math.cos(theta),
+                y: (Math.random() - 0.5) * h,
+                z: rz * Math.sin(theta),
+            });
+        }
+        for (let sign = -1; sign <= 1; sign += 2) {
+            for (let i = 0; i < nCap; i++) {
+                const u = Math.sqrt(Math.random());
+                const theta = Math.random() * Math.PI * 2;
+                pts.push({
+                    x: u * rx * Math.cos(theta),
+                    y: sign * h / 2,
+                    z: u * rz * Math.sin(theta),
+                });
+            }
+        }
+        return pts;
+    },
+    plane: (n, dims, hollow) => {
+        const hx = dims.sx / 2, hz = dims.sz / 2;
+        if (hollow) {
+            const edges = [
+                { a: { x: -hx, y: 0, z: -hz }, b: { x: hx, y: 0, z: -hz } },
+                { a: { x: hx, y: 0, z: -hz }, b: { x: hx, y: 0, z: hz } },
+                { a: { x: hx, y: 0, z: hz }, b: { x: -hx, y: 0, z: hz } },
+                { a: { x: -hx, y: 0, z: hz }, b: { x: -hx, y: 0, z: -hz } },
+            ];
+            return distributeOnEdges(edges, n);
+        }
+        const pts = [];
+        for (let i = 0; i < n; i++) {
+            pts.push({
+                x: (Math.random() - 0.5) * dims.sx,
+                y: 0,
+                z: (Math.random() - 0.5) * dims.sz,
+            });
+        }
+        return pts;
+    },
+    cone: (n, dims, hollow) => {
+        const rx = dims.sx / 2, rz = dims.sz / 2, h = dims.sy;
+        const apex = { x: 0, y: h / 2, z: 0 };
+        if (hollow) {
+            const edges = [];
+            const rimSegs = Math.max(8, Math.floor(Math.sqrt(Math.max(n, 64))));
+            for (let i = 0; i < rimSegs; i++) {
+                const t0 = (i / rimSegs) * Math.PI * 2;
+                const t1 = ((i + 1) / rimSegs) * Math.PI * 2;
+                edges.push({
+                    a: { x: rx * Math.cos(t0), y: -h / 2, z: rz * Math.sin(t0) },
+                    b: { x: rx * Math.cos(t1), y: -h / 2, z: rz * Math.sin(t1) },
+                });
+            }
+            const M = Math.max(4, Math.min(48, Math.floor(n / Math.max(rimSegs, 1))));
+            for (let k = 0; k < M; k++) {
+                const th = (k / M) * Math.PI * 2;
+                edges.push({
+                    a: apex,
+                    b: { x: rx * Math.cos(th), y: -h / 2, z: rz * Math.sin(th) },
+                });
+            }
+            return distributeOnEdges(edges, n);
+        }
+        const pts = [];
+        const nBase = Math.max(1, Math.floor(n * 0.2));
+        const nSide = n - nBase;
+        for (let i = 0; i < nSide; i++) {
+            const t = Math.random();
+            const crx = rx * (1 - t), crz = rz * (1 - t);
+            const theta = Math.random() * Math.PI * 2;
+            pts.push({
+                x: crx * Math.cos(theta),
+                y: t * h - h / 2,
+                z: crz * Math.sin(theta),
+            });
+        }
+        for (let i = 0; i < nBase; i++) {
+            const u = Math.sqrt(Math.random());
+            const theta = Math.random() * Math.PI * 2;
+            pts.push({
+                x: u * rx * Math.cos(theta),
+                y: -h / 2,
+                z: u * rz * Math.sin(theta),
+            });
+        }
+        return pts;
+    },
+    pyramid: (n, dims, hollow) => {
+        const hx = dims.sx / 2, hz = dims.sz / 2, hh = dims.sy / 2;
+        const apex = { x: 0, y: hh, z: 0 };
+        const corners = [
+            { x: -hx, y: -hh, z: -hz },
+            { x:  hx, y: -hh, z: -hz },
+            { x:  hx, y: -hh, z:  hz },
+            { x: -hx, y: -hh, z:  hz },
+        ];
+        if (hollow) {
+            const edges = [];
+            for (let i = 0; i < 4; i++) {
+                edges.push({ a: corners[i], b: corners[(i + 1) % 4] });
+                edges.push({ a: corners[i], b: apex });
+            }
+            return distributeOnEdges(edges, n);
+        }
+        const pts = [];
+        const nBase = Math.max(1, Math.floor(n * 0.25));
+        const nSide = n - nBase;
+        for (let i = 0; i < nBase; i++) {
+            pts.push({
+                x: (Math.random() - 0.5) * dims.sx,
+                y: -hh,
+                z: (Math.random() - 0.5) * dims.sz,
+            });
+        }
+        const tris = [];
+        for (let i = 0; i < 4; i++) {
+            tris.push([corners[i], corners[(i + 1) % 4], apex]);
+        }
+        const perTri = Math.max(1, Math.ceil(nSide / tris.length));
+        for (const [a, b, c] of tris) {
+            for (let j = 0; j < perTri && pts.length < n; j++) {
+                let u = Math.random(), v = Math.random();
+                if (u + v > 1) { u = 1 - u; v = 1 - v; }
+                const w = 1 - u - v;
+                pts.push({
+                    x: a.x * u + b.x * v + c.x * w,
+                    y: a.y * u + b.y * v + c.y * w,
+                    z: a.z * u + b.z * v + c.z * w,
+                });
+            }
+        }
+        return pts;
+    },
+    torus: (n, dims, hollow) => {
+        const R = Math.max(dims.sx, dims.sz) / 2;
+        const rr = Math.max(0.02 * R, Math.min(dims.sy, dims.sx, dims.sz) / 2 * 0.35);
+        if (hollow) {
+            const edges = [];
+            const Nu = Math.max(3, Math.min(32, Math.floor(Math.sqrt(Math.max(n / 24, 9)))));
+            const Nv = Nu;
+            const segU = Math.max(4, Math.min(256, Math.ceil(n / (2 * Math.max(Nv, 1)))));
+            const segV = Math.max(4, Math.min(256, Math.ceil(n / (2 * Math.max(Nu, 1)))));
+            for (let j = 0; j < Nv; j++) {
+                const v = (j / Nv) * Math.PI * 2;
+                for (let i = 0; i < segU; i++) {
+                    const u0 = (i / segU) * Math.PI * 2;
+                    const u1 = ((i + 1) / segU) * Math.PI * 2;
+                    edges.push({ a: torusPoint(R, rr, u0, v), b: torusPoint(R, rr, u1, v) });
+                }
+            }
+            for (let i = 0; i < Nu; i++) {
+                const u = (i / Nu) * Math.PI * 2;
+                for (let j = 0; j < segV; j++) {
+                    const v0 = (j / segV) * Math.PI * 2;
+                    const v1 = ((j + 1) / segV) * Math.PI * 2;
+                    edges.push({ a: torusPoint(R, rr, u, v0), b: torusPoint(R, rr, u, v1) });
+                }
+            }
+            return distributeOnEdges(edges, n);
+        }
+        const pts = [];
+        for (let i = 0; i < n; i++) {
+            const u = Math.random() * Math.PI * 2;
+            const v = Math.random() * Math.PI * 2;
+            pts.push(torusPoint(R, rr, u, v));
+        }
+        return pts;
+    },
+};
+
+// Scratch for parametric shapes: world point → layersContainer local (no-base case).
+const _shapeWorldTmp = new pc.Vec3();
+const _shapeLocalTmp = new pc.Vec3();
+const _shapeNormScratch = new pc.Vec3();
+const _shapeInvParent = new pc.Mat4();
+const _shapeInvBaseScratch = new pc.Mat4();
+
+/** When there is no imported base, frame the camera on a layer's splats (world AABB). */
+const frameOrbitOnLayerSplats = (layer) => {
+    const ent = layersContainer.findByName(`layer-${layer.id}`);
+    if (!ent || !layer.splats.length) return;
+    const wt = ent.getWorldTransform();
+    const v = new pc.Vec3();
+    let minx = Infinity, miny = Infinity, minz = Infinity;
+    let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
+    for (const s of layer.splats) {
+        v.set(s.x, s.y, s.z);
+        wt.transformPoint(v, v);
+        minx = Math.min(minx, v.x); maxx = Math.max(maxx, v.x);
+        miny = Math.min(miny, v.y); maxy = Math.max(maxy, v.y);
+        minz = Math.min(minz, v.z); maxz = Math.max(maxz, v.z);
+    }
+    const tcx = (minx + maxx) * 0.5;
+    const tcy = (miny + maxy) * 0.5;
+    const tcz = (minz + maxz) * 0.5;
+    const halfExtent = Math.max(maxx - minx, maxy - miny, maxz - minz) * 0.5;
+    orbit.target.set(tcx, tcy, tcz);
+    orbit.distance = Math.max(halfExtent * 2.8, 0.35);
+    orbit.yaw = 0;
+    orbit.pitch = -15;
+    if (cameraNavMode === 'fly') syncFlyCamFromOrbitParams();
+    updateCamera();
+    snapshotCameraResetFromFramedView();
+};
+
+/** Center orbit/fly camera on the active layer (base splats or user layer entity). */
+const frameCameraOnSelectedLayer = () => {
+    const isBase = selectedLayerId === 'base' || !selectedLayerId;
+    if (isBase) {
+        if (!paintables.length || !gsplatDataCache?.numSplats) return;
+        const wt = paintables[0].entity.getWorldTransform();
+        const v = new pc.Vec3();
+        const { x, y, z, numSplats } = gsplatDataCache;
+        let minx = Infinity, miny = Infinity, minz = Infinity;
+        let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
+        for (let i = 0; i < numSplats; i++) {
+            v.set(x[i], y[i], z[i]);
+            wt.transformPoint(v, v);
+            minx = Math.min(minx, v.x); maxx = Math.max(maxx, v.x);
+            miny = Math.min(miny, v.y); maxy = Math.max(maxy, v.y);
+            minz = Math.min(minz, v.z); maxz = Math.max(maxz, v.z);
+        }
+        const tcx = (minx + maxx) * 0.5;
+        const tcy = (miny + maxy) * 0.5;
+        const tcz = (minz + maxz) * 0.5;
+        const halfExtent = Math.max(maxx - minx, maxy - miny, maxz - minz) * 0.5;
+        orbit.target.set(tcx, tcy, tcz);
+        orbit.distance = Math.max(halfExtent * 2.8, 0.35);
+        orbit.yaw = 0;
+        orbit.pitch = -15;
+        if (cameraNavMode === 'fly') syncFlyCamFromOrbitParams();
+        updateCamera();
+        snapshotCameraResetFromFramedView();
+        return;
+    }
+    const layer = layers.find((l) => l.id === selectedLayerId);
+    if (layer) frameOrbitOnLayerSplats(layer);
+};
+
+const SHAPE_DIM_MIN = 0.05;
+const SHAPE_DIM_MAX = 20;
+const readShapeDimsFromUI = () => {
+    const clamp = (v, def) => {
+        const x = Number.isFinite(v) ? v : def;
+        return Math.max(SHAPE_DIM_MIN, Math.min(SHAPE_DIM_MAX, x));
+    };
+    const px = parseFloat(g('shape-size-x')?.value);
+    const py = parseFloat(g('shape-size-y')?.value);
+    const pz = parseFloat(g('shape-size-z')?.value);
+    return {
+        sx: clamp(px, 0.5),
+        sy: clamp(py, 0.5),
+        sz: clamp(pz, 0.5),
+    };
+};
+
+const readShapeRotFromUI = () => {
+    const p = (id) => { const v = parseFloat(g(id)?.value); return Number.isFinite(v) ? v : 0; };
+    return { rx: p('shape-rot-x'), ry: p('shape-rot-y'), rz: p('shape-rot-z') };
+};
+
+const LS_SHAPE_TOOL = 'photoshock-shape-tool-v1';
+const saveShapeToolPrefs = () => {
+    try {
+        let k = parseFloat(g('shape-density-num')?.value);
+        if (!Number.isFinite(k)) k = parseFloat(g('shape-density')?.value);
+        if (!Number.isFinite(k)) k = 5;
+        localStorage.setItem(LS_SHAPE_TOOL, JSON.stringify({
+            type: g('shape-type')?.value ?? 'cube',
+            sx: parseFloat(g('shape-size-x')?.value) || 0.5,
+            sy: parseFloat(g('shape-size-y')?.value) || 0.5,
+            sz: parseFloat(g('shape-size-z')?.value) || 0.5,
+            rx: parseFloat(g('shape-rot-x')?.value) || 0,
+            ry: parseFloat(g('shape-rot-y')?.value) || 0,
+            rz: parseFloat(g('shape-rot-z')?.value) || 0,
+            densityK: k,
+            hollow: !!g('shape-hollow-edges')?.checked,
+            color: g('shape-color')?.value ?? '#cccccc',
+        }));
+    } catch (_) { /* ignore */ }
+};
+const loadShapeToolPrefs = () => {
+    try {
+        const raw = localStorage.getItem(LS_SHAPE_TOOL);
+        if (!raw) return;
+        const o = JSON.parse(raw);
+        if (o.type && g('shape-type')) g('shape-type').value = o.type;
+        if (Number.isFinite(o.sx) && g('shape-size-x')) g('shape-size-x').value = String(o.sx);
+        if (Number.isFinite(o.sy) && g('shape-size-y')) g('shape-size-y').value = String(o.sy);
+        if (Number.isFinite(o.sz) && g('shape-size-z')) g('shape-size-z').value = String(o.sz);
+        if (Number.isFinite(o.densityK)) {
+            const k = o.densityK;
+            if (g('shape-density')) g('shape-density').value = String(k);
+            if (g('shape-density-num')) g('shape-density-num').value = Math.abs(k % 1) < 1e-6 ? String(Math.round(k)) : String(k);
+        }
+        if (Number.isFinite(o.rx) && g('shape-rot-x')) g('shape-rot-x').value = String(o.rx);
+        if (Number.isFinite(o.ry) && g('shape-rot-y')) g('shape-rot-y').value = String(o.ry);
+        if (Number.isFinite(o.rz) && g('shape-rot-z')) g('shape-rot-z').value = String(o.rz);
+        if (typeof o.hollow === 'boolean' && g('shape-hollow-edges')) g('shape-hollow-edges').checked = o.hollow;
+        if (o.color && /^#[0-9a-fA-F]{6}$/.test(o.color)) {
+            if (g('shape-color')) g('shape-color').value = o.color.toLowerCase();
+            if (g('shape-color-hex')) g('shape-color-hex').value = o.color.toLowerCase();
+        }
+    } catch (_) { /* ignore */ }
+};
+
+const SHAPE_DENSITY_MIN = 500;
+const SHAPE_DENSITY_MAX = 1_000_000; // 1000k splats
+
+/** UI density is in k (1 → 1000 splats). Clamped to SHAPE_DENSITY_MIN…MAX actual. */
+const readShapeDensityFromUI = () => {
+    const fromNum = parseFloat(g('shape-density-num')?.value);
+    let k = Number.isFinite(fromNum)
+        ? fromNum
+        : parseFloat(g('shape-density')?.value ?? '5');
+    if (!Number.isFinite(k)) k = 5;
+    const raw = Math.round(k * 1000);
+    return Math.max(SHAPE_DENSITY_MIN, Math.min(SHAPE_DENSITY_MAX, raw));
+};
+
+/** Normalized wireframe segments in [-0.5, 0.5] per axis; root local scale applies real size. */
+const buildShapePreviewLinePositions = (shapeType) => {
+    const pos = [];
+    const L = (ax, ay, az, bx, by, bz) => { pos.push(ax, ay, az, bx, by, bz); };
+    const h = 0.5;
+    if (shapeType === 'cube') {
+        for (const s of [-1, 1]) {
+            L(-h, s * h, -h, h, s * h, -h);
+            L(-h, s * h, h, h, s * h, h);
+            L(s * h, -h, -h, s * h, h, -h);
+            L(s * h, -h, h, s * h, h, h);
+            L(-h, -h, s * h, h, -h, s * h);
+            L(-h, h, s * h, h, h, s * h);
+        }
+        return new Float32Array(pos);
+    }
+    if (shapeType === 'sphere') {
+        const segs = 24;
+        const r = h;
+        for (let i = 0; i < segs; i++) {
+            const t0 = (i / segs) * Math.PI * 2;
+            const t1 = ((i + 1) / segs) * Math.PI * 2;
+            L(r * Math.cos(t0), 0, r * Math.sin(t0), r * Math.cos(t1), 0, r * Math.sin(t1));
+            L(0, r * Math.cos(t0), r * Math.sin(t0), 0, r * Math.cos(t1), r * Math.sin(t1));
+            L(r * Math.cos(t0), r * Math.sin(t0), 0, r * Math.cos(t1), r * Math.sin(t1), 0);
+        }
+        return new Float32Array(pos);
+    }
+    if (shapeType === 'cylinder') {
+        const segs = 20;
+        const yb = -h;
+        const yt = h;
+        for (let i = 0; i < segs; i++) {
+            const t0 = (i / segs) * Math.PI * 2;
+            const t1 = ((i + 1) / segs) * Math.PI * 2;
+            L(h * Math.cos(t0), yb, h * Math.sin(t0), h * Math.cos(t1), yb, h * Math.sin(t1));
+            L(h * Math.cos(t0), yt, h * Math.sin(t0), h * Math.cos(t1), yt, h * Math.sin(t1));
+            L(h * Math.cos(t0), yb, h * Math.sin(t0), h * Math.cos(t0), yt, h * Math.sin(t0));
+        }
+        return new Float32Array(pos);
+    }
+    if (shapeType === 'plane') {
+        L(-h, 0, -h, h, 0, -h);
+        L(h, 0, -h, h, 0, h);
+        L(h, 0, h, -h, 0, h);
+        L(-h, 0, h, -h, 0, -h);
+        return new Float32Array(pos);
+    }
+    if (shapeType === 'cone') {
+        const segs = 16;
+        const yb = -h;
+        const yt = h;
+        for (let i = 0; i < segs; i++) {
+            const t0 = (i / segs) * Math.PI * 2;
+            const t1 = ((i + 1) / segs) * Math.PI * 2;
+            L(h * Math.cos(t0), yb, h * Math.sin(t0), h * Math.cos(t1), yb, h * Math.sin(t1));
+            L(0, yt, 0, h * Math.cos(t0), yb, h * Math.sin(t0));
+        }
+        return new Float32Array(pos);
+    }
+    if (shapeType === 'pyramid') {
+        const c = [[-h, -h, -h], [h, -h, -h], [h, -h, h], [-h, -h, h]];
+        for (let i = 0; i < 4; i++) {
+            const [ax, ay, az] = c[i];
+            const [bx, by, bz] = c[(i + 1) % 4];
+            L(ax, ay, az, bx, by, bz);
+            L(ax, ay, az, 0, h, 0);
+        }
+        return new Float32Array(pos);
+    }
+    if (shapeType === 'torus') {
+        const R = 0.28;
+        const rr = 0.12;
+        const Nu = 16;
+        const Nv = 12;
+        for (let j = 0; j < Nv; j++) {
+            const v = (j / Nv) * Math.PI * 2;
+            for (let i = 0; i < Nu; i++) {
+                const u0 = (i / Nu) * Math.PI * 2;
+                const u1 = ((i + 1) / Nu) * Math.PI * 2;
+                const a0 = torusPoint(R, rr, u0, v);
+                const b0 = torusPoint(R, rr, u1, v);
+                L(a0.x, a0.y, a0.z, b0.x, b0.y, b0.z);
+            }
+        }
+        for (let i = 0; i < Nu; i++) {
+            const u = (i / Nu) * Math.PI * 2;
+            for (let j = 0; j < Nv; j++) {
+                const v0 = (j / Nv) * Math.PI * 2;
+                const v1 = ((j + 1) / Nv) * Math.PI * 2;
+                const a0 = torusPoint(R, rr, u, v0);
+                const b0 = torusPoint(R, rr, u, v1);
+                L(a0.x, a0.y, a0.z, b0.x, b0.y, b0.z);
+            }
+        }
+        return new Float32Array(pos);
+    }
+    return buildShapePreviewLinePositions('cube');
+};
+
+/** Low-poly solid fill in unit space [-0.5,0.5] (root scale applies); null if procedural mesh fails. */
+const buildShapePreviewFillMesh = (shapeType) => {
+    try {
+        if (shapeType === 'cube') {
+            return pc.Mesh.fromGeometry(device, new pc.BoxGeometry({
+                halfExtents: new pc.Vec3(0.5, 0.5, 0.5),
+                widthSegments: 1,
+                lengthSegments: 1,
+                heightSegments: 1,
+            }));
+        }
+        if (shapeType === 'sphere') {
+            return pc.Mesh.fromGeometry(device, new pc.SphereGeometry({
+                radius: 0.5,
+                latitudeBands: 8,
+                longitudeBands: 10,
+            }));
+        }
+        if (shapeType === 'cylinder') {
+            return pc.Mesh.fromGeometry(device, new pc.CylinderGeometry({
+                radius: 0.5,
+                height: 1,
+                heightSegments: 1,
+                capSegments: 14,
+            }));
+        }
+        if (shapeType === 'plane') {
+            return pc.Mesh.fromGeometry(device, new pc.PlaneGeometry({
+                halfExtents: new pc.Vec2(0.5, 0.5),
+                widthSegments: 2,
+                lengthSegments: 2,
+            }));
+        }
+        if (shapeType === 'cone') {
+            return pc.Mesh.fromGeometry(device, new pc.ConeGeometry({
+                baseRadius: 0.5,
+                height: 1,
+                heightSegments: 4,
+                capSegments: 14,
+            }));
+        }
+        if (shapeType === 'pyramid') {
+            return pc.Mesh.fromGeometry(device, new pc.ConeGeometry({
+                baseRadius: 0.5,
+                height: 1,
+                heightSegments: 1,
+                capSegments: 4,
+            }));
+        }
+        if (shapeType === 'torus') {
+            return pc.Mesh.fromGeometry(device, new pc.TorusGeometry({
+                ringRadius: 0.28,
+                tubeRadius: 0.12,
+                segments: 14,
+                sides: 10,
+            }));
+        }
+    } catch (err) {
+        console.warn('[shape preview] fill mesh', shapeType, err);
+    }
+    return null;
+};
+
+const rebuildShapePreviewGeometry = () => {
+    if (!shapePreviewMeshEntity) { console.warn('[shape] rebuildGeom: no meshEntity'); return; }
+    const shapeType = g('shape-type')?.value ?? 'cube';
+    const hollow = !!g('shape-hollow-edges')?.checked;
+    console.log('[shape] rebuildGeom:', shapeType, 'hollow:', hollow);
+    const instances = [];
+    if (!hollow) {
+        const fillMesh = buildShapePreviewFillMesh(shapeType);
+        if (fillMesh) {
+            const miFill = new pc.MeshInstance(fillMesh, shapePreviewFillMat);
+            miFill.cull = false;
+            miFill.transparent = true;
+            miFill.drawOrder = 198;
+            instances.push(miFill);
+        }
+    }
+    const positions = buildShapePreviewLinePositions(shapeType);
+    const lineMesh = meshFromLinePositions(positions);
+    const miLines = new pc.MeshInstance(lineMesh, shapePreviewLineMat);
+    miLines.cull = false;
+    miLines.drawOrder = 200;
+    instances.push(miLines);
+    if (shapePreviewMeshEntity.render) {
+        shapePreviewMeshEntity.removeComponent('render');
+    }
+    shapePreviewMeshEntity.addComponent('render', {
+        castShadows: false,
+        meshInstances: instances,
+    });
+    console.log('[shape] rebuildGeom: added render component with', instances.length, 'mesh instances, entity.enabled:', shapePreviewMeshEntity.enabled, 'root.enabled:', shapePreviewRoot?.enabled, 'root.parent:', !!shapePreviewRoot?.parent);
+};
+
+const ensureShapePreviewRoot = () => {
+    if (shapePreviewRoot) return;
+    shapePreviewRoot = new pc.Entity('shapePreviewRoot');
+    shapePreviewMeshEntity = new pc.Entity('shapePreviewMesh');
+    shapePreviewRoot.addChild(shapePreviewMeshEntity);
+    app.root.addChild(shapePreviewRoot);
+    shapePreviewRoot.enabled = true;
+    shapePreviewMeshEntity.enabled = true;
+};
+
+/** Place or replace the shape wire preview at the current orbit target (world). */
+const placeShapePreviewAtOrbitTarget = () => {
+    if (activeTool !== 'shapeLayer') { console.log('[shape] Add btn: wrong tool', activeTool); return; }
+    console.log('[shape] Add btn: placing preview at orbit target, orbit.target =', orbit.target.x, orbit.target.y, orbit.target.z, ', cameraNav =', cameraNavMode);
+    ensureShapePreviewRoot();
+    console.log('[shape] Add btn: root entity created?', !!shapePreviewRoot, 'mesh entity?', !!shapePreviewMeshEntity, 'parent?', !!shapePreviewRoot?.parent);
+    let px;
+    let py;
+    let pz;
+    if (cameraNavMode === 'orbit') {
+        px = orbit.target.x;
+        py = orbit.target.y;
+        pz = orbit.target.z;
+    } else {
+        getForwardFromYawPitch(flyCam.yaw, flyCam.pitch, _camFwdScratch);
+        const dist = Math.max(0.35, orbit.distance * 0.35);
+        px = flyCam.pos.x + _camFwdScratch.x * dist;
+        py = flyCam.pos.y + _camFwdScratch.y * dist;
+        pz = flyCam.pos.z + _camFwdScratch.z * dist;
+    }
+    shapePreviewRoot.setPosition(px, py, pz);
+    const rot = readShapeRotFromUI();
+    shapePreviewRoot.setLocalEulerAngles(rot.rx, rot.ry, rot.rz);
+    const dims = readShapeDimsFromUI();
+    shapePreviewRoot.setLocalScale(dims.sx, dims.sy, dims.sz);
+    shapePreviewOrbitLock = true;
+    rebuildShapePreviewGeometry();
+    updateShapeSplatButtonEnabled();
+    refreshLayerGizmoAttachment();
+};
+
+const destroyShapePreview = () => {
+    canvasContainer.classList.remove('shape-placement-active');
+    shapePreviewOrbitLock = false;
+    if (!shapePreviewRoot) {
+        gizmoTargetIsShapePreview = false;
+        updateShapeSplatButtonEnabled();
+        return;
+    }
+    layerTranslateGizmo.detach();
+    layerRotateGizmo.detach();
+    layerScaleGizmo.detach();
+    shapePreviewRoot.destroy();
+    shapePreviewRoot = null;
+    shapePreviewMeshEntity = null;
+    gizmoTargetIsShapePreview = false;
+    updateShapeSplatButtonEnabled();
+    refreshLayerGizmoAttachment();
+};
+
+const updateShapeSplatButtonEnabled = () => {
+    const btn = g('splat-shape-btn');
+    if (btn) btn.disabled = !shapePreviewRoot?.parent;
+};
+
+const applyShapePreviewTransformFromInputs = () => {
+    if (!shapePreviewRoot || syncingShapeUIFromPreview) return;
+    const d = readShapeDimsFromUI();
+    const r = readShapeRotFromUI();
+    shapePreviewRoot.setLocalScale(d.sx, d.sy, d.sz);
+    shapePreviewRoot.setLocalEulerAngles(r.rx, r.ry, r.rz);
+};
+
+/** Type / hollow: rebuild line + optional fill mesh; preserve transform. */
+const onShapePreviewTopologyChanged = () => {
+    saveShapeToolPrefs();
+    if (!shapePreviewRoot) return;
+    rebuildShapePreviewGeometry();
+    applyShapePreviewTransformFromInputs();
+};
+
+/** Size / rotation inputs — apply directly without rebuilding meshes. */
+const onShapePreviewTransformInputsChanged = () => {
+    saveShapeToolPrefs();
+    if (!shapePreviewRoot || syncingShapeUIFromPreview) return;
+    applyShapePreviewTransformFromInputs();
+};
+
+// Create a new splat object for a layer
+const createLayerSplat = (x, y, z, r, g, b, rot = null, scl = null) => {
+    const fdc0 = (r - 0.5) / SH_C0;
+    const fdc1 = (g - 0.5) / SH_C0;
+    const fdc2 = (b - 0.5) / SH_C0;
+    // If a nearby-splat rotation is provided use it so the disk faces the
+    // same way as the local surface.  Fall back to identity otherwise.
+    const [q0, q1, q2, q3] = rot ?? [1, 0, 0, 0];
+    // For scale: copy the nearby splat's log-scale but clamp to a sensible
+    // range so fill splats don't become huge.  Use fixed defaults when absent.
+    const s0 = scl ? Math.max(-5.5, Math.min(-2.0, scl[0])) : -3.5;
+    const s1 = scl ? Math.max(-5.5, Math.min(-2.0, scl[1])) : -3.5;
+    const s2 = scl ? Math.max(-5.5, Math.min(-2.0, scl[2])) : -4.5;
+    return {
+        x, y, z,
+        scale_0: s0, scale_1: s1, scale_2: s2,
+        rot_0: q0, rot_1: q1, rot_2: q2, rot_3: q3,
+        f_dc_0: fdc0, f_dc_1: fdc1, f_dc_2: fdc2,
+        opacity: invSigmoid(0.9),
+        nx: 0, ny: 1, nz: 0,
+    };
+};
+
+// Generate splats in gaps - add to selected layer
+const generateSplatsAt = (screenX, screenY) => {
+    if (!paintables.length || !gsplatDataCache) return;
+    let layer = layers.find((l) => l.id === selectedLayerId);
+    if (!layer) {
+        addLayer();
+        layer = layers[layers.length - 1];
+    }
+
+    const worldRadius = generateSplatsSize();
+    const density = Math.max(1, generateSplatsDensity());
+    const worldPt = getWorldPoint(screenX, screenY);
+    if (!worldPt) return;
+
+    if (lastGenerateSplatsWorld && worldPt.distance(lastGenerateSplatsWorld) < worldRadius * 0.4)
+        return;
+    lastGenerateSplatsWorld = worldPt.clone();
+
+    const invMat = new pc.Mat4().copy(paintables[0].entity.getWorldTransform()).invert();
+    const modelPt = new pc.Vec3();
+    invMat.transformPoint(worldPt, modelPt);
+
+    const refW = new pc.Vec3(worldPt.x + worldRadius, worldPt.y, worldPt.z);
+    const refM = new pc.Vec3();
+    invMat.transformPoint(refW, refM);
+    const modelRadius = modelPt.distance(refM);
+
+    const [r, g, b] = generateSplatsSampledColor;
+
+    // Pre-filter base-model splats to a small candidate set near the brush
+    // centre so per-splat nearest-neighbour lookups stay fast even on dense models.
+    const { numSplats, x: xA, y: yA, z: zA } = gsplatDataCache;
+    const { rot_0, rot_1, rot_2, rot_3, scale_0, scale_1, scale_2 } = gsplatDataCache.extra;
+    const searchR2 = (modelRadius * 3) ** 2;
+    const nearby = [];
+    for (let i = 0; i < numSplats; i++) {
+        const dx = xA[i] - modelPt.x, dy = yA[i] - modelPt.y, dz = zA[i] - modelPt.z;
+        if (dx*dx + dy*dy + dz*dz <= searchR2) nearby.push(i);
+    }
+
+    const added = [];
+    for (let i = 0; i < density; i++) {
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        const u = Math.pow(Math.random(), 1 / 3);
+        const sx = modelPt.x + u * Math.sin(phi) * Math.cos(theta) * modelRadius;
+        const sy = modelPt.y + u * Math.sin(phi) * Math.sin(theta) * modelRadius;
+        const sz = modelPt.z + u * Math.cos(phi) * modelRadius;
+
+        // Find the nearest base-model splat to inherit its orientation / scale.
+        let nearIdx = -1, nearD2 = Infinity;
+        for (const idx of nearby) {
+            const dx = xA[idx] - sx, dy = yA[idx] - sy, dz = zA[idx] - sz;
+            const d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 < nearD2) { nearD2 = d2; nearIdx = idx; }
+        }
+
+        const rot = nearIdx >= 0 && rot_0
+            ? [rot_0[nearIdx], rot_1[nearIdx], rot_2[nearIdx], rot_3[nearIdx]]
+            : null;
+        const scl = nearIdx >= 0 && scale_0
+            ? [scale_0[nearIdx], scale_1[nearIdx], scale_2[nearIdx]]
+            : null;
+
+        const splat = createLayerSplat(sx, sy, sz, r, g, b, rot, scl);
+        layer.splats.push(splat);
+        added.push(splat);
+    }
+    if (added.length) {
+        if (layerUpdateTimeout) clearTimeout(layerUpdateTimeout);
+        layerUpdateTimeout = setTimeout(() => {
+            layerUpdateTimeout = null;
+            updateLayerEntity(layer);
+        }, 150);
+    }
+};
+
+// Invert the current selection mask.
+const invertSelection = (opts = {}) => {
+    const recordUndo = opts.recordUndo === true;
+    const before = recordUndo ? captureSelectionSnapshot() : null;
+    const data = getActiveDataCache();
+    if (!data) return;
+    const n = data.numSplats;
+    const mask = getActiveSelectionMask(n);
+    for (let i = 0; i < n; i++) mask[i] = mask[i] ? 0 : 1;
+    recomputeSelectionSphere();
+    updateSelectionUI();
+    if (recordUndo) pushSelectionUndoFromBefore(before);
+};
+
+// ── Undo / Redo ───────────────────────────────────────────────────────────────
+const updateUndoRedoUI = () => {
+    g('undo-btn').disabled = strokes.length === 0;
+    g('redo-btn').disabled = redoStack.length === 0;
+};
+
+const resetTex = (p, name) => {
+    const tex = p.entity.gsplat.getInstanceTexture(name);
+    if (!tex) return;
+    const d = tex.lock(); if (d) d.fill(0); tex.unlock();
+};
+
+const triggerRebuild = () => { pendingRebuild = true; };
+
+const undo = () => {
+    if (!strokes.length) return;
+    const popped = strokes.pop();
+    redoStack.push(popped);
+    restoreSelectionSnapshot(popped.selectionBefore);
+    updateUndoRedoUI();
+    triggerRebuild();
+};
+
+const redo = () => {
+    if (!redoStack.length) return;
+    const s = redoStack.pop();
+    strokes.push(s);
+    restoreSelectionSnapshot(s.selectionAfter);
+    updateUndoRedoUI();
+    triggerRebuild();
+};
+
+// ── Update loop ───────────────────────────────────────────────────────────────
+app.on('update', () => {
+    if (pendingRebuild) {
+        pendingRebuild = false;
+        // Reset both GPU textures
+        for (const p of paintables) {
+            resetTex(p, 'customColor');
+            resetTex(p, 'customOpacity');
+        }
+        // Re-queue all committed stroke ops
+        for (const stroke of strokes) {
+            for (const op of stroke.ops) pendingPaints.push(op);
+        }
+        return; // process re-queued ops next frame
+    }
+
+    if (!pendingPaints.length) return;
+
+    const ops = pendingPaints.splice(0);
+    for (const op of ops) {
+        if (op.layerId) {
+            const lyr = layers.find((l) => l.id === op.layerId);
+            const pb = lyr?._gsplatPaint;
+            if (pb) applyPaintOpToPaintable(pb, op);
+            continue;
+        }
+        for (const p of paintables) {
+            applyPaintOpToPaintable(p, op);
+        }
+    }
+});
+
+// Squared distance from point P to segment AB in 2D (screen space).
+const distPointSeg2Sq = (px, py, ax, ay, bx, by) => {
+    const abx = bx - ax, aby = by - ay;
+    const apx = px - ax, apy = py - ay;
+    const ab2 = abx * abx + aby * aby;
+    if (ab2 < 1e-12) return apx * apx + apy * apy;
+    let t = (apx * abx + apy * aby) / ab2;
+    t = Math.max(0, Math.min(1, t));
+    const qx = ax + t * abx, qy = ay + t * aby;
+    const dx = px - qx, dy = py - qy;
+    return dx * dx + dy * dy;
+};
+
+// ── User-layer eraser ─────────────────────────────────────────────────────────
+// Remove splats that project inside the eraser disk, or within the disk swept
+// along the screen segment since the last applied pass (covers fast drags).
+// Runs at most once per animation frame (rAF) to avoid O(n)×mousemove jank.
+const runEraseUserLayerPass = (layer, p) => {
+    // During async rebuild the previous entity is renamed to __layer_rebuild_* so
+    // the new node can use the canonical name once ready.
+    const layerEnt = layersContainer.findByName(`layer-${layer.id}`)
+        ?? layersContainer.findByName(`__layer_rebuild_${layer.id}`);
+    if (!layerEnt) return;
+
+    const { screenX, screenY, screenX0, screenY0, worldRadius, worldDab, depthWorldFull } = p;
+
+    const fov     = cameraEntity.camera.fov * (Math.PI / 180);
+    const screenR = Math.max(4, (worldRadius / (orbit.distance * Math.tan(fov / 2))) * (canvas.clientHeight / 2));
+    const screenR2 = screenR * screenR;
+
+    const camPos = cameraEntity.getPosition();
+    const halfDepthW = (depthWorldFull || 0) * 0.5;
+    let tDab = 0;
+    let useDepthAlongRay = false;
+    const V = eraseRayWorldScratch;
+    if (halfDepthW > 1e-8 && worldDab) {
+        V.sub2(worldDab, camPos);
+        const vlen = V.length();
+        if (vlen > 1e-10) {
+            V.mulScalar(1 / vlen);
+            eraseCamToDabScratch.set(worldDab.x - camPos.x, worldDab.y - camPos.y, worldDab.z - camPos.z);
+            tDab = V.dot(eraseCamToDabScratch);
+            useDepthAlongRay = true;
+        }
+    }
+
+    const worldMat  = layerEnt.getWorldTransform();
+    const sMdl      = new pc.Vec3();
+    const sWorld    = new pc.Vec3();
+    const sScreen   = new pc.Vec3();
+    const before    = layer.splats.length;
+
+    layer.splats = layer.splats.filter((s) => {
+        sMdl.set(s.x, s.y, s.z);
+        worldMat.transformPoint(sMdl, sWorld);
+        if (useDepthAlongRay) {
+            eraseCamToDabScratch.set(sWorld.x - camPos.x, sWorld.y - camPos.y, sWorld.z - camPos.z);
+            const tSplat = V.dot(eraseCamToDabScratch);
+            if (Math.abs(tSplat - tDab) > halfDepthW) return true;
+        }
+        cameraEntity.camera.worldToScreen(sWorld, sScreen);
+        if (!Number.isFinite(sScreen.x) || !Number.isFinite(sScreen.y)) return true;
+        const dsq = distPointSeg2Sq(sScreen.x, sScreen.y, screenX0, screenY0, screenX, screenY);
+        return dsq > screenR2;
+    });
+
+    if (layer.splats.length === before) return;
+    if (layer.selectionMask) layer.selectionMask = null;
+
+    if (!layer._eraseRebuild) {
+        layer._eraseRebuild = true;
+        setTimeout(() => {
+            layer._eraseRebuild = false;
+            updateLayerEntity(layer);
+        }, 110);
+    }
+};
+
+const eraseUserLayerAt = (screenX, screenY, worldRadius, worldDab, depthWorldFull) => {
+    const layer = getActiveLayer();
+    if (!layer) return;
+
+    const x0 = layer._eraseSegX0 ?? screenX;
+    const y0 = layer._eraseSegY0 ?? screenY;
+    layer._erasePending = {
+        screenX, screenY, screenX0: x0, screenY0: y0, worldRadius, worldDab, depthWorldFull,
+    };
+    if (layer._eraseRaf != null) return;
+    layer._eraseRaf = requestAnimationFrame(() => {
+        layer._eraseRaf = null;
+        const q = layer._erasePending;
+        layer._erasePending = null;
+        if (!q) return;
+        runEraseUserLayerPass(layer, q);
+        layer._eraseSegX0 = q.screenX;
+        layer._eraseSegY0 = q.screenY;
+    });
+};
+
+const flushEraseUserLayerPending = () => {
+    const layer = getActiveLayer();
+    if (!layer) return;
+    if (layer._eraseRaf != null) {
+        cancelAnimationFrame(layer._eraseRaf);
+        layer._eraseRaf = null;
+    }
+    const q = layer._erasePending;
+    if (q) {
+        layer._erasePending = null;
+        runEraseUserLayerPass(layer, q);
+    }
+    layer._eraseSegX0 = undefined;
+    layer._eraseSegY0 = undefined;
+};
+
+// ── Painting ──────────────────────────────────────────────────────────────────
+// One dab at a world-space hit point (shared by stroke interpolation).
+const applyPaintDabWorld = (worldPt, worldRadius, hardness, intensity, isErase, isReset) => {
+    const userLayer = getActiveLayer();
+
+    const emitDab = (entity, layerId) => {
+        const invMat = new pc.Mat4().copy(entity.getWorldTransform()).invert();
+        const modelPt = new pc.Vec3();
+        invMat.transformPoint(worldPt, modelPt);
+
+        const refW = new pc.Vec3(worldPt.x + worldRadius, worldPt.y, worldPt.z);
+        const refM = new pc.Vec3();
+        invMat.transformPoint(refW, refM);
+        const modelRadius = modelPt.distance(refM);
+
+        const cyl = computeEraseCylinderInModel(worldPt, invMat, isErase ? eraserDepth() : 0);
+        const eraseExtra = isErase
+            ? {
+                eraseDepthHalf: cyl.halfModel,
+                evX: cyl.viewModel.x,
+                evY: cyl.viewModel.y,
+                evZ: cyl.viewModel.z,
+            }
+            : {};
+
+        const sphere = [modelPt.x, modelPt.y, modelPt.z, modelRadius];
+        const [r, g, b] = isErase ? [0, 0, 0] : hexToRgb(paintColorHex());
+        const color = [r, g, b, intensity];
+        const selC = selectionConstraintForPaintTools();
+        const op = {
+            sphere, color, hardness, isErase, isReset,
+            blendMode: isErase ? -1 : blendMode(),
+            cx: modelPt.x, cy: modelPt.y, cz: modelPt.z,
+            radius: modelRadius, r, g, b, intensity,
+            selectionConstraint: selC,
+            ...(layerId ? { layerId } : {}),
+            ...eraseExtra,
+        };
+
+        pendingPaints.push(op);
+
+        if (activeStroke) {
+            activeStroke.ops.push({
+                sphere, color, hardness, isErase, isReset,
+                selectionConstraint: selC,
+                ...(layerId ? { layerId } : {}),
+                ...eraseExtra,
+            });
+            if (!isReset) {
+                activeStroke.cpuOps.push({
+                    cx: op.cx, cy: op.cy, cz: op.cz,
+                    radius: op.radius, r, g, b, intensity, hardness, isErase,
+                    blendMode: op.blendMode,
+                    selectionConstraint: selC,
+                    ...(layerId ? { layerId } : {}),
+                    ...eraseExtra,
+                });
+            }
+        }
+    };
+
+    // User layer (shape / import / generated): paint in layer entity model space.
+    // Requires _gsplatPaint (GPU processors); skip until updateLayerEntity() finishes loading.
+    if (userLayer) {
+        if (userLayer._gsplatPaint?.entity) {
+            emitDab(userLayer._gsplatPaint.entity, userLayer.id);
+        }
+        return;
+    }
+
+    for (const p of paintables) {
+        emitDab(p.entity, undefined);
+    }
+};
+
+const paintAt = (screenX, screenY) => {
+    const isErase   = activeTool === 'eraser';
+    const isReset   = activeTool === 'resetBrush';
+    const worldRadius = isReset ? resetSize() : isErase ? eraserSize()     : brushSize();
+    const hardness    = isReset ? resetHardness() : isErase ? eraserHardness() : brushHardness();
+    const intensity   = isErase ? eraserIntensity() : brushIntensity();
+    const spacing     = isReset ? resetSpacing() : isErase ? eraserSpacing()  : brushSpacing();
+
+    const worldPt = getWorldPoint(screenX, screenY);
+    if (!worldPt) return;
+
+    // Erase on user layers: screen-space dab only (no stroke interpolation here)
+    if (isErase && getActiveLayer()) {
+        eraseUserLayerAt(screenX, screenY, worldRadius, worldPt, eraserDepth());
+        return;
+    }
+
+    const minMove = worldRadius * 2 * spacing;
+    if (lastPaintWorld && worldPt.distance(lastPaintWorld) < minMove) return;
+
+    // Dense overlap: many weak-edge hits still mottle under ALPHABLEND; keep stride small.
+    const dabStride = Math.max(
+        worldRadius * 0.09,
+        Math.min(worldRadius * 1.05, minMove * 0.55),
+    );
+
+    const dabOnce = (wp) => applyPaintDabWorld(wp, worldRadius, hardness, intensity, isErase, isReset);
+
+    if (!lastPaintWorld) {
+        dabOnce(worldPt);
+        lastPaintWorld = worldPt.clone();
+        return;
+    }
+
+    const dist = worldPt.distance(lastPaintWorld);
+    const n = Math.max(1, Math.ceil(dist / dabStride));
+    for (let i = 1; i <= n; i++) {
+        const t = i / n;
+        paintStrokeScratch.lerp(lastPaintWorld, worldPt, t);
+        dabOnce(paintStrokeScratch);
+    }
+    lastPaintWorld.copy(worldPt);
+};
+
+/** One-shot fill: all splats in the active selection get a full-strength paint dab (blend in modifier). */
+const applyPaintBucket = () => {
+    const userLayer = getActiveLayer();
+    const data = getActiveDataCache();
+    if (!data?.numSplats) return;
+    const n = data.numSplats;
+    const mask = getActiveSelectionMask(n);
+    if (!mask.some((v) => v)) return;
+
+    const [r, g, b] = hexToRgb(paintColorHex());
+    const intensity = brushIntensity();
+    const opBase = {
+        isBucket: true,
+        color: [r, g, b, intensity],
+        blendMode: blendMode(),
+    };
+
+    if (userLayer) {
+        if (!userLayer._gsplatPaint?.entity) return;
+        const op = { ...opBase, layerId: userLayer.id };
+        const selBefore = captureSelectionSnapshot();
+        pendingPaints.push(op);
+        redoStack.length = 0;
+        strokes.push({
+            isBucket: true,
+            blendMode: blendMode(),
+            ops: [op],
+            cpuOps: [{ isBucket: true, r, g, b, intensity, blendMode: blendMode() }],
+            selectionBefore: selBefore,
+            selectionAfter: captureSelectionSnapshot(),
+        });
+        updateUndoRedoUI();
+        return;
+    }
+
+    const selBefore = captureSelectionSnapshot();
+    pendingPaints.push(opBase);
+    redoStack.length = 0;
+    strokes.push({
+        isBucket: true,
+        blendMode: blendMode(),
+        ops: [opBase],
+        cpuOps: [{ isBucket: true, r, g, b, intensity, blendMode: blendMode() }],
+        selectionBefore: selBefore,
+        selectionAfter: captureSelectionSnapshot(),
+    });
+    updateUndoRedoUI();
+};
+
+/** GPU paint / erase / reset processors for a unified gsplat (base or user layer). */
+const createGsplatPaintProcessors = (gsplatComponent) => {
+    const paintProcessor = new pc.GSplatProcessor(
+        device,
+        { component: gsplatComponent },
+        { component: gsplatComponent, streams: ['customColor'] },
+        { processGLSL: PAINT_GLSL, processWGSL: PAINT_WGSL },
+    );
+    paintProcessor.blendState = pc.BlendState.ALPHABLEND;
+    paintProcessor.setParameter('uPaintSphere',   [0, 0, 0, 0]);
+    paintProcessor.setParameter('uPaintColor',   [1, 0, 0, 0.5]);
+    paintProcessor.setParameter('uHardness',     0.8);
+    paintProcessor.setParameter('uSelectionConstraint', 0);
+
+    const paintBucketProcessor = new pc.GSplatProcessor(
+        device,
+        { component: gsplatComponent },
+        { component: gsplatComponent, streams: ['customColor'] },
+        { processGLSL: PAINT_BUCKET_GLSL, processWGSL: PAINT_BUCKET_WGSL },
+    );
+    paintBucketProcessor.blendState = pc.BlendState.ALPHABLEND;
+    paintBucketProcessor.setParameter('uBucketColor', [1, 0, 0, 0.5]);
+
+    const eraseProcessor = new pc.GSplatProcessor(
+        device,
+        { component: gsplatComponent },
+        { component: gsplatComponent, streams: ['customOpacity'] },
+        { processGLSL: ERASE_GLSL, processWGSL: ERASE_WGSL },
+    );
+    eraseProcessor.blendState = ADDITIVE_BLEND;
+    eraseProcessor.setParameter('uPaintSphere',   [0, 0, 0, 0]);
+    eraseProcessor.setParameter('uPaintColor',   [0, 0, 0, 0.5]);
+    eraseProcessor.setParameter('uHardness',     0.8);
+    eraseProcessor.setParameter('uSelectionConstraint', 0);
+    eraseProcessor.setParameter('uEraseViewDir', [0, 0, 1]);
+    eraseProcessor.setParameter('uEraseDepthHalf', 0);
+
+    const resetColorProcessor = new pc.GSplatProcessor(
+        device,
+        { component: gsplatComponent },
+        { component: gsplatComponent, streams: ['customColor'] },
+        { processGLSL: RESET_COLOR_GLSL, processWGSL: RESET_COLOR_WGSL },
+    );
+    resetColorProcessor.blendState = RESET_BLEND;
+    resetColorProcessor.setParameter('uPaintSphere', [0, 0, 0, 0]);
+    resetColorProcessor.setParameter('uHardness', 0.8);
+    resetColorProcessor.setParameter('uSelectionConstraint', 0);
+
+    const resetOpacityProcessor = new pc.GSplatProcessor(
+        device,
+        { component: gsplatComponent },
+        { component: gsplatComponent, streams: ['customOpacity'] },
+        { processGLSL: RESET_OPACITY_GLSL, processWGSL: RESET_OPACITY_WGSL },
+    );
+    resetOpacityProcessor.blendState = RESET_BLEND;
+    resetOpacityProcessor.setParameter('uPaintSphere', [0, 0, 0, 0]);
+    resetOpacityProcessor.setParameter('uHardness', 0.8);
+    resetOpacityProcessor.setParameter('uSelectionConstraint', 0);
+
+    return { paintProcessor, paintBucketProcessor, eraseProcessor, resetColorProcessor, resetOpacityProcessor };
+};
+
+const destroyGsplatPaintBundle = (pb) => {
+    if (!pb) return;
+    pb.paintProcessor?.destroy?.();
+    pb.paintBucketProcessor?.destroy?.();
+    pb.eraseProcessor?.destroy?.();
+    pb.resetColorProcessor?.destroy?.();
+    pb.resetOpacityProcessor?.destroy?.();
+};
+
+const destroyLayerGsplatPaint = (layer) => {
+    destroyGsplatPaintBundle(layer?._gsplatPaint);
+    if (layer) layer._gsplatPaint = null;
+};
+
+/** Run one queued paint op on a paintable bundle (base row or layer._gsplatPaint). */
+const applyPaintOpToPaintable = (p, op) => {
+    if (op.isBucket) {
+        p.paintBucketProcessor.setParameter('uBucketColor', op.color);
+        p.paintBucketProcessor.process();
+    } else if (op.isReset) {
+        const c = selectionConstraintForOp(op);
+        p.resetColorProcessor.setParameter('uPaintSphere', op.sphere);
+        p.resetColorProcessor.setParameter('uHardness', op.hardness);
+        p.resetColorProcessor.setParameter('uSelectionConstraint', c);
+        p.resetColorProcessor.process();
+        p.resetOpacityProcessor.setParameter('uPaintSphere', op.sphere);
+        p.resetOpacityProcessor.setParameter('uHardness', op.hardness);
+        p.resetOpacityProcessor.setParameter('uSelectionConstraint', c);
+        p.resetOpacityProcessor.process();
+    } else if (op.isErase) {
+        setUniformsForErase(
+            p,
+            op.sphere,
+            op.color,
+            op.hardness,
+            op.eraseDepthHalf ?? 0,
+            [op.evX ?? 0, op.evY ?? 0, op.evZ ?? 1],
+            selectionConstraintForOp(op),
+        );
+        p.eraseProcessor.process();
+    } else {
+        setUniformsForPaint(p, op.sphere, op.color, op.hardness, selectionConstraintForOp(op));
+        p.paintProcessor.process();
+    }
+    p.entity.gsplat.workBufferUpdate = pc.WORKBUFFER_UPDATE_ONCE;
+};
+
+// ── Splat creation ────────────────────────────────────────────────────────────
+const createPaintableSplat = async (asset, opts = {}) => {
+    const resource = asset.resource;
+
+    // Follow the official PlayCanvas paint example pattern:
+    // 1. Create entity and add gsplat component with the loaded asset + unified:true
+    // 2. Add the entity to the scene
+    // 3. Add extra streams to the resource format
+    // 4. Initialize instance textures to zero
+    // 5. Set up workBufferModifier and parameters
+
+    const entity = new pc.Entity('splat');
+    // Pass the loaded asset directly so the placement is created immediately.
+    // unified:true enables setWorkBufferModifier, setParameter, getInstanceTexture.
+    const     gsplatComponent = entity.addComponent('gsplat', { asset, unified: true });
+    baseContainer.addChild(entity);
+
+    // Add extra instance streams AFTER the component has the resource.
+    // customColor  → accumulates paint   (ALPHABLEND)
+    // customOpacity → accumulates erase  (ADDITIVE)
+    const fmt = resource.format;
+    if (!fmt.extraStreams?.find(s => s.name === 'customColor')) {
+        fmt.addExtraStreams([
+            { name: 'customColor',    format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+            { name: 'customOpacity',  format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+            { name: 'customSelection', format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+        ]);
+    }
+
+    // Zero-initialize instance textures so unpainted splats are unaffected.
+    // getInstanceTexture only works after streams are added and in unified mode.
+    const colorTex = gsplatComponent.getInstanceTexture('customColor');
+    if (colorTex) { const d = colorTex.lock(); if (d) d.fill(0); colorTex.unlock(); }
+
+    const opacityTex = gsplatComponent.getInstanceTexture('customOpacity');
+    if (opacityTex) { const d = opacityTex.lock(); if (d) d.fill(0); opacityTex.unlock(); }
+
+    const selTex = gsplatComponent.getInstanceTexture('customSelection');
+    if (selTex) { const d = selTex.lock(); if (d) d.fill(0); selTex.unlock(); }
+
+    // Apply work-buffer modifier and per-instance parameters AFTER the placement exists.
+    gsplatComponent.setWorkBufferModifier({ glsl: MODIFIER_GLSL, wgsl: MODIFIER_WGSL });
+    gsplatComponent.setParameter('uBlendMode',     0);
+    gsplatComponent.setParameter('uShowSelection', 0);
+    gsplatComponent.setParameter('uSelectionColor', selectionHighlightColor());
+    pushSplatViewShaderUniforms(gsplatComponent);
+    gsplatComponent.setParameter('uHoverSphere',   [0, 0, 0, 0]);
+    gsplatComponent.setParameter('uHoverColor',    [1, 1, 1, 0]);
+    applyColorGradeToGsplat(gsplatComponent, baseColorGrade);
+    pushLayerOpacityToGsplat(gsplatComponent, baseLayerOpacityPct);
+
+    const processors = createGsplatPaintProcessors(gsplatComponent);
+    paintables.push({ entity, gsplatComponent, ...processors });
+
+    // Auto-center camera on the loaded model (skip when replacing, e.g. after delete-selection).
+    if (!opts?.preserveCamera) {
+        try {
+            const aabb = resource.aabb;
+            if (aabb) {
+                const center = aabb.center;
+                const halfExtent = aabb.halfExtents;
+                const radius = Math.max(halfExtent.x, halfExtent.y, halfExtent.z) * 2.5;
+                orbit.target.copy(center);
+                orbit.distance = Math.max(radius, 0.5);
+                orbit.yaw = 0;
+                orbit.pitch = -15;
+                if (cameraNavMode === 'fly') syncFlyCamFromOrbitParams();
+                updateCamera();
+                snapshotCameraResetFromFramedView();
+            }
+        } catch (_) { /* best effort */ }
+    }
+
+    // Cache splat data for CPU export.
+    // We use PlayCanvas's internal getProp() API to pull every standard
+    // Gaussian Splat property so the exported file is a valid 3DGS file.
+    const data = await resolveGsplatCpuData(resource.gsplatData);
+
+    if (data) {
+        const n = data.numSplats;
+
+        // Collect higher-order SH bands (up to f_rest_44)
+        const shRest = [];
+        for (let i = 0; i < 45; i++) {
+            const k = `f_rest_${i}`;
+            const a = data.getProp(k);
+            if (a) shRest.push({ key: k, data: new Float32Array(a) });
+        }
+
+        // Collect extra standard Gaussian Splat properties (scale, rotation, normals).
+        // These are required for a valid Gaussian Splat PLY/SOG.
+        const EXTRA_PROPS = [
+            'nx', 'ny', 'nz',
+            'scale_0', 'scale_1', 'scale_2',
+            'rot_0',   'rot_1',   'rot_2',   'rot_3',
+        ];
+        const extra = {};
+        for (const prop of EXTRA_PROPS) {
+            const a = data.getProp(prop);
+            if (a) extra[prop] = new Float32Array(a);
+        }
+
+        gsplatDataCache = {
+            numSplats: n,
+            x:       new Float32Array(data.getProp('x')),
+            y:       new Float32Array(data.getProp('y')),
+            z:       new Float32Array(data.getProp('z')),
+            fdc0:    new Float32Array(data.getProp('f_dc_0')),
+            fdc1:    new Float32Array(data.getProp('f_dc_1')),
+            fdc2:    new Float32Array(data.getProp('f_dc_2')),
+            opacity: new Float32Array(data.getProp('opacity')),
+            shRest,
+            extra,   // scale, rotation, normals, etc.
+        };
+        selectionMask = new Uint8Array(n);
+    }
+
+    applyModelRotation();
+    refreshBaseGizmoMassPivotChild();
+    refreshLayerGizmoAttachment();
+};
+
+/** Build layer-style splat objects from PlayCanvas gsplat decompressed data. */
+const gsplatDataToSplats = (data) => {
+    if (!data?.numSplats) return [];
+    const n = data.numSplats;
+    const x = data.getProp('x');
+    const y = data.getProp('y');
+    const z = data.getProp('z');
+    const fdc0 = data.getProp('f_dc_0');
+    const fdc1 = data.getProp('f_dc_1');
+    const fdc2 = data.getProp('f_dc_2');
+    const op = data.getProp('opacity');
+    const nx = data.getProp('nx');
+    const ny = data.getProp('ny');
+    const nz = data.getProp('nz');
+    const sc0 = data.getProp('scale_0');
+    const sc1 = data.getProp('scale_1');
+    const sc2 = data.getProp('scale_2');
+    const r0 = data.getProp('rot_0');
+    const r1 = data.getProp('rot_1');
+    const r2 = data.getProp('rot_2');
+    const r3 = data.getProp('rot_3');
+    const shProps = [];
+    for (let k = 0; k < 45; k++) {
+        const name = `f_rest_${k}`;
+        if (data.getProp(name)) shProps.push(name);
+    }
+    const splats = [];
+    for (let i = 0; i < n; i++) {
+        const s = {
+            x: x[i], y: y[i], z: z[i],
+            f_dc_0: fdc0[i], f_dc_1: fdc1[i], f_dc_2: fdc2[i],
+            opacity: op[i],
+            scale_0: sc0 ? sc0[i] : -5,
+            scale_1: sc1 ? sc1[i] : -5,
+            scale_2: sc2 ? sc2[i] : -5,
+            rot_0: r0 ? r0[i] : 1,
+            rot_1: r1 ? r1[i] : 0,
+            rot_2: r2 ? r2[i] : 0,
+            rot_3: r3 ? r3[i] : 0,
+            nx: nx ? nx[i] : 0,
+            ny: ny ? ny[i] : 1,
+            nz: nz ? nz[i] : 0,
+        };
+        for (const key of shProps) {
+            s[key] = data.getProp(key)[i];
+        }
+        splats.push(s);
+    }
+    return splats;
+};
+
+const collectShKeysFromSplatsArray = (arr) => {
+    if (!arr.length) return [];
+    const set = new Set();
+    for (const s of arr) {
+        for (const k of Object.keys(s)) {
+            if (/^f_rest_\d+$/.test(k)) set.add(k);
+        }
+    }
+    return [...set].sort((a, b) => parseInt(a.slice(8), 10) - parseInt(b.slice(8), 10));
+};
+
+/** Remove imported base splat; user layers are kept. */
+const removeBaseModel = () => {
+    if (!paintables.length) return;
+    if (!confirm('Remove the imported base model? Strokes on it are discarded. Layers are kept.')) return;
+    for (const p of paintables) {
+        p.paintProcessor.destroy?.();
+        p.eraseProcessor.destroy?.();
+        p.resetColorProcessor?.destroy?.();
+        p.resetOpacityProcessor?.destroy?.();
+        p.entity.destroy();
+    }
+    paintables.length = 0;
+    gsplatDataCache = null;
+    selectionMask = null;
+    strokes.length = 0;
+    redoStack.length = 0;
+    activeStroke = null;
+    baseModelName = '';
+    baseTransform = createDefaultLayerTransform();
+    baseColorGrade = createDefaultColorGrade();
+    baseLayerOpacityPct = 100;
+    updateUndoRedoUI();
+    if (layers.length) {
+        selectedLayerId = layers[0].id;
+        hasSelection = !!(layers[0].selectionMask?.some((v) => v > 0));
+    } else {
+        selectedLayerId = 'base';
+        hasSelection = false;
+    }
+    renderLayersUI();
+    updateSelectionUI();
+};
+
+/** Load PLY/SOG as a CPU splat layer (does not replace the scene). */
+const importSplatAsLayer = async (source) => {
+    emptySceneLoadingDepth++;
+    updateEmptyScenePlaceholder();
+    instructions.innerHTML = '<p>Importing layer…</p>';
+
+    let loadUrl;
+    let originalUrl;
+    if (source instanceof File) {
+        loadUrl = URL.createObjectURL(source);
+        originalUrl = source.name;
+    } else {
+        loadUrl = originalUrl = source;
+    }
+
+    try {
+        await new Promise((resolve, reject) => {
+        const assetName = `importLayer-${Date.now()}`;
+        const asset = new pc.Asset(assetName, 'gsplat', { url: loadUrl, filename: originalUrl }, gsplatAssetDataForFilename(originalUrl));
+        app.assets.add(asset);
+        asset.once('load', async (a) => {
+            try {
+                const resource = a.resource;
+                const data = await resolveGsplatCpuData(resource.gsplatData);
+                if (!data?.numSplats) {
+                    if (source instanceof File) URL.revokeObjectURL(loadUrl);
+                    instructions.innerHTML = '<p style="color:#f88">Could not read splat data.</p>';
+                    reject(new Error('No splat data'));
+                    return;
+                }
+                const splats = gsplatDataToSplats(data);
+                const baseName = source instanceof File
+                    ? source.name.replace(/\.[^/.]+$/, '')
+                    : (originalUrl.split('/').pop() ?? 'Imported').replace(/\.[^/.]+$/, '');
+                const layer = {
+                    id: `layer-${layerIdCounter++}`,
+                    name: baseName || 'Imported',
+                    visible: true,
+                    opacityPct: 100,
+                    splats,
+                    selectionMask: null,
+                    colorGrade: cloneColorGrade(),
+                    ...createDefaultLayerTransform(),
+                };
+                layers.push(layer);
+                selectedLayerId = layer.id;
+                hasSelection = false;
+                try {
+                    app.assets.remove(asset);
+                } catch (_) { /* optional API */ }
+
+                if (source instanceof File) URL.revokeObjectURL(loadUrl);
+                instructions.innerHTML = '';
+                renderLayersUI();
+                updateLayerEntity(layer).then(() => {
+                    applyModelRotation();
+                    refreshLayerGizmoAttachment();
+                    resolve();
+                }).catch((err) => {
+                    instructions.innerHTML = `<p style="color:#f88">${err?.message || err}</p>`;
+                    reject(err);
+                });
+            } catch (err) {
+                if (source instanceof File) URL.revokeObjectURL(loadUrl);
+                instructions.innerHTML = `<p style="color:#f88">${err.message}</p>`;
+                reject(err);
+            }
+        });
+        asset.once('error', (msg) => {
+            if (source instanceof File) URL.revokeObjectURL(loadUrl);
+            instructions.innerHTML = `<p style="color:#f88">Load error: ${msg}</p>`;
+            reject(new Error(msg));
+        });
+        app.assets.load(asset);
+        });
+    } finally {
+        emptySceneLoadingDepth--;
+        updateEmptyScenePlaceholder();
+    }
+};
+
+/** Merge all other user layers into the selected layer (selected must be a user layer). */
+const mergeUserLayersIntoSelected = () => {
+    const target = layers.find((l) => l.id === selectedLayerId);
+    if (!target || selectedLayerId === 'base' || !selectedLayerId) {
+        alert('Select a layer in the list (not the base row) to merge into.');
+        return;
+    }
+    const toMerge = layers.filter((l) => l.id !== target.id);
+    if (!toMerge.length) {
+        alert('Need at least two layers. Add another layer or import one first.');
+        return;
+    }
+    if (!confirm(`Merge ${toMerge.length} other layer(s) into "${target.name}"? Those layers will be removed.`)) return;
+
+    for (const o of toMerge) {
+        for (const s of o.splats) target.splats.push({ ...s });
+        destroyLayerGsplatPaint(o);
+        const ch = layersContainer.findByName(`layer-${o.id}`);
+        if (ch) ch.destroy();
+    }
+    layers.length = 0;
+    layers.push(target);
+    target.selectionMask = null;
+    hasSelection = false;
+    selectedLayerId = target.id;
+    renderLayersUI();
+    updateSelectionUI();
+    updateLayerEntity(target);
+};
+
+// ── Loading ───────────────────────────────────────────────────────────────────
+const unloadAll = () => {
+    for (const p of paintables) {
+        p.paintProcessor.destroy?.();
+        p.eraseProcessor.destroy?.();
+        p.resetColorProcessor?.destroy?.();
+        p.resetOpacityProcessor?.destroy?.();
+        p.entity.destroy();
+    }
+        paintables.length = 0;
+    for (const layer of [...layers]) {
+        destroyLayerGsplatPaint(layer);
+    }
+    strokes.length = 0; redoStack.length = 0;
+    activeStroke = null; gsplatDataCache = null;
+    selectionMask = null; hasSelection = false;
+    showSelectionHighlight = true;
+    { const cb = g('sel-show-highlight'); if (cb) cb.checked = true; }
+    selectionSphere = [0,0,0,-1]; lastPaintWorld = null;
+    layers.length = 0;
+    selectedLayerId = 'base';
+    baseModelName = '';
+    baseTransform = createDefaultLayerTransform();
+    baseColorGrade = createDefaultColorGrade();
+    baseLayerOpacityPct = 100;
+    for (const c of layersContainer.children.slice()) c.destroy();
+    resetModelRotation();
+    updateUndoRedoUI(); updateSelectionUI();
+    renderLayersUI();
+};
+
+const loadSplat = async (source, opts = {}) => {
+    emptySceneLoadingDepth++;
+    updateEmptyScenePlaceholder();
+    instructions.innerHTML = '<p>Loading…</p>';
+
+    let loadUrl, originalUrl;
+    if (source instanceof File) {
+        loadUrl = URL.createObjectURL(source);
+        originalUrl = source.name;
+    } else {
+        loadUrl = originalUrl = source;
+    }
+
+    try {
+        await new Promise((resolve, reject) => {
+            const asset = new pc.Asset('splat', 'gsplat', { url: loadUrl, filename: originalUrl }, gsplatAssetDataForFilename(originalUrl));
+            app.assets.add(asset);
+            asset.once('load', async (a) => {
+                try {
+                    const preserve = opts.preserveCamera;
+                    const savedOrbit = preserve ? { target: orbit.target.clone(), distance: orbit.distance, yaw: orbit.yaw, pitch: orbit.pitch } : null;
+                    const savedNavMode = preserve ? cameraNavMode : null;
+                    const savedFly = preserve ? { pos: flyCam.pos.clone(), yaw: flyCam.yaw, pitch: flyCam.pitch } : null;
+                    const savedRot = preserve ? { ...globalModelRotation } : null;
+                    unloadAll();
+                    await createPaintableSplat(a, opts);
+                    if (preserve) {
+                        if (savedNavMode === 'fly' && savedFly) {
+                            flyCam.pos.copy(savedFly.pos);
+                            flyCam.yaw = savedFly.yaw;
+                            flyCam.pitch = savedFly.pitch;
+                            cameraNavMode = 'fly';
+                        } else if (savedOrbit) {
+                            orbit.target.copy(savedOrbit.target);
+                            orbit.distance = savedOrbit.distance;
+                            orbit.yaw = savedOrbit.yaw;
+                            orbit.pitch = savedOrbit.pitch;
+                            cameraNavMode = 'orbit';
+                        }
+                        syncCameraNavToolbar();
+                        updateCamera();
+                    }
+                    if (preserve && savedRot && paintables.length) {
+                        globalModelRotation = { x: savedRot.x, y: savedRot.y, z: savedRot.z };
+                        applyModelRotation();
+                    }
+                    baseModelName = source instanceof File ? source.name : (source.split('/').pop() ?? 'Model');
+                    selectedLayerId = 'base';
+                    setTool(activeTool);
+                    updateUndoRedoUI();
+                    if (source instanceof File) URL.revokeObjectURL(loadUrl);
+                    instructions.innerHTML = '';
+                    renderLayersUI();
+                    resolve();
+                } catch (err) {
+                    instructions.innerHTML = `<p style="color:#f88">Error: ${err.message}</p>`;
+                    console.error('createPaintableSplat error:', err);
+                    reject(err);
+                }
+            });
+            asset.once('error', (msg) => {
+                instructions.innerHTML = `<p style="color:#f88">Load error: ${msg}</p>`;
+                console.error('Asset load error:', msg);
+                reject(new Error(msg));
+            });
+            app.assets.load(asset);
+        });
+    } finally {
+        emptySceneLoadingDepth--;
+        updateEmptyScenePlaceholder();
+    }
+};
+
+// ── Export ────────────────────────────────────────────────────────────────────
+// Mirror the GPU pipeline exactly so the exported file matches what you see:
+//
+//  GPU modifier reads:
+//    customColor   = ALPHABLEND accumulation of all paint ops
+//    customOpacity = ADDITIVE  accumulation of all erase ops
+//  Then applies the CURRENT blend-mode ONCE to the accumulated paint.
+//
+// We replicate both accumulation strategies and the single blend-mode pass.
+const applyAllCpuStrokes = () => {
+    if (!gsplatDataCache) return null;
+    const { numSplats, x: xA, y: yA, z: zA, fdc0, fdc1, fdc2, opacity } = gsplatDataCache;
+
+    // Per-splat ALPHABLEND paint accumulation (same as GPU customColor texture)
+    const cumPR = new Float32Array(numSplats);
+    const cumPG = new Float32Array(numSplats);
+    const cumPB = new Float32Array(numSplats);
+    const cumPA = new Float32Array(numSplats); // accumulated coverage
+
+    // Per-splat ADDITIVE erase accumulation (same as GPU customOpacity texture)
+    const cumErase = new Float32Array(numSplats);
+
+    for (const stroke of strokes) {
+        // Use cpuOps for export; fallback to ops (sphere data) if cpuOps missing
+        const opsToApply = stroke.cpuOps?.length
+            ? stroke.cpuOps
+            : (stroke.ops || []).map((o) => (
+                o.isBucket
+                    ? {
+                        isBucket: true,
+                        r: o.color[0], g: o.color[1], b: o.color[2],
+                        intensity: o.color[3], blendMode: blendMode(),
+                        ...(o.layerId ? { layerId: o.layerId } : {}),
+                    }
+                    : {
+                        cx: o.sphere[0], cy: o.sphere[1], cz: o.sphere[2],
+                        radius: o.sphere[3],
+                        r: o.color[0], g: o.color[1], b: o.color[2],
+                        intensity: o.color[3], hardness: o.hardness,
+                        isErase: o.isErase, blendMode: blendMode(),
+                        selectionConstraint: o.selectionConstraint,
+                        ...(o.layerId ? { layerId: o.layerId } : {}),
+                        ...(o.isErase && o.eraseDepthHalf != null
+                            ? { eraseDepthHalf: o.eraseDepthHalf, evX: o.evX, evY: o.evY, evZ: o.evZ }
+                            : {}),
+                    }
+            ));
+        if (!opsToApply.length) continue;
+        for (const op of opsToApply) {
+            if (op.layerId) continue; // layer strokes use GPU textures only (not base CPU cache)
+            if (op.isBucket) {
+                const a = op.intensity;
+                for (let i = 0; i < numSplats; i++) {
+                    if (!selectionMask?.[i]) continue;
+                    cumPR[i] = op.r * a + cumPR[i] * (1 - a);
+                    cumPG[i] = op.g * a + cumPG[i] * (1 - a);
+                    cumPB[i] = op.b * a + cumPB[i] * (1 - a);
+                    cumPA[i] = a + cumPA[i] * (1 - a);
+                }
+                continue;
+            }
+            const r2 = (op.radius * 1.001) ** 2; // small epsilon for fp tolerance
+            const sc = op.selectionConstraint != null ? op.selectionConstraint : (hasSelection ? 1 : 0);
+            for (let i = 0; i < numSplats; i++) {
+                if (sc === 1 && selectionMask?.[i]) continue;
+                if (sc === 2 && (!selectionMask || !selectionMask[i])) continue;
+                const dx = xA[i] - op.cx, dy = yA[i] - op.cy, dz = zA[i] - op.cz;
+                let falloff;
+                if (op.isErase) {
+                    let tEdge;
+                    if ((op.eraseDepthHalf ?? 0) > 1e-8 && op.evX != null) {
+                        const evx = op.evX, evy = op.evY, evz = op.evZ;
+                        const longitud = dx * evx + dy * evy + dz * evz;
+                        const perpSq = dx * dx + dy * dy + dz * dz - longitud * longitud;
+                        const perp = Math.sqrt(Math.max(0, perpSq));
+                        const R = op.radius;
+                        const D = Math.max(op.eraseDepthHalf, 1e-6);
+                        if (perp >= R || Math.abs(longitud) > D) continue;
+                        tEdge = Math.max(perp / R, Math.abs(longitud) / D);
+                    } else {
+                        if (dx * dx + dy * dy + dz * dz >= r2) continue;
+                        tEdge = Math.sqrt(dx * dx + dy * dy + dz * dz) / op.radius;
+                    }
+                    const tLin = 1 - tEdge;
+                    falloff = op.hardness >= 1
+                        ? 1
+                        : smoothstepJS(0, Math.max(0.001, 1 - op.hardness), tLin);
+                } else {
+                    if (dx * dx + dy * dy + dz * dz >= r2) continue;
+                    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    falloff = paintPlateauFalloff(dist, op.radius, op.hardness);
+                }
+                if (falloff < 0.008) continue;
+                const a = op.intensity * falloff;
+
+                if (op.isErase) {
+                    // GPU erase uses ADDITIVE blend (ONE, ONE) → simple sum
+                    cumErase[i] += a;
+                } else {
+                    // GPU paint uses ALPHABLEND (SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+                    // Porter-Duff "over": dst = src*srcA + dst*(1-srcA)
+                    cumPR[i] = op.r * a + cumPR[i] * (1 - a);
+                    cumPG[i] = op.g * a + cumPG[i] * (1 - a);
+                    cumPB[i] = op.b * a + cumPB[i] * (1 - a);
+                    cumPA[i] = a + cumPA[i] * (1 - a);
+                }
+            }
+        }
+    }
+
+    // Apply accumulated paint/erase to the original SH coefficients.
+    // The blend mode is applied ONCE to the accumulated colour — matching how
+    // the GPU modifier reads uBlendMode at render time (not per-stroke).
+    const curBlend = blendMode();
+    const out0  = new Float32Array(fdc0);
+    const out1  = new Float32Array(fdc1);
+    const out2  = new Float32Array(fdc2);
+    const outOp = new Float32Array(opacity);
+
+    for (let i = 0; i < numSplats; i++) {
+        // ── paint ────────────────────────────────────────────────────────────
+        const a = cumPA[i];
+        if (a > 0) {
+            const origR = 0.5 + fdc0[i] * SH_C0;
+            const origG = 0.5 + fdc1[i] * SH_C0;
+            const origB = 0.5 + fdc2[i] * SH_C0;
+            let fR, fG, fB;
+            switch (curBlend) {
+                case 1: // Multiply
+                    fR = origR + (origR * cumPR[i] - origR) * a;
+                    fG = origG + (origG * cumPG[i] - origG) * a;
+                    fB = origB + (origB * cumPB[i] - origB) * a;
+                    break;
+                case 2: // Lighten
+                    fR = origR + (Math.max(origR, cumPR[i]) - origR) * a;
+                    fG = origG + (Math.max(origG, cumPG[i]) - origG) * a;
+                    fB = origB + (Math.max(origB, cumPB[i]) - origB) * a;
+                    break;
+                case 3: // Darken
+                    fR = origR + (Math.min(origR, cumPR[i]) - origR) * a;
+                    fG = origG + (Math.min(origG, cumPG[i]) - origG) * a;
+                    fB = origB + (Math.min(origB, cumPB[i]) - origB) * a;
+                    break;
+                default: // Normal
+                    fR = origR + (cumPR[i] - origR) * a;
+                    fG = origG + (cumPG[i] - origG) * a;
+                    fB = origB + (cumPB[i] - origB) * a;
+            }
+            out0[i] = (fR - 0.5) / SH_C0;
+            out1[i] = (fG - 0.5) / SH_C0;
+            out2[i] = (fB - 0.5) / SH_C0;
+        }
+
+        // ── erase ────────────────────────────────────────────────────────────
+        if (cumErase[i] > 0) {
+            outOp[i] = invSigmoid(
+                sigmoid(outOp[i]) * (1 - Math.min(1, cumErase[i]))
+            );
+        }
+    }
+
+    return { out0, out1, out2, outOp };
+};
+
+// Read paint from GPU textures (guarantees export matches what you see)
+const getPaintFromGpu = async () => {
+    if (!gsplatDataCache || !paintables.length) return null;
+    const p = paintables[0];
+    const colorTex = p.gsplatComponent.getInstanceTexture('customColor');
+    const opacityTex = p.gsplatComponent.getInstanceTexture('customOpacity');
+    if (!colorTex || !opacityTex) return null;
+    const w = colorTex.width, h = colorTex.height;
+    if (w <= 0 || h <= 0) return null;
+    const n = gsplatDataCache.numSplats;
+    let colorData, opacityData;
+    try {
+        colorData = await colorTex.read(0, 0, w, h, { immediate: true });
+        opacityData = await opacityTex.read(0, 0, w, h, { immediate: true });
+    } catch (_) { return null; }
+    const { fdc0, fdc1, fdc2, opacity } = gsplatDataCache;
+    const curBlend = blendMode();
+    const out0 = new Float32Array(fdc0), out1 = new Float32Array(fdc1), out2 = new Float32Array(fdc2);
+    const outOp = new Float32Array(opacity);
+    for (let i = 0; i < n; i++) {
+        const off = Math.min(i, w * h - 1) * 4;
+        const cr = colorData[off] / 255, cg = colorData[off + 1] / 255, cb = colorData[off + 2] / 255, ca = colorData[off + 3] / 255;
+        const ea = opacityData[off + 3] / 255;
+        const origR = 0.5 + fdc0[i] * SH_C0, origG = 0.5 + fdc1[i] * SH_C0, origB = 0.5 + fdc2[i] * SH_C0;
+        let fR, fG, fB;
+        if (ca > 0) {
+            switch (curBlend) {
+                case 1: fR = origR + (origR * cr - origR) * ca; fG = origG + (origG * cg - origG) * ca; fB = origB + (origB * cb - origB) * ca; break;
+                case 2: fR = origR + (Math.max(origR, cr) - origR) * ca; fG = origG + (Math.max(origG, cg) - origG) * ca; fB = origB + (Math.max(origB, cb) - origB) * ca; break;
+                case 3: fR = origR + (Math.min(origR, cr) - origR) * ca; fG = origG + (Math.min(origG, cg) - origG) * ca; fB = origB + (Math.min(origB, cb) - origB) * ca; break;
+                default: fR = origR + (cr - origR) * ca; fG = origG + (cg - origG) * ca; fB = origB + (cb - origB) * ca;
+            }
+            out0[i] = (fR - 0.5) / SH_C0; out1[i] = (fG - 0.5) / SH_C0; out2[i] = (fB - 0.5) / SH_C0;
+        }
+        if (ea > 0) outOp[i] = invSigmoid(sigmoid(opacity[i]) * (1 - Math.min(1, ea)));
+    }
+    return { out0, out1, out2, outOp };
+};
+
+/**
+ * Bake GPU customColor/customOpacity into SH DC + opacity for one user layer.
+ * Uses `layer._cpuToGpuSplat` so texel indices match the paint pipeline (same as selection).
+ */
+const getLayerPaintFromGpu = async (layer, gsplat) => {
+    const n = layer.splats.length;
+    if (!n) return null;
+    const colorTex = gsplat.getInstanceTexture('customColor');
+    const opacityTex = gsplat.getInstanceTexture('customOpacity');
+    if (!colorTex || !opacityTex) return null;
+    const w = colorTex.width;
+    const h = colorTex.height;
+    if (w <= 0 || h <= 0) return null;
+    let colorData;
+    let opacityData;
+    try {
+        colorData = await colorTex.read(0, 0, w, h, { immediate: true });
+        opacityData = await opacityTex.read(0, 0, w, h, { immediate: true });
+    } catch (_) {
+        return null;
+    }
+    const map = layer._cpuToGpuSplat;
+    const curBlend = blendMode();
+    const numTexels = w * h;
+    const out0 = new Float32Array(n);
+    const out1 = new Float32Array(n);
+    const out2 = new Float32Array(n);
+    const outOp = new Float32Array(n);
+
+    for (let cpu = 0; cpu < n; cpu++) {
+        const splat = layer.splats[cpu];
+        const fdc0 = splat.f_dc_0 ?? 0;
+        const fdc1 = splat.f_dc_1 ?? 0;
+        const fdc2 = splat.f_dc_2 ?? 0;
+        const op = splat.opacity ?? 0;
+        const origR = 0.5 + fdc0 * SH_C0;
+        const origG = 0.5 + fdc1 * SH_C0;
+        const origB = 0.5 + fdc2 * SH_C0;
+
+        out0[cpu] = fdc0;
+        out1[cpu] = fdc1;
+        out2[cpu] = fdc2;
+        outOp[cpu] = op;
+
+        const gpu = map ? map[cpu] : cpu;
+        if (gpu < 0 || gpu >= numTexels) continue;
+        const off = gpu * 4;
+        const cr = colorData[off] / 255;
+        const cg = colorData[off + 1] / 255;
+        const cb = colorData[off + 2] / 255;
+        const ca = colorData[off + 3] / 255;
+        const ea = opacityData[off + 3] / 255;
+
+        if (ca > 0) {
+            let fR;
+            let fG;
+            let fB;
+            switch (curBlend) {
+                case 1:
+                    fR = origR + (origR * cr - origR) * ca;
+                    fG = origG + (origG * cg - origG) * ca;
+                    fB = origB + (origB * cb - origB) * ca;
+                    break;
+                case 2:
+                    fR = origR + (Math.max(origR, cr) - origR) * ca;
+                    fG = origG + (Math.max(origG, cg) - origG) * ca;
+                    fB = origB + (Math.max(origB, cb) - origB) * ca;
+                    break;
+                case 3:
+                    fR = origR + (Math.min(origR, cr) - origR) * ca;
+                    fG = origG + (Math.min(origG, cg) - origG) * ca;
+                    fB = origB + (Math.min(origB, cb) - origB) * ca;
+                    break;
+                default:
+                    fR = origR + (cr - origR) * ca;
+                    fG = origG + (cg - origG) * ca;
+                    fB = origB + (cb - origB) * ca;
+            }
+            out0[cpu] = (fR - 0.5) / SH_C0;
+            out1[cpu] = (fG - 0.5) / SH_C0;
+            out2[cpu] = (fB - 0.5) / SH_C0;
+        }
+        if (ea > 0) {
+            outOp[cpu] = invSigmoid(sigmoid(op) * (1 - Math.min(1, ea)));
+        }
+    }
+    return { out0, out1, out2, outOp };
+};
+
+/**
+ * Save a Blob as a file. Safari/macOS leaves `name.ply.download` if revokeObjectURL runs
+ * before the download finishes; we defer revoke. Chromium can use the Save dialog when available.
+ */
+const triggerBlobDownload = async (blob, downloadFilename) => {
+    const lower = downloadFilename.toLowerCase();
+    const isPly = lower.endsWith('.ply');
+    const isJson = lower.endsWith('.json');
+
+    if (typeof window.showSaveFilePicker === 'function') {
+        try {
+            const types = isPly
+                ? [{ description: 'PLY (Gaussian splat)', accept: { 'application/octet-stream': ['.ply'] } }]
+                : isJson
+                    ? [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
+                    : [{ description: 'File', accept: { 'application/octet-stream': [lower.match(/\.[^.]+$/)?.[0] || '.bin'] } }];
+            const handle = await window.showSaveFilePicker({
+                suggestedName: downloadFilename,
+                types,
+            });
+            const writable = await handle.createWritable();
+            await writable.write(blob);
+            await writable.close();
+            return;
+        } catch (e) {
+            if (e?.name === 'AbortError') return;
+            console.warn('Save picker failed, using download link:', e);
+        }
+    }
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = downloadFilename;
+    a.rel = 'noopener noreferrer';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    window.setTimeout(() => {
+        a.remove();
+        URL.revokeObjectURL(url);
+    }, 60_000);
+};
+
+const exportToFile = async () => {
+    commitActiveColorGradeFromUI();
+    const hasBase = !!(gsplatDataCache && paintables.length > 0);
+    const layerSplats = [];
+    const layerEntities = [];
+    for (const layer of layers) {
+        if (!layer.visible) continue;
+        const ent = layersContainer.findByName(`layer-${layer.id}`);
+        for (const s of layer.splats) {
+            layerSplats.push(s);
+            layerEntities.push(ent);
+        }
+    }
+    if (!hasBase && layerSplats.length === 0) {
+        alert('Nothing to export.');
+        return;
+    }
+
+    let nBase = 0;
+    let xA;
+    let yA;
+    let zA;
+    let shRest = [];
+    let extra = {};
+    let out0;
+    let out1;
+    let out2;
+    let outOp;
+    const emptyF = new Float32Array(0);
+
+    if (hasBase) {
+        ({ x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache);
+        const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
+        const p = painted ?? {
+            out0: gsplatDataCache.fdc0, out1: gsplatDataCache.fdc1,
+            out2: gsplatDataCache.fdc2, outOp: gsplatDataCache.opacity,
+        };
+        out0 = p.out0;
+        out1 = p.out1;
+        out2 = p.out2;
+        outOp = p.outOp;
+        nBase = gsplatDataCache.numSplats;
+    } else {
+        xA = emptyF;
+        yA = emptyF;
+        zA = emptyF;
+        out0 = emptyF;
+        out1 = emptyF;
+        out2 = emptyF;
+        outOp = emptyF;
+    }
+
+    const nLayer = layerSplats.length;
+    const nTotal = nBase + nLayer;
+
+    // Bake layer brush/erase from GPU (customColor / customOpacity) — same logic as base getPaintFromGpu.
+    const layerFdc0 = new Float32Array(nLayer);
+    const layerFdc1 = new Float32Array(nLayer);
+    const layerFdc2 = new Float32Array(nLayer);
+    const layerOpBaked = new Float32Array(nLayer);
+    const layerPaintTargets = [];
+    const layerPaintPromises = [];
+    for (const layer of layers) {
+        if (!layer.visible || !layer.splats.length) continue;
+        const ent = layersContainer.findByName(`layer-${layer.id}`);
+        if (ent?.gsplat) {
+            layerPaintTargets.push(layer);
+            layerPaintPromises.push(getLayerPaintFromGpu(layer, ent.gsplat));
+        }
+    }
+    const layerPaintResults = await Promise.all(layerPaintPromises);
+    const layerPaintById = new Map();
+    layerPaintTargets.forEach((lyr, i) => layerPaintById.set(lyr.id, layerPaintResults[i]));
+    let layerFlatIdx = 0;
+    for (const layer of layers) {
+        if (!layer.visible) continue;
+        const bakedGpu = layerPaintById.get(layer.id);
+        for (let k = 0; k < layer.splats.length; k++) {
+            const s = layer.splats[k];
+            if (bakedGpu) {
+                layerFdc0[layerFlatIdx] = bakedGpu.out0[k];
+                layerFdc1[layerFlatIdx] = bakedGpu.out1[k];
+                layerFdc2[layerFlatIdx] = bakedGpu.out2[k];
+                layerOpBaked[layerFlatIdx] = bakedGpu.outOp[k];
+            } else {
+                layerFdc0[layerFlatIdx] = s.f_dc_0 ?? 0;
+                layerFdc1[layerFlatIdx] = s.f_dc_1 ?? 0;
+                layerFdc2[layerFlatIdx] = s.f_dc_2 ?? 0;
+                layerOpBaked[layerFlatIdx] = s.opacity ?? 0;
+            }
+            layerFlatIdx++;
+        }
+    }
+
+    const baseEntity = paintables[0]?.entity;
+
+    const baked = {
+        x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0,
+        rot_0: 1, rot_1: 0, rot_2: 0, rot_3: 0,
+        scale_0: 0, scale_1: 0, scale_2: 0,
+    };
+
+    const bx = new Float32Array(nTotal);
+    const by = new Float32Array(nTotal);
+    const bz = new Float32Array(nTotal);
+    const bnx = new Float32Array(nTotal);
+    const bny = new Float32Array(nTotal);
+    const bnz = new Float32Array(nTotal);
+    const br0 = new Float32Array(nTotal);
+    const br1 = new Float32Array(nTotal);
+    const br2 = new Float32Array(nTotal);
+    const br3 = new Float32Array(nTotal);
+    const bs0 = new Float32Array(nTotal);
+    const bs1 = new Float32Array(nTotal);
+    const bs2 = new Float32Array(nTotal);
+
+    if (nBase > 0 && baseEntity) {
+        for (let i = 0; i < nBase; i++) {
+            bakeSplatAttributesForExport(
+                baseEntity,
+                xA[i], yA[i], zA[i],
+                extra.nx?.[i] ?? 0, extra.ny?.[i] ?? 1, extra.nz?.[i] ?? 0,
+                extra.rot_0?.[i] ?? 1, extra.rot_1?.[i] ?? 0, extra.rot_2?.[i] ?? 0, extra.rot_3?.[i] ?? 0,
+                extra.scale_0?.[i] ?? -5, extra.scale_1?.[i] ?? -5, extra.scale_2?.[i] ?? -5,
+                baked,
+            );
+            bx[i] = baked.x; by[i] = baked.y; bz[i] = baked.z;
+            bnx[i] = baked.nx; bny[i] = baked.ny; bnz[i] = baked.nz;
+            br0[i] = baked.rot_0; br1[i] = baked.rot_1; br2[i] = baked.rot_2; br3[i] = baked.rot_3;
+            bs0[i] = baked.scale_0; bs1[i] = baked.scale_1; bs2[i] = baked.scale_2;
+        }
+    }
+    for (let i = 0; i < nLayer; i++) {
+        const s = layerSplats[i];
+        const ent = layerEntities[i];
+        const j = nBase + i;
+        if (!ent) {
+            bx[j] = s.x; by[j] = s.y; bz[j] = s.z;
+            bnx[j] = s.nx ?? 0; bny[j] = s.ny ?? 1; bnz[j] = s.nz ?? 0;
+            br0[j] = s.rot_0 ?? 1; br1[j] = s.rot_1 ?? 0; br2[j] = s.rot_2 ?? 0; br3[j] = s.rot_3 ?? 0;
+            bs0[j] = s.scale_0 ?? -5; bs1[j] = s.scale_1 ?? -5; bs2[j] = s.scale_2 ?? -5;
+            continue;
+        }
+        bakeSplatAttributesForExport(
+            ent,
+            s.x, s.y, s.z,
+            s.nx ?? 0, s.ny ?? 1, s.nz ?? 0,
+            s.rot_0 ?? 1, s.rot_1 ?? 0, s.rot_2 ?? 0, s.rot_3 ?? 0,
+            s.scale_0 ?? -5, s.scale_1 ?? -5, s.scale_2 ?? -5,
+            baked,
+        );
+        bx[j] = baked.x; by[j] = baked.y; bz[j] = baked.z;
+        bnx[j] = baked.nx; bny[j] = baked.ny; bnz[j] = baked.nz;
+        br0[j] = baked.rot_0; br1[j] = baked.rot_1; br2[j] = baked.rot_2; br3[j] = baked.rot_3;
+        bs0[j] = baked.scale_0; bs1[j] = baked.scale_1; bs2[j] = baked.scale_2;
+    }
+
+    const concatColorOpacity = (baseArr, getVal, layerFlat = null) => {
+        const out = new Float32Array(nTotal);
+        for (let i = 0; i < nBase; i++) out[i] = baseArr?.[i] ?? 0;
+        for (let i = 0; i < nLayer; i++) {
+            out[nBase + i] = layerFlat ? layerFlat[i] : (getVal ? getVal(layerSplats[i]) : 0);
+        }
+        return out;
+    };
+
+    const concatShKey = (baseArr, key) => {
+        const out = new Float32Array(nTotal);
+        for (let i = 0; i < nBase; i++) out[i] = baseArr?.[i] ?? 0;
+        for (let i = 0; i < nLayer; i++) out[nBase + i] = layerSplats[i][key] ?? 0;
+        return out;
+    };
+
+    const columns = [];
+    const addCol = (name, data) => { if (data) columns.push(new Column(name, data)); };
+
+    // Column order matches standard 3DGS / Inria-style PLY (SuperSplat, splat-transform):
+    // xyz, normals, DC SH, f_rest_*, opacity, log-scale, quaternion.
+    addCol('x', bx);
+    addCol('y', by);
+    addCol('z', bz);
+    addCol('nx', bnx);
+    addCol('ny', bny);
+    addCol('nz', bnz);
+    const mergedFdc0 = concatColorOpacity(out0, (s) => s.f_dc_0 ?? 0, layerFdc0);
+    const mergedFdc1 = concatColorOpacity(out1, (s) => s.f_dc_1 ?? 0, layerFdc1);
+    const mergedFdc2 = concatColorOpacity(out2, (s) => s.f_dc_2 ?? 0, layerFdc2);
+    if (nBase > 0) {
+        applyGradeToFdcTriplets(mergedFdc0, mergedFdc1, mergedFdc2, 0, nBase, baseColorGrade);
+    }
+    {
+        let off = nBase;
+        for (const layer of layers) {
+            if (!layer.visible) continue;
+            ensureLayerColorGrade(layer);
+            const cnt = layer.splats.length;
+            applyGradeToFdcTriplets(mergedFdc0, mergedFdc1, mergedFdc2, off, cnt, layer.colorGrade);
+            off += cnt;
+        }
+    }
+    addCol('f_dc_0', mergedFdc0);
+    addCol('f_dc_1', mergedFdc1);
+    addCol('f_dc_2', mergedFdc2);
+
+    const baseShKeys = hasBase ? shRest.map((sh) => sh.key) : [];
+    const layerShKeys = collectShKeysFromSplatsArray(layerSplats);
+    const shKeySet = new Set([...baseShKeys, ...layerShKeys]);
+    const allShKeys = [...shKeySet].sort((a, b) => parseInt(a.slice(8), 10) - parseInt(b.slice(8), 10));
+    for (const key of allShKeys) {
+        const shEntry = hasBase ? shRest.find((sh) => sh.key === key) : null;
+        columns.push(new Column(key, concatShKey(shEntry?.data ?? null, key)));
+    }
+
+    {
+        const rawOp = concatColorOpacity(outOp, (s) => s.opacity ?? 0, layerOpBaked);
+        const mergedOp = new Float32Array(nTotal);
+        for (let i = 0; i < nBase; i++) {
+            mergedOp[i] = applyDisplayOpacityMultToLogit(rawOp[i], opacityPctToUniform(baseLayerOpacityPct));
+        }
+        let oi = nBase;
+        for (const layer of layers) {
+            if (!layer.visible) continue;
+            ensureLayerOpacityPct(layer);
+            const m = opacityPctToUniform(layer.opacityPct);
+            for (let k = 0; k < layer.splats.length; k++) {
+                mergedOp[oi] = applyDisplayOpacityMultToLogit(rawOp[oi], m);
+                oi++;
+            }
+        }
+        addCol('opacity', mergedOp);
+    }
+    addCol('scale_0', bs0);
+    addCol('scale_1', bs1);
+    addCol('scale_2', bs2);
+    addCol('rot_0', br0);
+    addCol('rot_1', br1);
+    addCol('rot_2', br2);
+    addCol('rot_3', br3);
+
+    if (columns.length === 0) { alert('No splat data to export.'); return; }
+
+    // DataTable v2 API: constructor takes only the columns array
+    const table    = new DataTable(columns);
+    const memFs    = new MemoryFileSystem();
+    const filename = 'painted.ply';
+
+    try {
+        await writePly(
+            { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
+            memFs,
+        );
+    } catch (err) {
+        console.error('Export error:', err);
+        alert(`Export failed: ${err?.message || err}`);
+        return;
+    }
+
+    const buffer = memFs.results?.get(filename);
+    if (!buffer) { alert('Export failed — no output buffer.'); return; }
+
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    await triggerBlobDownload(blob, filename);
+};
+
+// ── Mouse events ──────────────────────────────────────────────────────────────
+// Alt+click: Add ↔ Subtract. Used for the current selection action.
+const getEffectiveSelMode = (altKey) => {
+    const m = selectionMode;
+    if (!altKey) return m;
+    if (m === 'add') return 'subtract';
+    if (m === 'subtract') return 'add';
+    return m;
+};
+
+app.mouse.on(pc.EVENT_MOUSEDOWN, async (e) => {
+    lastMouse.x = e.x; lastMouse.y = e.y;
+
+    const isLeft  = e.button === pc.MOUSEBUTTON_LEFT;
+    const isRight = e.button === pc.MOUSEBUTTON_RIGHT;
+
+    if (isLeft && activeTool === 'cursor') {
+        isOrbiting = true;
+        canvasContainer.classList.add('is-dragging');
+    }
+    if (isRight) {
+        isPanning = true;
+        canvasContainer.classList.add('is-dragging');
+    }
+
+    if (!isLeft) return;
+
+    if (awaitingSwatchSplatPick) {
+        if (hasRenderableSplats()) {
+            strokeDepth = await pickStrokeDepth(e.x, e.y, false);
+            if (strokeDepth != null) addSwatchFromSplatAtScreen(e.x, e.y);
+            strokeDepth = null;
+        }
+        cancelSwatchSplatPick();
+        return;
+    }
+
+    if (activeTool === 'paintBucket' && hasRenderableSplats()) {
+        clearHoverSphere();
+        applyPaintBucket();
+        return;
+    }
+
+    if (activeTool === 'shapeLayer') {
+        canvasContainer.classList.add('shape-placement-active');
+        const session = ++shapePlaceSession;
+        const sx = e.x;
+        const sy = e.y;
+        shapePlacementDrag = {
+            active: true, startX: sx, startY: sy, depth: null, world0: null, session,
+        };
+        console.log('[shape] mousedown: starting drag session', session);
+        (async () => {
+            const d = await pickStrokeDepth(sx, sy, true);
+            console.log('[shape] pickStrokeDepth resolved, depth =', d, 'session =', session, 'current =', shapePlaceSession);
+            if (session !== shapePlaceSession) { console.log('[shape] session mismatch, aborting'); return; }
+            const w0Raw = cameraEntity.camera.screenToWorld(sx, sy, d);
+            const w0 = new pc.Vec3(w0Raw.x, w0Raw.y, w0Raw.z);
+            console.log('[shape] creating preview at', w0.x.toFixed(2), w0.y.toFixed(2), w0.z.toFixed(2));
+            ensureShapePreviewRoot();
+            shapePreviewOrbitLock = false;
+            shapePreviewRoot.setPosition(w0.x, w0.y, w0.z);
+            const rot = readShapeRotFromUI();
+            shapePreviewRoot.setLocalEulerAngles(rot.rx, rot.ry, rot.rz);
+            const dims = readShapeDimsFromUI();
+            shapePreviewRoot.setLocalScale(dims.sx, dims.sy, dims.sz);
+            rebuildShapePreviewGeometry();
+            updateShapeSplatButtonEnabled();
+            // Store into drag state for mouse-move scaling (only if still active)
+            const drag = shapePlacementDrag;
+            if (drag?.session === session) {
+                drag.depth = d;
+                drag.world0 = w0;
+            }
+            canvasContainer.classList.remove('shape-placement-active');
+            refreshLayerGizmoAttachment();
+        })();
+        return;
+    }
+
+    if (activeTool === 'brush' || activeTool === 'eraser' || activeTool === 'resetBrush') {
+        clearHoverSphere();
+        if (!hasRenderableSplats()) return;
+        strokeDepth = await pickStrokeDepth(e.x, e.y, false);
+        if (strokeDepth == null) return;
+        if (activeTool === 'eraser') {
+            const ly = getActiveLayer();
+            if (ly) {
+                ly._eraseSegX0 = undefined;
+                ly._eraseSegY0 = undefined;
+            }
+        }
+        isPainting = true;
+        lastPaintWorld = null;
+        activeStroke = {
+            isErase: activeTool === 'eraser',
+            isReset: activeTool === 'resetBrush',
+            blendMode: blendMode(), ops: [], cpuOps: [],
+            selectionBefore: captureSelectionSnapshot(),
+        };
+        redoStack.length = 0;
+        updateUndoRedoUI();
+        paintAt(e.x, e.y);
+    }
+
+    if (activeTool === 'brushSelect') {
+        if (hasRenderableSplats()) {
+            strokeDepth = await pickStrokeDepth(e.x, e.y, false);
+            if (strokeDepth == null) return;
+            pendingSelectionUndoSnap = captureSelectionSnapshot();
+            isBrushSelecting = true;
+            brushSelectFirstDab = true;
+            lastBrushSelectWorld = null;
+            brushSelectEffectiveMode = getEffectiveSelMode(e.altKey);
+            brushSelectAt(e.x, e.y);
+        }
+    }
+
+    if (activeTool === 'colorSelect') {
+        if (hasRenderableSplats()) {
+            strokeDepth = await pickStrokeDepth(e.x, e.y, false);
+            if (strokeDepth != null) {
+                const worldPt = getWorldPoint(e.x, e.y);
+                if (worldPt) {
+                    const before = captureSelectionSnapshot();
+                    applyColorSelection(worldPt, getEffectiveSelMode(e.altKey), e.x, e.y);
+                    pushSelectionUndoFromBefore(before);
+                }
+            }
+            strokeDepth = null;
+        }
+    }
+
+    if (activeTool === 'lassoSelect' && hasRenderableSplats()) {
+        pendingSelectionUndoSnap = captureSelectionSnapshot();
+        lassoDragActive = true;
+        lassoPoints = [{ x: e.x, y: e.y }];
+        lassoEffectiveMode = getEffectiveSelMode(e.altKey);
+        redrawSelectionOverlays();
+    }
+
+    if (activeTool === 'vectorSelect' && hasRenderableSplats()) {
+        const last = vectorPolyPoints[vectorPolyPoints.length - 1];
+        if (!last || Math.hypot(e.x - last.x, e.y - last.y) >= 4) {
+            vectorPolyPoints.push({ x: e.x, y: e.y });
+            redrawSelectionOverlays();
+        }
+    }
+
+    if (activeTool === 'boxSelect') {
+        pendingSelectionUndoSnap = captureSelectionSnapshot();
+        boxSelectDrag = { x1: e.x, y1: e.y, x2: e.x, y2: e.y, effectiveMode: getEffectiveSelMode(e.altKey) };
+        Object.assign(boxSelectRect.style, {
+            left: `${e.x}px`, top: `${e.y}px`, width: '0', height: '0',
+        });
+        boxSelectRect.classList.add('active');
+    }
+
+    if (activeTool === 'generateSplats') {
+        if (e.altKey && paintables.length) {
+            strokeDepth = await pickStrokeDepth(e.x, e.y);
+            const worldPt = getWorldPoint(e.x, e.y);
+            if (worldPt) sampleColorAt(worldPt);
+            strokeDepth = null;
+        } else if (paintables.length) {
+            isGenerateSplatsPainting = true;
+            lastGenerateSplatsWorld = null;
+            strokeDepth = await pickStrokeDepth(e.x, e.y);
+            generateSplatsAt(e.x, e.y);
+        }
+    }
+
+    if (activeTool === 'splatSelect' && hasRenderableSplats()) {
+        strokeDepth = await pickStrokeDepth(e.x, e.y, false);
+        if (strokeDepth == null) return;
+        pendingSelectionUndoSnap = captureSelectionSnapshot();
+        isSplatSelecting = true;
+        splatPickAt(e.x, e.y, e.shiftKey);
+    }
+});
+
+app.mouse.on(pc.EVENT_MOUSEMOVE, (e) => {
+    const dx = e.x - lastMouse.x;
+    const dy = e.y - lastMouse.y;
+    lastMouse.x = e.x; lastMouse.y = e.y;
+
+    // Update brush cursor
+    if (activeTool === 'brush' || activeTool === 'eraser' || activeTool === 'resetBrush' || activeTool === 'brushSelect' || activeTool === 'generateSplats' || activeTool === 'splatSelect') updateBrushCursorAt(e.x, e.y);
+
+    if (shapePlacementDrag?.active && activeTool === 'shapeLayer' && shapePlacementDrag.depth != null
+        && shapePlacementDrag.world0 && shapePreviewRoot?.parent) {
+        const w1 = cameraEntity.camera.screenToWorld(e.x, e.y, shapePlacementDrag.depth);
+        const w0 = shapePlacementDrag.world0;
+        const pxMove = Math.hypot(e.x - shapePlacementDrag.startX, e.y - shapePlacementDrag.startY);
+        if (pxMove < 4) {
+            const ui = readShapeDimsFromUI();
+            shapePreviewRoot.setLocalScale(ui.sx, ui.sy, ui.sz);
+        } else {
+            const dist = w0.distance(w1);
+            const s = Math.max(SHAPE_DIM_MIN, Math.min(SHAPE_DIM_MAX, dist));
+            shapePreviewRoot.setLocalScale(s, s, s);
+            syncingShapeUIFromPreview = true;
+            const sf = (v) => String(Math.round(v * 10000) / 10000);
+            if (g('shape-size-x')) g('shape-size-x').value = sf(s);
+            if (g('shape-size-y')) g('shape-size-y').value = sf(s);
+            if (g('shape-size-z')) g('shape-size-z').value = sf(s);
+            syncingShapeUIFromPreview = false;
+        }
+        shapePreviewRoot.setPosition(w0.x, w0.y, w0.z);
+    }
+
+    // Camera look (cursor + left drag)
+    if (isOrbiting && activeTool === 'cursor') {
+        if (cameraNavMode === 'orbit') {
+            orbit.yaw   -= dx * 0.3;
+            orbit.pitch += dy * 0.3;
+            orbit.pitch  = Math.max(-89, Math.min(89, orbit.pitch));
+        } else {
+            flyCam.yaw   -= dx * 0.3;
+            flyCam.pitch += dy * 0.3;
+            flyCam.pitch  = Math.max(-89, Math.min(89, flyCam.pitch));
+        }
+        updateCamera();
+    }
+
+    // Camera pan (right-drag, any tool)
+    if (isPanning) {
+        const scale = orbit.distance * 0.002;
+        const right = cameraEntity.right;
+        const up    = cameraEntity.up;
+        if (cameraNavMode === 'orbit') {
+            orbit.target.x -= right.x * dx * scale;
+            orbit.target.y -= right.y * dx * scale;
+            orbit.target.z -= right.z * dx * scale;
+            orbit.target.x += up.x * dy * scale;
+            orbit.target.y += up.y * dy * scale;
+            orbit.target.z += up.z * dy * scale;
+        } else {
+            flyCam.pos.x -= right.x * dx * scale;
+            flyCam.pos.y -= right.y * dx * scale;
+            flyCam.pos.z -= right.z * dx * scale;
+            flyCam.pos.x += up.x * dy * scale;
+            flyCam.pos.y += up.y * dy * scale;
+            flyCam.pos.z += up.z * dy * scale;
+        }
+        updateCamera();
+    }
+
+    // Paint / erase / reset
+    if (isPainting && (activeTool === 'brush' || activeTool === 'eraser' || activeTool === 'resetBrush')) {
+        paintAt(e.x, e.y);
+    }
+
+    // Generate splats drag
+    if (isGenerateSplatsPainting && activeTool === 'generateSplats') {
+        generateSplatsAt(e.x, e.y);
+    }
+
+    // Brush select drag
+    if (isBrushSelecting && activeTool === 'brushSelect') {
+        brushSelectAt(e.x, e.y);
+    }
+
+    // Splat select drag
+    if (isSplatSelecting && activeTool === 'splatSelect') {
+        splatDragSelectAt(e.x, e.y, e.shiftKey);
+    }
+
+    // Box select drag
+    if (boxSelectDrag) {
+        boxSelectDrag.x2 = e.x; boxSelectDrag.y2 = e.y;
+        const x = Math.min(boxSelectDrag.x1, e.x);
+        const y = Math.min(boxSelectDrag.y1, e.y);
+        Object.assign(boxSelectRect.style, {
+            left:   `${x}px`, top:    `${y}px`,
+            width:  `${Math.abs(e.x - boxSelectDrag.x1)}px`,
+            height: `${Math.abs(e.y - boxSelectDrag.y1)}px`,
+        });
+    }
+
+    if (lassoDragActive && activeTool === 'lassoSelect') {
+        const lp = lassoPoints[lassoPoints.length - 1];
+        if (lp && Math.hypot(e.x - lp.x, e.y - lp.y) >= 3) {
+            lassoPoints.push({ x: e.x, y: e.y });
+            redrawSelectionOverlays();
+        }
+    }
+
+    if (activeTool === 'vectorSelect' && vectorPolyPoints.length) {
+        vectorHoverScreen = { x: e.x, y: e.y };
+        redrawSelectionOverlays();
+    }
+});
+
+app.mouse.on(pc.EVENT_MOUSEUP, (e) => {
+    const isLeft  = e.button === pc.MOUSEBUTTON_LEFT;
+    const isRight = e.button === pc.MOUSEBUTTON_RIGHT;
+    if (isLeft)  isOrbiting = false;
+    if (isRight) isPanning  = false;
+    if (!isPanning && !isOrbiting) canvasContainer.classList.remove('is-dragging');
+
+    if (!isLeft) return;
+
+    if (shapePlacementDrag?.active && activeTool === 'shapeLayer') {
+        canvasContainer.classList.remove('shape-placement-active');
+        shapePlacementDrag = null;
+        refreshLayerGizmoAttachment();
+    }
+
+    // Commit paint stroke
+    if (isPainting && activeStroke?.ops.length) {
+        activeStroke.selectionAfter = captureSelectionSnapshot();
+        strokes.push(activeStroke);
+        updateUndoRedoUI();
+    }
+    if (isPainting && activeTool === 'eraser') flushEraseUserLayerPending();
+    isPainting = false; activeStroke = null; lastPaintWorld = null;
+    strokeDepth = null;   // reset for the next stroke
+
+    if (isGenerateSplatsPainting) {
+        isGenerateSplatsPainting = false;
+        lastGenerateSplatsWorld = null;
+        if (layerUpdateTimeout) {
+            clearTimeout(layerUpdateTimeout);
+            layerUpdateTimeout = null;
+            const layer = layers.find((l) => l.id === selectedLayerId);
+            if (layer?.splats.length) updateLayerEntity(layer);
+        }
+    }
+
+    if (isBrushSelecting) {
+        isBrushSelecting = false;
+        pushSelectionUndoFromBefore(pendingSelectionUndoSnap);
+        pendingSelectionUndoSnap = null;
+        lastBrushSelectWorld = null;
+        brushSelectEffectiveMode = null;
+    }
+
+    if (isSplatSelecting) {
+        isSplatSelecting = false;
+        pushSelectionUndoFromBefore(pendingSelectionUndoSnap);
+        pendingSelectionUndoSnap = null;
+        strokeDepth = null;
+    }
+
+    if (activeTool !== 'brush' && activeTool !== 'eraser' && activeTool !== 'brushSelect' && activeTool !== 'generateSplats' && activeTool !== 'lassoSelect' && activeTool !== 'vectorSelect') {
+        brushCursor.style.cssText = '';
+    }
+
+    if (lassoDragActive && activeTool === 'lassoSelect') {
+        lassoDragActive = false;
+        const pending = pendingSelectionUndoSnap;
+        pendingSelectionUndoSnap = null;
+        const closed = closeSelectionPoly(lassoPoints);
+        const mode = lassoEffectiveMode ?? selectionMode;
+        lassoPoints.length = 0;
+        lassoEffectiveMode = null;
+        redrawSelectionOverlays();
+        if (closed && getWorldMatEntityForActiveTarget()) {
+            applyPolygonSelection(closed, mode);
+            pushSelectionUndoFromBefore(pending);
+        }
+    }
+
+    // Commit box selection
+    if (boxSelectDrag) {
+        const { x1, y1, x2, y2 } = boxSelectDrag;
+        const pending = pendingSelectionUndoSnap;
+        pendingSelectionUndoSnap = null;
+        if (Math.abs(x2-x1) > 4 && Math.abs(y2-y1) > 4 && getWorldMatEntityForActiveTarget()) {
+            applyBoxSelection(x1, y1, x2, y2, boxSelectDrag?.effectiveMode ?? selectionMode);
+            pushSelectionUndoFromBefore(pending);
+        }
+        boxSelectDrag = null;
+        boxSelectRect.classList.remove('active');
+    }
+});
+
+// Scroll: zoom (ignore wheel events that occur right after double-click)
+let lastDblClickTime = 0;
+const WHEEL_UI_ROOT_SELECTOR = '#right-panel, #left-panel, #options-bar, #menu-bar, #snapshot-modal, #support-modal';
+window.addEventListener('wheel', (e) => {
+    if (Date.now() - lastDblClickTime < 300) return;
+    if (e.target instanceof Element && e.target.closest(WHEEL_UI_ROOT_SELECTOR)) return;
+    e.preventDefault();
+    const dz = e.deltaY * 0.005;
+    if (cameraNavMode === 'orbit') {
+        orbit.distance = Math.max(0.05, orbit.distance + dz);
+    } else {
+        getForwardFromYawPitch(flyCam.yaw, flyCam.pitch, _navStep);
+        _navStep.mulScalar(-dz * 3);
+        flyCam.pos.add(_navStep);
+        orbit.distance = Math.max(0.05, orbit.distance + dz);
+    }
+    updateCamera();
+}, { passive: false });
+
+// Double-click: move camera pivot to clicked point (cursor tool only)
+canvas.addEventListener('dblclick', async (e) => {
+    if (activeTool !== 'cursor') return;
+    e.preventDefault();
+    e.stopPropagation();
+    lastDblClickTime = Date.now();
+    if (!hasRenderableSplats()) return;
+    isOrbiting = false;
+    canvasContainer.classList.remove('is-dragging');
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    strokeDepth = await pickStrokeDepth(x, y, false);
+    const worldPt = strokeDepth != null ? getWorldPoint(x, y) : null;
+    strokeDepth = null;
+    if (worldPt) {
+        if (cameraNavMode === 'orbit') {
+            orbit.target.copy(worldPt);
+        } else {
+            getForwardFromYawPitch(flyCam.yaw, flyCam.pitch, _camFwdScratch);
+            const d = Math.max(0.2, Math.min(8, flyCam.pos.distance(worldPt) * 0.65));
+            flyCam.pos.set(
+                worldPt.x - _camFwdScratch.x * d,
+                worldPt.y - _camFwdScratch.y * d,
+                worldPt.z - _camFwdScratch.z * d,
+            );
+        }
+        updateCamera();
+    }
+});
+
+// ── Keyboard ──────────────────────────────────────────────────────────────────
+const NAV_KEYS = ['w','a','s','d','q','e'];
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        if (awaitingSwatchSplatPick) {
+            cancelSwatchSplatPick();
+            e.preventDefault();
+            return;
+        }
+        if (isSupportModalOpen()) {
+            closeSupportModalSnoozed();
+            e.preventDefault();
+            return;
+        }
+        const snapModal = g('snapshot-modal');
+        if (snapModal?.classList.contains('is-open')) {
+            snapModal.classList.remove('is-open');
+            snapModal.setAttribute('aria-hidden', 'true');
+            e.preventDefault();
+            return;
+        }
+    }
+
+    const key = e.key.toLowerCase();
+
+    // Selection mode: 8=New, 9=Add, 0=Subtract when a selection tool is active — before INPUT check
+    const selTools = ['boxSelect', 'lassoSelect', 'vectorSelect', 'brushSelect', 'colorSelect', 'splatSelect'];
+    if (selTools.includes(activeTool) && ['8', '9', '0'].includes(key)) {
+        e.preventDefault();
+        setSelectionMode({ '8': 'new', '9': 'add', '0': 'subtract' }[key]);
+        return;
+    }
+
+    // Brush size (ArrowUp/Down) when brush, eraser, or reset active — handle before INPUT check
+    if ((activeTool === 'brush' || activeTool === 'eraser' || activeTool === 'resetBrush') && (key === 'arrowup' || key === 'arrowdown')) {
+        e.preventDefault();
+        const sliderId = activeTool === 'brush' ? 'brush-size' : activeTool === 'resetBrush' ? 'reset-size' : 'eraser-size';
+        const slider = g(sliderId);
+        if (slider) {
+            const step = parseFloat(slider.step) || 0.005;
+            let v = parseFloat(slider.value) || 0.15;
+            v = key === 'arrowup' ? v + step : Math.max(parseFloat(slider.min) || 0.005, v - step);
+            v = Math.min(parseFloat(slider.max) || 0.5, v);
+            slider.value = v;
+            const numEl = g(sliderId + '-num');
+            if (numEl) numEl.value = v;
+        }
+        return;
+    }
+
+    if (e.key === 'Enter' && activeTool === 'vectorSelect' && vectorPolyPoints.length >= 3) {
+        if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'SELECT') {
+            e.preventDefault();
+            const before = captureSelectionSnapshot();
+            const poly = closeSelectionPoly(vectorPolyPoints);
+            vectorPolyPoints.length = 0;
+            vectorHoverScreen = null;
+            redrawSelectionOverlays();
+            if (poly && getWorldMatEntityForActiveTarget()) {
+                applyPolygonSelection(poly, selectionMode);
+                pushSelectionUndoFromBefore(before);
+            }
+            return;
+        }
+    }
+
+    if (key === 'backspace' && activeTool === 'vectorSelect' && vectorPolyPoints.length) {
+        if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'SELECT') {
+            e.preventDefault();
+            vectorPolyPoints.pop();
+            redrawSelectionOverlays();
+            return;
+        }
+    }
+
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+
+    if (e.key === '`' || e.code === 'Backquote') {
+        if (e.target.tagName === 'TEXTAREA') return;
+        e.preventDefault();
+        setCameraNavMode(cameraNavMode === 'orbit' ? 'fly' : 'orbit');
+        return;
+    }
+
+    // Layer gizmo: 1=Position 2=Rotation 3=Scale (always; selection uses 8/9/0)
+    if (['1', '2', '3'].includes(key)) {
+        e.preventDefault();
+        const m = key === '1' ? 'translate' : key === '2' ? 'rotate' : 'scale';
+        layerGizmoMode = m;
+        try { localStorage.setItem(LS_LAYER_GIZMO_MODE, m); } catch (_) { /* ignore */ }
+        updateLayerGizmoModeButtons();
+        refreshLayerGizmoAttachment();
+        return;
+    }
+
+    if (NAV_KEYS.includes(key)) {
+        keysNav[key] = true;
+        e.preventDefault();
+        return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+        if (key === 'z') { e.preventDefault(); undo(); return; }
+        if (key === 'y' || (e.shiftKey && key === 'z')) { e.preventDefault(); redo(); return; }
+    }
+
+    switch (key) {
+        case 'v': setTool('cursor');       break;
+        case 'r': setTool('brushSelect');  break;
+        case 'c': setTool('colorSelect');  break;
+        case 'x': setTool('eraser');       break;
+        case 'z': setTool('resetBrush');   break;
+        case 'h':
+            showSelectionHighlight = !showSelectionHighlight;
+            {
+                const cb = g('sel-show-highlight');
+                if (cb) cb.checked = showSelectionHighlight;
+            }
+            updateSelectionUI();
+            break;
+        case 'delete': case 'backspace':
+            e.preventDefault();
+            if (hasSelection) removeSelectedSplats();
+            else clearSelection();
+            break;
+        case 'b': setTool('brush');        break;
+        case 'k': setTool('paintBucket');  break;
+        case 'o': setTool('boxSelect'); break;
+        case 'l': setTool('lassoSelect'); break;
+        case 'y': setTool('vectorSelect'); break;
+        case 'm':
+            e.preventDefault();
+            setSplatMode(!splatMode);
+            break;
+        case 'g': setTool('generateSplats'); break;
+        case 'n': setTool('shapeLayer');     break;
+        case 's': setTool('splatSelect');   break;
+        case 'i': if (e.shiftKey) { e.preventDefault(); invertSelection({ recordUndo: true }); } break;
+        case 'escape':
+            if (activeTool === 'vectorSelect' && vectorPolyPoints.length) {
+                vectorPolyPoints.length = 0;
+                vectorHoverScreen = null;
+                redrawSelectionOverlays();
+                break;
+            }
+            if (activeTool === 'lassoSelect' && (lassoDragActive || lassoPoints.length)) {
+                lassoDragActive = false;
+                lassoPoints.length = 0;
+                lassoEffectiveMode = null;
+                pendingSelectionUndoSnap = null;
+                redrawSelectionOverlays();
+                break;
+            }
+            if (boxSelectDrag) {
+                pendingSelectionUndoSnap = null;
+                boxSelectDrag = null;
+                boxSelectRect?.classList.remove('active');
+            }
+            clearSelection({ recordUndo: true });
+            if (selTools.includes(activeTool) || activeTool === 'shapeLayer' || activeTool === 'paintBucket') setTool('cursor');
+            break;
+    }
+});
+window.addEventListener('keyup', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    const key = e.key.toLowerCase();
+    if (NAV_KEYS.includes(key)) keysNav[key] = false;
+});
+window.addEventListener('blur', () => {
+    NAV_KEYS.forEach(k => { keysNav[k] = false; });
+});
+// Focus canvas on click so keyboard works
+canvasContainer.addEventListener('mousedown', () => {
+    const c = document.getElementById('application-canvas');
+    if (c && document.activeElement !== c) c.focus();
+});
+canvasContainer.addEventListener('mouseleave', () => {
+    hideColorPixelLoupe();
+    clearHoverSphere();
+});
+
+// ── UI bindings ───────────────────────────────────────────────────────────────
+g('tool-cursor').addEventListener('click',        () => setTool('cursor'));
+g('tool-brush').addEventListener('click',         () => setTool('brush'));
+g('tool-eraser').addEventListener('click',        () => setTool('eraser'));
+g('tool-resetBrush').addEventListener('click',    () => setTool('resetBrush'));
+g('tool-paint-bucket')?.addEventListener('click', () => setTool('paintBucket'));
+g('tool-box-select').addEventListener('click',    () => setTool('boxSelect'));
+g('tool-lasso-select')?.addEventListener('click', () => setTool('lassoSelect'));
+g('tool-vector-select')?.addEventListener('click', () => setTool('vectorSelect'));
+g('tool-brush-select').addEventListener('click',  () => setTool('brushSelect'));
+g('tool-color-select').addEventListener('click',  () => setTool('colorSelect'));
+g('tool-generate-splats').addEventListener('click', () => setTool('generateSplats'));
+g('tool-shape-layer')?.addEventListener('click', () => setTool('shapeLayer'));
+g('tool-splat-select').addEventListener('click',   () => setTool('splatSelect'));
+g('btn-splat-mode').addEventListener('click',      () => setSplatMode(!splatMode));
+for (const btn of document.querySelectorAll('.splat-style-btn')) {
+    btn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const s = btn.dataset.splatStyle;
+        if (s) setSplatViewStyle(s);
+    });
+}
+
+wireLayersListDragReorder();
+g('add-layer-btn').addEventListener('click', addLayer);
+
+['lt-pos-x', 'lt-pos-y', 'lt-pos-z', 'lt-rot-x', 'lt-rot-y', 'lt-rot-z', 'lt-scl-x', 'lt-scl-y', 'lt-scl-z']
+    .forEach((id) => {
+        const el = g(id);
+        if (!el) return;
+        el.addEventListener('input', readLayerTransformInputsIntoModel);
+        el.addEventListener('change', readLayerTransformInputsIntoModel);
+    });
+g('lt-reset-btn')?.addEventListener('click', resetActiveLayerTransform);
+g('add-shape-preview-btn')?.addEventListener('click', () => placeShapePreviewAtOrbitTarget());
+g('splat-shape-btn')?.addEventListener('click', () => splatShapePreviewToLayer());
+
+// Shape color picker ↔ hex sync + persist
+g('shape-color')?.addEventListener('input', () => {
+    const hex = g('shape-color').value;
+    if (g('shape-color-hex')) g('shape-color-hex').value = hex;
+    saveShapeToolPrefs();
+});
+g('shape-color-hex')?.addEventListener('change', () => {
+    const norm = normalizeBrushHex(g('shape-color-hex')?.value);
+    if (norm) { g('shape-color').value = norm; g('shape-color-hex').value = norm; }
+    else { g('shape-color-hex').value = g('shape-color').value; }
+    saveShapeToolPrefs();
+});
+g('shape-type')?.addEventListener('change', onShapePreviewTopologyChanged);
+['shape-size-x', 'shape-size-y', 'shape-size-z', 'shape-rot-x', 'shape-rot-y', 'shape-rot-z'].forEach((id) => {
+    g(id)?.addEventListener('input', onShapePreviewTransformInputsChanged);
+    g(id)?.addEventListener('change', onShapePreviewTransformInputsChanged);
+});
+g('shape-hollow-edges')?.addEventListener('change', onShapePreviewTopologyChanged);
+
+g('save-sel-btn').addEventListener('click', saveSelection);
+g('export-sel-btn').addEventListener('click', exportSelections);
+g('import-sel-btn').addEventListener('click', importSelections);
+g('add-swatch-btn').addEventListener('click', addSwatch);
+g('pick-swatch-splat-btn')?.addEventListener('click', () => {
+    if (awaitingSwatchSplatPick) {
+        cancelSwatchSplatPick();
+        return;
+    }
+    if (!hasRenderableSplats()) return;
+    awaitingSwatchSplatPick = true;
+    canvasContainer.classList.add('swatch-splat-pick-armed');
+    g('pick-swatch-splat-btn')?.classList.add('accent-btn');
+});
+renderSavedSelectionsList();
+loadCachedSwatches();
+renderSwatchesList();
+
+g('file-input').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (file) await loadSplat(file);
+    e.target.value = '';
+});
+g('empty-scene-load-btn')?.addEventListener('click', () => g('file-input')?.click());
+g('empty-scene-import-btn')?.addEventListener('click', () => g('import-layer-input')?.click());
+g('import-layer-input')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (file) {
+        try {
+            await importSplatAsLayer(file);
+        } catch (_) { /* error shown in instructions */ }
+    }
+    e.target.value = '';
+});
+g('merge-layers-btn')?.addEventListener('click', mergeUserLayersIntoSelected);
+g('separate-sel-layer-btn')?.addEventListener('click', () => { void separateSelectionToNewLayer(); });
+
+g('undo-btn').addEventListener('click', undo);
+g('redo-btn').addEventListener('click', redo);
+g('export-ply').addEventListener('click', () => exportToFile());
+
+const LS_SNAPSHOT_W = 'photoshock-snapshot-w';
+const LS_SNAPSHOT_H = 'photoshock-snapshot-h';
+const LS_SNAPSHOT_FMT = 'photoshock-snapshot-fmt';
+const LS_SNAPSHOT_TRANSP = 'photoshock-snapshot-transparent';
+
+const clampSnapshotDim = (v, fallback) => {
+    const n = parseInt(String(v), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(64, Math.min(8192, n));
+};
+
+const flipRgbaImageY = (pixels, w, h) => {
+    const row = w * 4;
+    const tmp = new Uint8Array(row);
+    for (let y = 0; y < h >> 1; y++) {
+        const y2 = h - 1 - y;
+        const o1 = y * row;
+        const o2 = y2 * row;
+        tmp.set(pixels.subarray(o1, o1 + row));
+        pixels.copyWithin(o1, o2, o2 + row);
+        pixels.set(tmp, o2);
+    }
+};
+
+const syncSnapshotTransparentEnabled = () => {
+    const fmt = g('snapshot-format')?.value;
+    const cb = g('snapshot-transparent');
+    if (!cb) return;
+    const isPng = fmt === 'png';
+    cb.disabled = !isPng;
+    if (!isPng) cb.checked = false;
+};
+
+const takeViewportSnapshot = async () => {
+    const dev = app.graphicsDevice;
+    const wIn = g('snapshot-w');
+    const hIn = g('snapshot-h');
+    const fmtEl = g('snapshot-format');
+    const transpEl = g('snapshot-transparent');
+    const w = clampSnapshotDim(wIn?.value, dev.width);
+    const h = clampSnapshotDim(hIn?.value, dev.height);
+    const mime = fmtEl?.value === 'jpeg' ? 'image/jpeg' : 'image/png';
+    const wantTransparent = transpEl?.checked && mime === 'image/png';
+
+    try {
+        localStorage.setItem(LS_SNAPSHOT_W, String(w));
+        localStorage.setItem(LS_SNAPSHOT_H, String(h));
+        localStorage.setItem(LS_SNAPSHOT_FMT, fmtEl?.value || 'png');
+        localStorage.setItem(LS_SNAPSHOT_TRANSP, wantTransparent ? '1' : '0');
+    } catch (_) { /* ignore */ }
+
+    const cam = cameraEntity.camera;
+    const pr = cam.clearColor.r;
+    const pg = cam.clearColor.g;
+    const pb = cam.clearColor.b;
+    const pa = cam.clearColor.a;
+
+    const wasGrid = viewportGridEntity.enabled;
+    viewportGridEntity.enabled = false;
+
+    if (wantTransparent) {
+        cam.clearColor.set(0, 0, 0, 0);
+    } else {
+        const hex = g('bg-color-input')?.value || '#24252b';
+        hexToColor(hex);
+        cam.clearColor.a = 1;
+    }
+
+    try {
+        app.resizeCanvas(w, h);
+        await new Promise((r) => requestAnimationFrame(r));
+        app.render();
+        await new Promise((r) => requestAnimationFrame(r));
+        app.render();
+
+        const hasReadPixels =
+            typeof dev.readPixelsAsync === 'function' || typeof dev.readPixels === 'function';
+
+        let blob;
+        if (hasReadPixels) {
+            const pixels = new Uint8Array(w * h * 4);
+            if (typeof dev.readPixelsAsync === 'function') {
+                await dev.readPixelsAsync(0, 0, w, h, pixels, true);
+            } else {
+                dev.readPixels(0, 0, w, h, pixels);
+            }
+            flipRgbaImageY(pixels, w, h);
+
+            const c = document.createElement('canvas');
+            c.width = w;
+            c.height = h;
+            const ctx = c.getContext('2d');
+            ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels.buffer), w, h), 0, 0);
+
+            blob = await new Promise((res, rej) => {
+                if (mime === 'image/jpeg') {
+                    c.toBlob((b) => (b ? res(b) : rej(new Error('JPEG encode failed'))), mime, 0.92);
+                } else {
+                    c.toBlob((b) => (b ? res(b) : rej(new Error('PNG encode failed'))), mime);
+                }
+            });
+        } else {
+            // WebGPU (and similar): GraphicsDevice has no readPixels; snapshot via the canvas API.
+            const canvas = dev.canvas;
+            if (!canvas?.toBlob) {
+                throw new Error(
+                    'This renderer cannot read the framebuffer (try WebGL, or a browser that supports canvas snapshots with WebGPU).',
+                );
+            }
+            blob = await new Promise((res, rej) => {
+                if (mime === 'image/jpeg') {
+                    canvas.toBlob((b) => (b ? res(b) : rej(new Error('JPEG encode failed'))), mime, 0.92);
+                } else {
+                    canvas.toBlob((b) => (b ? res(b) : rej(new Error('PNG encode failed'))), mime);
+                }
+            });
+        }
+        const ext = mime === 'image/jpeg' ? 'jpg' : 'png';
+        void triggerBlobDownload(blob, `photoshock-viewport-${Date.now()}.${ext}`);
+    } catch (err) {
+        console.error('[snapshot]', err);
+        alert(`Snapshot failed: ${err?.message || err}`);
+    } finally {
+        cam.clearColor.set(pr, pg, pb, pa);
+        viewportGridEntity.enabled = wasGrid;
+        resizeCanvasToContainer();
+        requestAnimationFrame(() => app.render());
+    }
+};
+
+g('snapshot-download-btn')?.addEventListener('click', () => { void takeViewportSnapshot(); });
+g('snapshot-format')?.addEventListener('change', syncSnapshotTransparentEnabled);
+
+const snapshotModalEl = g('snapshot-modal');
+const openSnapshotModal = () => {
+    if (!snapshotModalEl) return;
+    snapshotModalEl.classList.add('is-open');
+    snapshotModalEl.setAttribute('aria-hidden', 'false');
+    syncSnapshotTransparentEnabled();
+    g('snapshot-w')?.focus();
+};
+const closeSnapshotModal = () => {
+    if (!snapshotModalEl) return;
+    snapshotModalEl.classList.remove('is-open');
+    snapshotModalEl.setAttribute('aria-hidden', 'true');
+};
+
+g('snapshot-open-btn')?.addEventListener('click', openSnapshotModal);
+g('snapshot-modal-backdrop')?.addEventListener('click', closeSnapshotModal);
+g('snapshot-modal-close')?.addEventListener('click', closeSnapshotModal);
+g('snapshot-modal-cancel')?.addEventListener('click', closeSnapshotModal);
+
+(() => {
+    try {
+        const wEl = g('snapshot-w'), hEl = g('snapshot-h'), fEl = g('snapshot-format'), tEl = g('snapshot-transparent');
+        const sw = localStorage.getItem(LS_SNAPSHOT_W);
+        const sh = localStorage.getItem(LS_SNAPSHOT_H);
+        const sf = localStorage.getItem(LS_SNAPSHOT_FMT);
+        const st = localStorage.getItem(LS_SNAPSHOT_TRANSP);
+        if (wEl && sw) wEl.value = sw;
+        if (hEl && sh) hEl.value = sh;
+        if (fEl && (sf === 'png' || sf === 'jpeg')) fEl.value = sf;
+        if (tEl && st === '1') tEl.checked = true;
+    } catch (_) { /* ignore */ }
+    syncSnapshotTransparentEnabled();
+})();
+
+// Background color
+const bgInput = g('bg-color-input');
+const hexToColor = (hex) => {
+    if (!hex || hex.length < 7) return;
+    const r = parseInt(hex.slice(1, 3), 16) / 255;
+    const gv = parseInt(hex.slice(3, 5), 16) / 255;
+    const b = parseInt(hex.slice(5, 7), 16) / 255;
+    cameraEntity.camera.clearColor = new pc.Color(r, gv, b);
+};
+
+const persistBgColor = (hex) => {
+    try {
+        const h = (hex ?? '').trim();
+        if (/^#[0-9a-fA-F]{6}$/.test(h)) localStorage.setItem(LS_BG_COLOR_KEY, h.toLowerCase());
+    } catch (_) { /* private mode / quota */ }
+};
+
+const loadCachedBgColor = () => {
+    try {
+        const raw = localStorage.getItem(LS_BG_COLOR_KEY);
+        if (!raw) return;
+        const h = raw.trim();
+        if (!/^#[0-9a-fA-F]{6}$/.test(h)) return;
+        const v = h.toLowerCase();
+        if (bgInput) bgInput.value = v;
+        hexToColor(v);
+    } catch (_) { /* ignore */ }
+};
+
+const onBgColorPick = (e) => {
+    const v = e.target.value;
+    hexToColor(v);
+    persistBgColor(v);
+};
+bgInput.addEventListener('input', onBgColorPick);
+bgInput.addEventListener('change', onBgColorPick);
+
+loadCachedBgColor();
+
+// Brush color: picker ↔ hex field
+const onBrushPickerChange = () => {
+    syncBrushHexFieldFromPicker();
+    persistBrushColor();
+};
+g('paint-color')?.addEventListener('input', onBrushPickerChange);
+g('paint-color')?.addEventListener('change', onBrushPickerChange);
+g('paint-color-hex')?.addEventListener('input', () => {
+    const norm = normalizeBrushHex(g('paint-color-hex')?.value);
+    if (norm) g('paint-color').value = norm;
+    persistBrushColor();
+});
+g('paint-color-hex')?.addEventListener('change', applyBrushHexFromTextField);
+g('paint-color-hex')?.addEventListener('blur', applyBrushHexFromTextField);
+
+loadCachedBrushColor();
+syncBrushHexFieldFromPicker();
+syncLayerTransformUI();
+
+g('floating-sel-clear')?.addEventListener('click', () => clearSelection({ recordUndo: true }));
+['select-all-btn2', 'floating-sel-select-all']
+    .forEach(id => g(id)?.addEventListener('click', () => selectAll({ recordUndo: true })));
+['invert-sel-btn2', 'floating-sel-invert']
+    .forEach(id => g(id)?.addEventListener('click', () => invertSelection({ recordUndo: true })));
+
+document.querySelectorAll('.sel-mode-toolbar-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setSelectionMode(btn.dataset.selMode));
+});
+
+syncSelectionModeToolbar();
+['sharpen-sel-btn2','sharpen-sel-btn3']
+    .forEach(id => g(id)?.addEventListener('click', () => sharpenSelectedSplats()));
+
+g('blend-mode').addEventListener('change', () => {
+    for (const p of paintables) syncDisplayUniforms(p);
+});
+
+g('reset-camera-btn').addEventListener('click', resetCamera);
+g('frame-active-layer-btn')?.addEventListener('click', frameCameraOnSelectedLayer);
+
+flyCamResetState.pos.copy(cameraEntity.getPosition());
+flyCamResetState.yaw = orbit.yaw;
+flyCamResetState.pitch = orbit.pitch;
+syncCameraNavToolbar();
+document.querySelectorAll('.camera-nav-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        const m = btn.dataset.cameraNav;
+        if (m === 'orbit' || m === 'fly') setCameraNavMode(m);
+    });
+});
+try {
+    if (localStorage.getItem(LS_CAMERA_NAV) === 'fly') setCameraNavMode('fly');
+} catch (_) { /* ignore */ }
+
+// Slider live labels
+const linkSlider = (id, labelId, fmt) => {
+    const slider = g(id), label = g(labelId);
+    if (!slider || !label) return;
+    const update = () => { if (label.tagName === 'SPAN') label.textContent = fmt(parseFloat(slider.value)); };
+    slider.addEventListener('input', update);
+    update();
+};
+
+// Bidirectional sync: slider <-> number input (typing in the field is not overwritten until blur/change)
+const linkSliderNum = (sliderId, numId, min, max, step, fmt = (v) => v, onCommit = null) => {
+    const slider = g(sliderId), num = g(numId);
+    if (!slider || !num) return;
+    const clamp = (v) => Math.max(min, Math.min(max, v));
+    const snapToStep = (v) => {
+        if (!Number.isFinite(step) || step <= 0) return clamp(v);
+        const n = Math.round((clamp(v) - min) / step);
+        return clamp(min + n * step);
+    };
+    const maybeCommit = () => { if (onCommit) onCommit(); };
+    const syncToNum = () => { num.value = fmt(parseFloat(slider.value)); };
+    const commitNum = () => {
+        let v = parseFloat(num.value);
+        if (!Number.isFinite(v)) {
+            syncToNum();
+            return;
+        }
+        v = snapToStep(v);
+        slider.value = String(v);
+        num.value = fmt(v);
+        maybeCommit();
+    };
+    const onNumInput = () => {
+        const raw = String(num.value).trim();
+        if (raw === '' || raw === '-' || raw === '.' || raw === '-.') return;
+        const v = parseFloat(raw);
+        if (!Number.isFinite(v)) return;
+        slider.value = String(clamp(v));
+    };
+    slider.addEventListener('input', () => { syncToNum(); maybeCommit(); });
+    num.addEventListener('input', onNumInput);
+    num.addEventListener('change', commitNum);
+    num.addEventListener('blur', commitNum);
+    syncToNum();
+};
+linkSliderNum('brush-size',       'brush-size-num',       0.005, 0.5, 0.005, v => v.toFixed(3));
+linkSliderNum('brush-hardness',   'brush-hardness-num',   0, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('brush-intensity',  'brush-intensity-num', 0.05, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('brush-spacing',    'brush-spacing-num',   0.05, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('eraser-size',      'eraser-size-num',     0.005, 0.5, 0.005, v => v.toFixed(3));
+linkSliderNum('eraser-hardness',  'eraser-hardness-num', 0, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('eraser-intensity', 'eraser-intensity-num', 0.05, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('eraser-spacing',   'eraser-spacing-num',  0.05, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('eraser-depth',     'eraser-depth-num',    0, 1, 0.005, v => v.toFixed(3));
+linkSliderNum('reset-size',       'reset-size-num',      0.005, 0.5, 0.005, v => v.toFixed(3));
+linkSliderNum('selection-highlight-intensity', 'selection-highlight-intensity-num', 0.1, 1, 0.05, v => v.toFixed(2));
+['selection-highlight-color', 'selection-highlight-intensity', 'selection-highlight-intensity-num'].forEach(id => {
+    g(id)?.addEventListener('input', updateSelectionUI);
+    g(id)?.addEventListener('change', updateSelectionUI);
+});
+syncSelectionDepthUI();
+g('selection-depth-range')?.addEventListener('input', (e) => {
+    selectionDepthControl = parseSelectionDepth(e.target.value);
+    const lab = g('selection-depth-label');
+    if (lab) lab.textContent = String(selectionDepthControl);
+});
+g('selection-depth-range')?.addEventListener('change', () => {
+    try { localStorage.setItem(LS_SELECTION_DEPTH, String(selectionDepthControl)); } catch (_) { /* ignore */ }
+});
+linkSliderNum('reset-hardness',   'reset-hardness-num',  0, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('reset-spacing',    'reset-spacing-num',   0.05, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('brush-select-size',     'brush-select-size-num',     0.005, 0.5, 0.005, v => v.toFixed(3));
+linkSliderNum('brush-select-hardness','brush-select-hardness-num', 0, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('brush-select-spacing',  'brush-select-spacing-num',  0.05, 1, 0.05, v => v.toFixed(2));
+linkSliderNum('generate-splats-size',  'generate-splats-size-num',  0.005, 0.5, 0.005, v => v.toFixed(3));
+linkSliderNum('shape-density', 'shape-density-num', 0.5, 1000, 0.5, (v) =>
+    (Math.abs(v % 1) < 1e-6 ? String(Math.round(v)) : v.toFixed(1)));
+g('shape-density')?.addEventListener('input', saveShapeToolPrefs);
+g('shape-density')?.addEventListener('change', saveShapeToolPrefs);
+
+loadShapeToolPrefs();
+
+const cgCommit = () => commitActiveColorGradeFromUI();
+linkSliderNum('cg-exposure', 'cg-exposure-num', -4, 4, 0.05, (v) => v.toFixed(2), cgCommit);
+linkSliderNum('cg-contrast', 'cg-contrast-num', 0.1, 3, 0.05, (v) => v.toFixed(2), cgCommit);
+linkSliderNum('cg-black', 'cg-black-num', 0, 0.95, 0.005, (v) => v.toFixed(3), cgCommit);
+linkSliderNum('cg-white', 'cg-white-num', 0.05, 1, 0.005, (v) => v.toFixed(3), cgCommit);
+linkSliderNum('cg-sat', 'cg-sat-num', 0, 2, 0.02, (v) => v.toFixed(2), cgCommit);
+linkSliderNum('cg-temp', 'cg-temp-num', -1, 1, 0.02, (v) => v.toFixed(2), cgCommit);
+linkSliderNum('cg-tint', 'cg-tint-num', -1, 1, 0.02, (v) => v.toFixed(2), cgCommit);
+linkSliderNum('cg-wheel-sh-amt', 'cg-wheel-sh-amt-num', 0, 1, 0.02, (v) => v.toFixed(2), cgCommit);
+linkSliderNum('cg-wheel-md-amt', 'cg-wheel-md-amt-num', 0, 1, 0.02, (v) => v.toFixed(2), cgCommit);
+linkSliderNum('cg-wheel-hi-amt', 'cg-wheel-hi-amt-num', 0, 1, 0.02, (v) => v.toFixed(2), cgCommit);
+['cg-wheel-sh', 'cg-wheel-md', 'cg-wheel-hi'].forEach((id) => {
+    g(id)?.addEventListener('input', cgCommit);
+    g(id)?.addEventListener('change', cgCommit);
+});
+for (let i = 0; i < 8; i++) {
+    for (const ax of ['h', 's', 'l']) {
+        g(`cg-s${i}-${ax}`)?.addEventListener('input', cgCommit);
+    }
+}
+g('cg-reset-btn')?.addEventListener('click', resetActiveColorGrade);
+g('cg-bake-grade-btn')?.addEventListener('click', () => { bakeColorGradeIntoActiveTarget(); });
+g('brush-bake-paint-btn')?.addEventListener('click', () => { bakeBrushPaintIntoModel(); });
+g('paint-bucket-bake-btn')?.addEventListener('click', () => { bakeBrushPaintIntoModel(); });
+g('cg-grade-selected-only')?.addEventListener('change', () => { pushAllColorGradesToGPU(); });
+g('sel-show-highlight')?.addEventListener('change', (e) => {
+    showSelectionHighlight = !!e.target.checked;
+    updateSelectionUI();
+});
+refreshColorGradeUIFromSelection();
+initCgGradeSliderUi();
+
+linkSlider('color-tolerance',  'color-tolerance-val',  v => {
+    const tol = Math.pow(v, 3) * 0.25;
+    return tol < 0.001 ? `${(tol*1000).toFixed(2)}‰` : `${(tol*100).toFixed(2)}%`;
+});
+linkSlider('generate-splats-density', 'generate-splats-density-val', v => String(Math.round(v)));
+linkSlider('sharpen-strength',  'sharpen-strength-val',  v => `${Math.round(v*100)}%`);
+linkSlider('sharpen-strength2', 'sharpen-strength-val2', v => `${Math.round(v*100)}%`);
+linkSlider('sharpen-strength3', 'sharpen-strength-val3', v => `${Math.round(v*100)}%`);
+// Keep all three sharpen sliders in sync so the active panel always shows the right value
+['sharpen-strength','sharpen-strength2','sharpen-strength3'].forEach(id => {
+    g(id)?.addEventListener('input', (e) => {
+        ['sharpen-strength','sharpen-strength2','sharpen-strength3'].forEach(sid => {
+            if (sid !== id) { const el = g(sid); if (el) el.value = e.target.value; }
+        });
+    });
+});
+
+// Init sampled color display
+const colorBox = g('generate-splats-color');
+if (colorBox) colorBox.style.background = 'rgb(128,128,128)';
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+setTool('cursor');
+updateEmptyScenePlaceholder();
+updateUndoRedoUI();
+updateSelectionUI();
+
+updateLayerGizmoModeButtons();
+updateFloatingGizmoBarVisibility();
+document.querySelectorAll('.gizmo-mode-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        const m = btn.dataset.gizmoMode;
+        if (m !== 'translate' && m !== 'rotate' && m !== 'scale') return;
+        layerGizmoMode = m;
+        try { localStorage.setItem(LS_LAYER_GIZMO_MODE, m); } catch (_) {}
+        updateLayerGizmoModeButtons();
+        refreshLayerGizmoAttachment();
+    });
+});
+g('toggle-layer-gizmo-btn')?.addEventListener('click', () => {
+    layerGizmoVisible = !layerGizmoVisible;
+    try { localStorage.setItem(LS_LAYER_GIZMO_VISIBLE, layerGizmoVisible ? '1' : '0'); } catch (_) {}
+    refreshLayerGizmoAttachment();
+});
+g('toggle-viewport-grid-btn')?.addEventListener('click', () => {
+    viewportGridVisible = !viewportGridVisible;
+    viewportGridEntity.enabled = viewportGridVisible;
+    if (viewportGridVisible) {
+        viewportGridEntity.setPosition(orbit.target.x, orbit.target.y, orbit.target.z);
+    }
+    try { localStorage.setItem(LS_VIEWPORT_GRID, viewportGridVisible ? '1' : '0'); } catch (_) {}
+    updateViewportGridToggleButton();
+});
+updateViewportGridToggleButton();
+refreshLayerGizmoAttachment();
+
+(() => {
+    const tabs = document.querySelectorAll('.right-panel-tab[data-right-tab]');
+    const p1 = g('right-tab-panel-1');
+    const p2 = g('right-tab-panel-2');
+    const activate = (id) => {
+        tabs.forEach((t) => {
+            const on = t.dataset.rightTab === id;
+            t.classList.toggle('active', on);
+            t.setAttribute('aria-selected', on ? 'true' : 'false');
+            t.tabIndex = on ? 0 : -1;
+        });
+        if (p1) {
+            const on = id === '1';
+            p1.classList.toggle('hidden', !on);
+            if (on) p1.removeAttribute('hidden');
+            else p1.setAttribute('hidden', '');
+        }
+        if (p2) {
+            const on = id === '2';
+            p2.classList.toggle('hidden', !on);
+            if (on) p2.removeAttribute('hidden');
+            else p2.setAttribute('hidden', '');
+        }
+        try { localStorage.setItem(LS_RIGHT_PANEL_TAB, id); } catch (_) { /* ignore */ }
+    };
+    tabs.forEach((t) => {
+        t.addEventListener('click', () => activate(t.dataset.rightTab));
+    });
+    let initial = '1';
+    try { initial = localStorage.getItem(LS_RIGHT_PANEL_TAB) || '1'; } catch (_) { /* ignore */ }
+    if (initial !== '1' && initial !== '2') initial = '1';
+    activate(initial);
+})();
+
+// Right panel: drag the left edge to change width (saved in localStorage)
+(() => {
+    const panel = g('right-panel');
+    const handle = g('right-panel-resizer');
+    if (!panel || !handle) return;
+    let startX = 0;
+    let startW = 0;
+    let raf = null;
+    const bumpCanvas = () => {
+        if (raf != null) return;
+        raf = requestAnimationFrame(() => {
+            raf = null;
+            resizeCanvasToContainer();
+        });
+    };
+    const startDrag = (clientX) => {
+        startX = clientX;
+        startW = panel.getBoundingClientRect().width;
+        handle.classList.add('dragging');
+        document.body.style.cursor = 'ew-resize';
+    };
+    const endDrag = (e) => {
+        if (!handle.classList.contains('dragging')) return;
+        handle.classList.remove('dragging');
+        document.body.style.cursor = '';
+        try {
+            if (e?.pointerId != null) handle.releasePointerCapture(e.pointerId);
+        } catch (_) { /* ignore */ }
+        applyRightPanelWidth(panel.getBoundingClientRect().width, true);
+    };
+    handle.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        startDrag(e.clientX);
+        try { handle.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+    });
+    handle.addEventListener('pointermove', (e) => {
+        if (!handle.classList.contains('dragging')) return;
+        const dx = startX - e.clientX;
+        applyRightPanelWidth(startW + dx, false);
+        bumpCanvas();
+    });
+    handle.addEventListener('pointerup', endDrag);
+    handle.addEventListener('pointercancel', endDrag);
+    handle.addEventListener('keydown', (e) => {
+        const step = e.shiftKey ? 20 : 8;
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            e.preventDefault();
+            const w = panel.getBoundingClientRect().width;
+            const delta = e.key === 'ArrowLeft' ? step : -step;
+            applyRightPanelWidth(w + delta, true);
+        }
+    });
+})();
+

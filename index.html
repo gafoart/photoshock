@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#24252b" />
+  <meta name="description" content="Photoshock — paint on Gaussian splats and export as PLY or SOG" />
+  <link rel="icon" type="image/svg+xml" href="/brand/logo.svg" />
+  <link rel="icon" type="image/png" sizes="48x48" href="/brand/48.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/brand/16.png" />
+  <link rel="apple-touch-icon" href="/brand/48.png" />
+  <title>Photoshock</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div
+    id="desktop-only-gate"
+    class="desktop-only-gate"
+    role="dialog"
+    aria-modal="true"
+    aria-live="polite"
+    aria-label="Photoshock is only available on desktop browsers."
+  >
+    <div class="desktop-only-gate__stage">
+      <img
+        class="desktop-only-gate__logo"
+        src="/brand/logo.svg"
+        alt="Photoshock"
+        width="280"
+        height="160"
+        decoding="async"
+      />
+      <div class="desktop-only-gate__ribbon" aria-hidden="true">
+        <div class="desktop-only-gate__marquee">
+          <div class="desktop-only-gate__marquee-track">
+            <span class="desktop-only-gate__marquee-chunk"
+              >DESKTOP ONLY • DESKTOP ONLY • DESKTOP ONLY • DESKTOP ONLY • </span
+            ><span class="desktop-only-gate__marquee-chunk"
+              >DESKTOP ONLY • DESKTOP ONLY • DESKTOP ONLY • DESKTOP ONLY • </span
+            >
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="app">
+
+    <!-- ── Top menu bar ── -->
+    <div id="menu-bar">
+      <span class="app-logo" aria-label="Photoshock">
+        <img class="app-logo-img" src="/brand/logo.svg" width="120" height="24" alt="" decoding="async" />
+      </span>
+      <div class="menu-sep"></div>
+
+      <div class="menu-group">
+        <label class="menu-btn" id="load-label" title="Replace scene with PLY / SOG">
+          <span data-tabler-icon="file-import" data-tabler-size="15"></span>
+          Load Splat
+          <input type="file" id="file-input" accept=".ply,.compressed.ply,.sog" hidden />
+        </label>
+        <label class="menu-btn" id="import-layer-label" title="Add PLY/SOG as a new layer (keeps base and other layers)">
+          <span data-tabler-icon="stack-push" data-tabler-size="15"></span>
+          Import as layer
+          <input type="file" id="import-layer-input" accept=".ply,.compressed.ply,.sog" hidden />
+        </label>
+      </div>
+
+      <div class="menu-sep"></div>
+
+      <div class="menu-group">
+        <button class="menu-btn" id="undo-btn" title="Undo (Ctrl+Z)" disabled>
+          <span data-tabler-icon="arrow-back-up" data-tabler-size="14"></span>
+          Undo
+        </button>
+        <button class="menu-btn" id="redo-btn" title="Redo (Ctrl+Y)" disabled>
+          <span data-tabler-icon="arrow-forward-up" data-tabler-size="14"></span>
+          Redo
+        </button>
+      </div>
+
+      <div class="menu-sep"></div>
+
+      <div class="menu-group">
+        <button class="menu-btn export-btn" id="export-ply">
+          <span data-tabler-icon="file-export" data-tabler-size="14"></span>
+          Export PLY
+        </button>
+        <button type="button" class="menu-btn export-btn" id="snapshot-open-btn" title="Export viewport as PNG or JPEG">
+          <span data-tabler-icon="camera" data-tabler-size="14"></span>
+          Snapshot…
+        </button>
+      </div>
+
+      <div class="menu-sep"></div>
+
+      <div class="menu-group" style="align-items:center;gap:6px;">
+        <label class="menu-btn" style="gap:6px;cursor:pointer;" title="Background color">
+          <span data-tabler-icon="color-picker" data-tabler-size="13"></span>
+          BG
+          <input type="color" id="bg-color-input" value="#24252b" style="width:28px;height:20px;border:none;padding:0;background:none;cursor:pointer;" />
+        </label>
+      </div>
+
+      <div class="menu-bar-spacer" aria-hidden="true"></div>
+      <div class="menu-group menu-group-end">
+        <button type="button" class="menu-btn export-btn" id="support-open-btn" title="Open Gumroad — name a fair price">
+          <span data-tabler-icon="hand-love-you" data-tabler-size="15"></span>
+          Support the project
+        </button>
+      </div>
+    </div>
+
+    <!-- ── Context-sensitive options bar ── -->
+    <div id="options-bar">
+
+      <!-- Selection tools: highlight + ring depth (shown with box / brush / color / splat select) -->
+      <div id="selection-options-strip" class="selection-options-strip hidden">
+        <div class="opt-sep"></div>
+        <label class="radio-label sel-strip-label"><input type="checkbox" id="sel-show-highlight" checked /> Sel. highlight</label>
+        <label class="radio-label sel-strip-label" title="When checked, brush/eraser/reset affect only selected splats. When unchecked, selected splats are protected.">
+          <input type="checkbox" id="sel-paint-scope-only" /> Paint only in selection
+        </label>
+        <div class="opt-group">
+          <label class="opt-label" for="selection-depth-range">Depth</label>
+          <input type="range" id="selection-depth-range" min="0" max="100" value="50" title="Low = only nearest splats (same screen region) · High = also select deeper splats stacked behind along the view" />
+          <span id="selection-depth-label" class="opt-num sel-depth-val">50</span>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label">Hi color</label>
+          <input type="color" id="selection-highlight-color" value="#2670e8" title="Selection highlight tint" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Hi mix</label>
+          <input type="range" id="selection-highlight-intensity" min="0.1" max="1" step="0.05" value="0.45" />
+          <input type="number" id="selection-highlight-intensity-num" class="opt-num" min="0.1" max="1" step="0.05" value="0.45" />
+        </div>
+      </div>
+
+      <!-- Brush options -->
+      <div class="tool-options" id="options-brush">
+        <div class="opt-group brush-color-group">
+          <label class="opt-label">Color</label>
+          <div class="brush-color-row">
+            <input type="color" id="paint-color" value="#ff0000" title="Pick color" />
+            <input type="text" id="paint-color-hex" class="brush-hex-input" maxlength="9" spellcheck="false" autocomplete="off" value="#ff0000" title="Hex: #rgb or #rrggbb" placeholder="#ff0000" />
+          </div>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label">Size</label>
+          <input type="range" id="brush-size" min="0.005" max="0.5" step="0.005" value="0.15" />
+          <input type="number" id="brush-size-num" class="opt-num" min="0.005" max="0.5" step="0.005" value="0.15" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Hardness</label>
+          <input type="range" id="brush-hardness" min="0" max="1" step="0.05" value="0.8" />
+          <input type="number" id="brush-hardness-num" class="opt-num" min="0" max="1" step="0.05" value="0.8" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Intensity</label>
+          <input type="range" id="brush-intensity" min="0.05" max="1" step="0.05" value="0.5" />
+          <input type="number" id="brush-intensity-num" class="opt-num" min="0.05" max="1" step="0.05" value="0.5" />
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label">Blend</label>
+          <select id="blend-mode">
+            <option value="0">Normal</option>
+            <option value="1">Multiply</option>
+            <option value="2">Lighten</option>
+            <option value="3">Darken</option>
+          </select>
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Spacing</label>
+          <input type="range" id="brush-spacing" min="0.05" max="1" step="0.05" value="0.2" />
+          <input type="number" id="brush-spacing-num" class="opt-num" min="0.05" max="1" step="0.05" value="0.2" />
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group" id="brush-bake-paint-group">
+          <button type="button" class="opt-btn accent-btn" id="brush-bake-paint-btn" title="Bake current paint &amp; erase into splat colors, clear GPU paint layer, and reset undo for this target — then change brush settings freely">
+            <span data-tabler-icon="circle-check" data-tabler-size="13"></span> Bake to model
+          </button>
+        </div>
+      </div>
+
+      <!-- Paint bucket (color/blend/intensity shared with Brush panel below) -->
+      <div class="tool-options hidden" id="options-paint-bucket">
+        <div class="opt-group">
+          <button type="button" class="opt-btn accent-btn" id="paint-bucket-bake-btn" title="Same as Brush: bake paint into splat colors and clear the GPU paint layer">
+            <span data-tabler-icon="circle-check" data-tabler-size="13"></span> Bake to model
+          </button>
+        </div>
+        <div class="opt-sep"></div>
+        <span class="opt-hint">Click the model to fill every <strong>selected</strong> splat. Color, blend mode &amp; intensity use the Brush panel above.</span>
+      </div>
+
+      <!-- Eraser options -->
+      <div class="tool-options hidden" id="options-eraser">
+        <div class="opt-group">
+          <label class="opt-label">Size</label>
+          <input type="range" id="eraser-size" min="0.005" max="0.5" step="0.005" value="0.15" />
+          <input type="number" id="eraser-size-num" class="opt-num" min="0.005" max="0.5" step="0.005" value="0.15" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Hardness</label>
+          <input type="range" id="eraser-hardness" min="0" max="1" step="0.05" value="0.8" />
+          <input type="number" id="eraser-hardness-num" class="opt-num" min="0" max="1" step="0.05" value="0.8" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Intensity</label>
+          <input type="range" id="eraser-intensity" min="0.05" max="1" step="0.05" value="0.5" />
+          <input type="number" id="eraser-intensity-num" class="opt-num" min="0.05" max="1" step="0.05" value="0.5" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Spacing</label>
+          <input type="range" id="eraser-spacing" min="0.05" max="1" step="0.05" value="0.2" />
+          <input type="number" id="eraser-spacing-num" class="opt-num" min="0.05" max="1" step="0.05" value="0.2" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label" title="Thickness along the view ray through the brush. 0 = spherical erase (default).">Depth</label>
+          <input type="range" id="eraser-depth" min="0" max="1" step="0.005" value="0" />
+          <input type="number" id="eraser-depth-num" class="opt-num" min="0" max="1" step="0.005" value="0" />
+        </div>
+      </div>
+
+      <!-- Reset Brush options -->
+      <div class="tool-options hidden" id="options-resetBrush">
+        <span class="opt-hint">Restore splats to original colors (clears paint &amp; erase)</span>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label">Size</label>
+          <input type="range" id="reset-size" min="0.005" max="0.5" step="0.005" value="0.15" />
+          <input type="number" id="reset-size-num" class="opt-num" min="0.005" max="0.5" step="0.005" value="0.15" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Hardness</label>
+          <input type="range" id="reset-hardness" min="0" max="1" step="0.05" value="0.8" />
+          <input type="number" id="reset-hardness-num" class="opt-num" min="0" max="1" step="0.05" value="0.8" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Spacing</label>
+          <input type="range" id="reset-spacing" min="0.05" max="1" step="0.05" value="0.2" />
+          <input type="number" id="reset-spacing-num" class="opt-num" min="0.05" max="1" step="0.05" value="0.2" />
+        </div>
+      </div>
+
+      <!-- Brush Select options -->
+      <div class="tool-options hidden" id="options-brush-select">
+        <div class="opt-group">
+          <label class="opt-label">Size</label>
+          <input type="range" id="brush-select-size" min="0.005" max="0.5" step="0.005" value="0.15" />
+          <input type="number" id="brush-select-size-num" class="opt-num" min="0.005" max="0.5" step="0.005" value="0.15" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Hardness</label>
+          <input type="range" id="brush-select-hardness" min="0" max="1" step="0.05" value="0.8" />
+          <input type="number" id="brush-select-hardness-num" class="opt-num" min="0" max="1" step="0.05" value="0.8" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Spacing</label>
+          <input type="range" id="brush-select-spacing" min="0.05" max="1" step="0.05" value="0.2" />
+          <input type="number" id="brush-select-spacing-num" class="opt-num" min="0.05" max="1" step="0.05" value="0.2" />
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group sel-info">
+          <span id="sel-count-label-brush">No selection</span>
+        </div>
+      </div>
+
+      <!-- Box Select options -->
+      <div class="tool-options hidden" id="options-box-select">
+        <div class="opt-group">
+          <button class="opt-btn" id="select-all-btn2">
+            <span data-tabler-icon="select-all" data-tabler-size="13"></span> Select All
+          </button>
+          <button class="opt-btn" id="invert-sel-btn2">
+            <span data-tabler-icon="arrows-left-right" data-tabler-size="13"></span> Invert
+          </button>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label">Sharpen</label>
+          <input type="range" id="sharpen-strength2" min="0.05" max="1" step="0.05" value="0.5" />
+          <span class="opt-val" id="sharpen-strength-val2">50%</span>
+        </div>
+        <div class="opt-group">
+          <button class="opt-btn accent-btn" id="sharpen-sel-btn2" title="Shrink scale of selected splats to reduce blurriness">
+            <span data-tabler-icon="blur-off" data-tabler-size="13"></span> Sharpen Selected
+          </button>
+        </div>
+        <div class="opt-group sel-info">
+          <span id="sel-count-label2">No selection</span>
+        </div>
+      </div>
+
+      <!-- Lasso Select options -->
+      <div class="tool-options hidden" id="options-lasso-select">
+        <span class="opt-hint">Drag a freehand loop; release to select enclosed splats. Alt temporarily swaps add/subtract.</span>
+        <div class="opt-group sel-info">
+          <span id="sel-count-label-lasso">No selection</span>
+        </div>
+      </div>
+
+      <!-- Polygon (vector) Select options -->
+      <div class="tool-options hidden" id="options-vector-select">
+        <span class="opt-hint">Click each corner; press Enter to close (≥3 points). Backspace removes last point.</span>
+        <div class="opt-group sel-info">
+          <span id="sel-count-label-vector">No selection</span>
+        </div>
+      </div>
+
+      <!-- Color Select options -->
+      <div class="tool-options hidden" id="options-color-select">
+        <div class="opt-group">
+          <label class="opt-label">Tolerance</label>
+          <input type="range" id="color-tolerance" min="0" max="1" step="0.005" value="0.2" />
+          <span class="opt-val" id="color-tolerance-val">0.20%</span>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label">Sharpen</label>
+          <input type="range" id="sharpen-strength3" min="0.05" max="1" step="0.05" value="0.5" />
+          <span class="opt-val" id="sharpen-strength-val3">50%</span>
+        </div>
+        <div class="opt-group">
+          <button class="opt-btn accent-btn" id="sharpen-sel-btn3" title="Shrink scale of selected splats to reduce blurriness">
+            <span data-tabler-icon="blur-off" data-tabler-size="13"></span> Sharpen Selected
+          </button>
+        </div>
+        <div class="opt-group sel-info">
+          <span id="sel-count-label3">No selection</span>
+        </div>
+      </div>
+
+      <!-- Cursor options -->
+      <div class="tool-options hidden" id="options-cursor">
+        <span class="opt-hint">Drag to orbit · Scroll to zoom · All camera controls active</span>
+      </div>
+
+      <!-- Splat Select options -->
+      <div class="tool-options hidden" id="options-splat-select">
+        <span class="opt-hint">Click nearest splat · Shift+click add · Drag select multiple</span>
+        <div class="opt-sep"></div>
+        <span class="opt-hint" style="color:#8cf">TAB — toggle Splat Mode to see dots</span>
+      </div>
+
+      <!-- Shape layer (parametric) -->
+      <div class="tool-options hidden" id="options-shape-layer">
+        <div class="opt-group">
+          <label class="opt-label">Type</label>
+          <select id="shape-type">
+            <option value="cube">Cube</option>
+            <option value="sphere">Sphere</option>
+            <option value="cylinder">Cylinder</option>
+            <option value="plane">Plane</option>
+            <option value="cone">Cone</option>
+            <option value="pyramid">Pyramid</option>
+            <option value="torus">Torus</option>
+          </select>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group shape-xyz-group">
+          <label class="opt-label"><span data-tabler-icon="resize" data-tabler-size="14"></span></label>
+          <div class="shape-xyz-row">
+            <label class="shape-axis-label">X <input type="number" id="shape-size-x" class="opt-num shape-axis-input" min="0.05" max="20" step="0.05" value="0.5" title="Width / extent along X" /></label>
+            <label class="shape-axis-label">Y <input type="number" id="shape-size-y" class="opt-num shape-axis-input" min="0.05" max="20" step="0.05" value="0.5" title="Height / extent along Y" /></label>
+            <label class="shape-axis-label">Z <input type="number" id="shape-size-z" class="opt-num shape-axis-input" min="0.05" max="20" step="0.05" value="0.5" title="Depth / extent along Z" /></label>
+          </div>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group shape-xyz-group">
+          <label class="opt-label"><span data-tabler-icon="rotate" data-tabler-size="14"></span></label>
+          <div class="shape-xyz-row">
+            <label class="shape-axis-label">X <input type="number" id="shape-rot-x" class="opt-num shape-axis-input" min="-360" max="360" step="1" value="0" title="Rotation around X axis (degrees)" /></label>
+            <label class="shape-axis-label">Y <input type="number" id="shape-rot-y" class="opt-num shape-axis-input" min="-360" max="360" step="1" value="0" title="Rotation around Y axis (degrees)" /></label>
+            <label class="shape-axis-label">Z <input type="number" id="shape-rot-z" class="opt-num shape-axis-input" min="-360" max="360" step="1" value="0" title="Rotation around Z axis (degrees)" /></label>
+          </div>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label" title="Splats in k — up to 1000k (1 million)">Density (k splats)</label>
+          <div class="slider-num-row">
+            <input type="range" id="shape-density" min="0.5" max="1000" step="0.5" value="5" />
+            <input type="number" id="shape-density-num" class="opt-num opt-num-wide" inputmode="decimal" min="0.5" max="1000" step="0.5" value="5" title="k splats (5 = 5000)" />
+          </div>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label">Color</label>
+          <div class="brush-color-row">
+            <input type="color" id="shape-color" value="#cccccc" />
+            <input type="text" id="shape-color-hex" class="brush-hex-input" maxlength="9" spellcheck="false" value="#cccccc" />
+          </div>
+        </div>
+        <div class="opt-group">
+          <label class="radio-label" title="Splats only on edges / wireframe">
+            <input type="checkbox" id="shape-hollow-edges" />
+            Hollow (edges only)
+          </label>
+        </div>
+        <div class="opt-group" style="display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center">
+          <button type="button" class="opt-btn" id="add-shape-preview-btn" title="Place wire preview at orbit target (same as double-click focus center in Cursor mode)">
+            <span data-tabler-icon="cube-plus" data-tabler-size="14"></span>
+            Add
+          </button>
+          <button type="button" class="opt-btn accent-btn" id="splat-shape-btn" disabled title="Create splat layer from the current preview">
+            <span data-tabler-icon="sparkles" data-tabler-size="14"></span>
+            Splat it
+          </button>
+        </div>
+      </div>
+
+      <!-- Generate Splats options -->
+      <div class="tool-options hidden" id="options-generate-splats">
+        <div class="opt-group">
+          <label class="opt-label">Color</label>
+          <div class="sampled-color-box" id="generate-splats-color" title="Alt+click to sample from base splat"></div>
+          <span class="opt-hint" style="font-size:10px">Alt+click to sample</span>
+        </div>
+        <div class="opt-sep"></div>
+        <div class="opt-group">
+          <label class="opt-label">Size</label>
+          <input type="range" id="generate-splats-size" min="0.005" max="0.5" step="0.005" value="0.15" />
+          <input type="number" id="generate-splats-size-num" class="opt-num" min="0.005" max="0.5" step="0.005" value="0.15" />
+        </div>
+        <div class="opt-group">
+          <label class="opt-label">Density</label>
+          <input type="range" id="generate-splats-density" min="1" max="50" step="1" value="10" />
+          <span class="opt-val" id="generate-splats-density-val">10</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ── Workspace: left panel + canvas ── -->
+    <div id="workspace">
+
+      <!-- Left tool panel -->
+      <div id="left-panel">
+        <div class="tool-group">
+          <button class="tool-btn active" id="tool-cursor" data-tool="cursor" title="Cursor (V)">
+            <span data-tabler-icon="location" data-tabler-size="18"></span>
+          </button>
+        </div>
+
+        <div class="panel-sep"></div>
+
+        <div class="tool-group">
+          <button class="tool-btn" id="tool-brush" data-tool="brush" title="Brush (B)">
+            <span data-tabler-icon="brush" data-tabler-size="18"></span>
+          </button>
+          <button class="tool-btn" id="tool-eraser" data-tool="eraser" title="Eraser (X)">
+            <span data-tabler-icon="eraser" data-tabler-size="18"></span>
+          </button>
+          <button class="tool-btn" id="tool-resetBrush" data-tool="resetBrush" title="Reset Brush (Z) - restore original colors">
+            <span data-tabler-icon="image-generation" data-tabler-size="18"></span>
+          </button>
+          <button class="tool-btn" id="tool-paint-bucket" data-tool="paintBucket" title="Paint bucket (K) — fill selected splats">
+            <span data-tabler-icon="bucket-droplet" data-tabler-size="18"></span>
+          </button>
+        </div>
+
+        <div class="panel-sep"></div>
+
+        <div class="tool-group">
+          <button class="tool-btn" id="tool-box-select" data-tool="boxSelect" title="Box Select (O)">
+            <span data-tabler-icon="selection-rectangle" data-tabler-size="18"></span>
+          </button>
+          <button class="tool-btn" id="tool-lasso-select" data-tool="lassoSelect" title="Lasso Select (L)">
+            <span data-tabler-icon="lasso" data-tabler-size="18"></span>
+          </button>
+          <button class="tool-btn" id="tool-vector-select" data-tool="vectorSelect" title="Polygon Select (Y)">
+            <span data-tabler-icon="polygon" data-tabler-size="18"></span>
+          </button>
+          <button class="tool-btn" id="tool-brush-select" data-tool="brushSelect" title="Brush Select (R)">
+            <span data-tabler-icon="selection-brush" data-tabler-size="18"></span>
+          </button>
+          <button class="tool-btn" id="tool-color-select" data-tool="colorSelect" title="Color Select (C)">
+            <span data-tabler-icon="color-selection" data-tabler-size="18"></span>
+          </button>
+          <!-- Splat Select: click/drag to pick individual splats -->
+          <button class="tool-btn" id="tool-splat-select" data-tool="splatSelect" title="Splat Select (S)">
+            <span data-tabler-icon="tilt-shift" data-tabler-variant="filled" data-tabler-size="18"></span>
+          </button>
+        </div>
+
+        <div class="panel-sep"></div>
+
+        <div class="tool-group">
+          <button class="tool-btn" id="tool-generate-splats" data-tool="generateSplats" title="Generate Splats (G)">
+            <span data-tabler-icon="braille" data-tabler-size="18"></span>
+          </button>
+          <button class="tool-btn" id="tool-shape-layer" data-tool="shapeLayer" title="Shape layer (N) — cube, sphere, etc. Options in top bar">
+            <span data-tabler-icon="cube-3d-sphere" data-tabler-size="18"></span>
+          </button>
+        </div>
+
+        <div class="panel-sep"></div>
+
+        <!-- Splat Mode toggle + SuperSplat-style centers / rings -->
+        <div class="tool-group splat-mode-toolbar">
+          <button class="tool-btn" id="btn-splat-mode" title="Splat mode (M) — overlay on true colors">
+            <span data-tabler-icon="grid-dots" data-tabler-size="18"></span>
+          </button>
+          <div class="splat-view-style-group hidden" id="splat-view-style-group" role="group" aria-label="Splat overlay style">
+            <button type="button" class="tool-btn splat-style-btn active" data-splat-style="centers" title="Centers — cyan dots on each splat (like SuperSplat); model stays visible underneath">
+              <span data-tabler-icon="circle-dot" data-tabler-size="14"></span>
+            </button>
+            <button type="button" class="tool-btn splat-style-btn" data-splat-style="rings" title="Rings — thin stroke in each splat’s color on the ellipse edge (SuperSplat-style); ring-aware selection">
+              <span data-tabler-icon="circle" data-tabler-size="14"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Canvas area -->
+      <div id="canvas-container" class="mode-cursor">
+        <div id="empty-scene-placeholder" class="empty-scene-placeholder" aria-hidden="false">
+          <div class="empty-scene-placeholder__card">
+            <img class="empty-scene-placeholder__logo" src="/brand/logo.svg" width="160" height="32" alt="" decoding="async" />
+            <h2 class="empty-scene-placeholder__title">No splat scene yet</h2>
+            <p class="empty-scene-placeholder__text">
+              Load a <strong>.ply</strong>, <strong>.compressed.ply</strong>, or <strong>.sog</strong> from the menu, or <strong>drag and drop</strong> a file onto this view.
+              Use <strong>Import as layer</strong> to add splats without replacing the whole scene.
+            </p>
+            <div class="empty-scene-placeholder__actions">
+              <button type="button" class="menu-btn export-btn" id="empty-scene-load-btn">
+                <span data-tabler-icon="file-import" data-tabler-size="14"></span>
+                Load Splat
+              </button>
+              <button type="button" class="menu-btn" id="empty-scene-import-btn">
+                <span data-tabler-icon="stack-push" data-tabler-size="14"></span>
+                Import as layer
+              </button>
+            </div>
+          </div>
+        </div>
+        <canvas id="application-canvas" tabindex="0"></canvas>
+        <svg id="selection-overlay-svg" class="selection-overlay-svg" aria-hidden="true"></svg>
+        <!-- Box selection overlay -->
+        <div id="box-select-rect"></div>
+        <!-- Brush / sphere-select cursor circle -->
+        <div id="brush-cursor"></div>
+        <!-- Magnified pixel preview (color select & pick swatch from splat) -->
+        <div id="color-pixel-loupe" class="color-pixel-loupe hidden" aria-hidden="true">
+          <div class="color-pixel-loupe-glass">
+            <canvas id="color-pixel-loupe-canvas" width="130" height="130"></canvas>
+          </div>
+          <div id="color-pixel-loupe-hex" class="color-pixel-loupe-hex">#000000</div>
+        </div>
+        <!-- Instructions overlay -->
+        <div id="instructions">
+          <p></p>
+        </div>
+      </div>
+
+      <!-- Floating gizmo toolbar (positioned to the left of the right panel) -->
+      <div id="floating-gizmo-bar" class="floating-gizmo-bar hidden">
+        <div class="floating-gizmo-modes" role="group" aria-label="Gizmo mode">
+          <button type="button" class="floating-gizmo-btn gizmo-mode-btn active" data-gizmo-mode="translate" title="Move (position) · Key 1" aria-label="Move">
+            <span data-tabler-icon="arrows-move" data-tabler-size="16"></span>
+          </button>
+          <button type="button" class="floating-gizmo-btn gizmo-mode-btn" data-gizmo-mode="rotate" title="Rotate · Key 2" aria-label="Rotate">
+            <span data-tabler-icon="rotate" data-tabler-size="16"></span>
+          </button>
+          <button type="button" class="floating-gizmo-btn gizmo-mode-btn" data-gizmo-mode="scale" title="Scale · Key 3" aria-label="Scale">
+            <span data-tabler-icon="resize" data-tabler-size="16"></span>
+          </button>
+        </div>
+        <div class="floating-gizmo-sep"></div>
+        <button type="button" class="floating-gizmo-btn" id="toggle-layer-gizmo-btn" title="Show or hide the 3D gizmo in the viewport" aria-label="Toggle gizmo">
+          <span data-tabler-icon="gizmo" data-tabler-size="16"></span>
+        </button>
+        <button type="button" class="floating-gizmo-btn" id="toggle-viewport-grid-btn" title="XZ grid: 1-unit subdivisions, 10-unit majors, red X / blue Z, fades with distance (plane through camera target)" aria-label="Toggle grid">
+          <span data-tabler-icon="grid-3x3" data-tabler-size="16"></span>
+        </button>
+        <div class="floating-gizmo-sep"></div>
+        <button type="button" class="floating-gizmo-btn" id="reset-camera-btn" title="Reset camera" aria-label="Reset camera">
+          <span data-tabler-icon="camera-rotate" data-tabler-size="16"></span>
+        </button>
+        <button type="button" class="floating-gizmo-btn" id="frame-active-layer-btn" title="Frame active layer in view — center camera on current layer" aria-label="Frame active layer">
+          <span data-tabler-icon="focus-centered" data-tabler-size="16"></span>
+        </button>
+        <div class="floating-gizmo-sep"></div>
+        <div class="floating-gizmo-camera-nav" role="group" aria-label="Camera navigation">
+          <button type="button" class="floating-gizmo-btn camera-nav-btn active" data-camera-nav="orbit" title="Orbit — pivot around target; WASD pans target on ground plane · ` toggles Fly" aria-label="Orbit camera" aria-pressed="true">
+            <span data-tabler-icon="rotate-dot" data-tabler-size="16"></span>
+          </button>
+          <button type="button" class="floating-gizmo-btn camera-nav-btn" data-camera-nav="fly" title="Fly — WASD moves through space; scroll drifts along view · ` toggles Orbit" aria-label="Fly camera" aria-pressed="false">
+            <span data-tabler-icon="plane-tilt" data-tabler-size="16"></span>
+          </button>
+        </div>
+        <div class="floating-gizmo-selection-commands hidden" id="floating-gizmo-selection-commands" role="group" aria-label="Selection mode and actions">
+          <button type="button" class="floating-gizmo-btn sel-mode-toolbar-btn" data-sel-mode="new" title="New selection — replace (8)" aria-label="New selection" aria-pressed="false">
+            <span data-tabler-icon="square-rounded" data-tabler-size="16"></span>
+          </button>
+          <button type="button" class="floating-gizmo-btn sel-mode-toolbar-btn" data-sel-mode="add" title="Add to selection (9)" aria-label="Add to selection" aria-pressed="false">
+            <span data-tabler-icon="square-rounded-plus" data-tabler-size="16"></span>
+          </button>
+          <button type="button" class="floating-gizmo-btn sel-mode-toolbar-btn" data-sel-mode="subtract" title="Subtract from selection (0)" aria-label="Subtract from selection" aria-pressed="false">
+            <span data-tabler-icon="square-rounded-minus" data-tabler-size="16"></span>
+          </button>
+          <button type="button" class="floating-gizmo-btn" id="floating-sel-select-all" title="Select all" aria-label="Select all">
+            <span data-tabler-icon="select-all" data-tabler-size="16"></span>
+          </button>
+          <button type="button" class="floating-gizmo-btn" id="floating-sel-invert" title="Invert selection (Shift+I)" aria-label="Invert selection">
+            <span data-tabler-icon="arrows-left-right" data-tabler-size="16"></span>
+          </button>
+        </div>
+        <div class="floating-gizmo-clear-wrap hidden" id="floating-gizmo-clear-wrap" role="group" aria-label="Clear selection">
+          <div class="floating-gizmo-sep"></div>
+          <button type="button" class="floating-gizmo-btn" id="floating-sel-clear" title="Clear selection (Delete)" aria-label="Clear selection">
+            <span data-tabler-icon="square-off" data-tabler-size="16"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Right panel: layers + model transform (width: drag left edge) -->
+      <div id="right-panel">
+        <div id="right-panel-resizer" role="separator" aria-orientation="vertical" aria-label="Resize side panel" title="Drag to resize panel" tabindex="0"></div>
+        <div id="right-panel-inner">
+        <div class="panel-section" id="layers-section">
+          <div class="panel-section-title layers-title-row">
+            Layers
+            <span class="layers-title-actions">
+              <button class="layers-title-btn" id="add-layer-btn" title="Add Layer" aria-label="Add Layer">
+                <span data-tabler-icon="square-plus" data-tabler-size="14"></span>
+              </button>
+              <button class="layers-title-btn" id="merge-layers-btn" title="Merge layers into selected" aria-label="Merge layers into selected">
+                <span data-tabler-icon="arrow-merge" data-tabler-size="14"></span>
+              </button>
+              <button class="layers-title-btn" id="separate-sel-layer-btn" title="Move selection to a new layer (active user layer only)" aria-label="Separate selection to new layer">
+                <span data-tabler-icon="arrows-split" data-tabler-size="14"></span>
+              </button>
+            </span>
+          </div>
+          <div id="layers-list"></div>
+        </div>
+
+        <div class="right-panel-tabstrip" role="tablist" aria-label="Side panel sections">
+          <button type="button" class="right-panel-tab active" role="tab" id="right-tab-btn-1" data-right-tab="1" aria-selected="true" aria-controls="right-tab-panel-1" tabindex="0">Scene</button>
+          <button type="button" class="right-panel-tab" role="tab" id="right-tab-btn-2" data-right-tab="2" aria-selected="false" aria-controls="right-tab-panel-2" tabindex="-1">Color</button>
+        </div>
+
+        <div id="right-tab-panel-1" class="right-tab-panel" role="tabpanel" aria-labelledby="right-tab-btn-1">
+          <div id="layer-transform-section" class="layer-transform-section hidden">
+            <div class="panel-section-title layers-title-row">
+              Layer transform
+              <span class="layers-title-actions">
+                <button class="layers-title-btn" type="button" id="lt-reset-btn" title="Reset transform" aria-label="Reset transform">
+                  <span data-tabler-icon="restore" data-tabler-size="14"></span>
+                </button>
+              </span>
+            </div>
+            <div class="transform-grid">
+              <span class="transform-label" data-gizmo-label="translate" title="Position">
+                <span data-tabler-icon="arrows-move" data-tabler-size="14"></span>
+              </span>
+              <label class="transform-axis">X <input type="number" id="lt-pos-x" class="transform-num" inputmode="decimal" step="any" min="-1000" max="1000" title="Position X (−1000…1000)" placeholder="0" /></label>
+              <label class="transform-axis">Y <input type="number" id="lt-pos-y" class="transform-num" inputmode="decimal" step="any" min="-1000" max="1000" title="Position Y (−1000…1000)" placeholder="0" /></label>
+              <label class="transform-axis">Z <input type="number" id="lt-pos-z" class="transform-num" inputmode="decimal" step="any" min="-1000" max="1000" title="Position Z (−1000…1000)" placeholder="0" /></label>
+              <span class="transform-label" data-gizmo-label="rotate" title="Rotation">
+                <span data-tabler-icon="rotate" data-tabler-size="14"></span>
+              </span>
+              <label class="transform-axis">X <input type="number" id="lt-rot-x" class="transform-num" inputmode="decimal" step="any" min="-360" max="360" title="Rotation X in degrees (−360…360)" placeholder="0" /></label>
+              <label class="transform-axis">Y <input type="number" id="lt-rot-y" class="transform-num" inputmode="decimal" step="any" min="-360" max="360" title="Rotation Y in degrees (−360…360)" placeholder="0" /></label>
+              <label class="transform-axis">Z <input type="number" id="lt-rot-z" class="transform-num" inputmode="decimal" step="any" min="-360" max="360" title="Rotation Z in degrees (−360…360)" placeholder="0" /></label>
+              <span class="transform-label" data-gizmo-label="scale" title="Scale">
+                <span data-tabler-icon="resize" data-tabler-size="14"></span>
+              </span>
+              <label class="transform-axis">X <input type="number" id="lt-scl-x" class="transform-num" inputmode="decimal" step="any" min="0.01" max="10" title="Scale X (0.01…10)" placeholder="1" /></label>
+              <label class="transform-axis">Y <input type="number" id="lt-scl-y" class="transform-num" inputmode="decimal" step="any" min="0.01" max="10" title="Scale Y (0.01…10)" placeholder="1" /></label>
+              <label class="transform-axis">Z <input type="number" id="lt-scl-z" class="transform-num" inputmode="decimal" step="any" min="0.01" max="10" title="Scale Z (0.01…10)" placeholder="1" /></label>
+            </div>
+          </div>
+          <div class="panel-section" id="saved-selections-section">
+            <div class="panel-section-title">Saved Selections</div>
+            <div class="opt-group opt-group-row">
+              <input type="text" id="save-sel-name" class="opt-input" placeholder="Name your selection" maxlength="32" inputmode="text" />
+              <button type="button" class="opt-btn" id="save-sel-btn" title="Save selection" aria-label="Save selection">
+                <span data-tabler-icon="plus" data-tabler-size="14"></span>
+              </button>
+            </div>
+            <div class="opt-group opt-group-row">
+              <button class="opt-btn" id="export-sel-btn" title="Download selections as file">
+                <span data-tabler-icon="file-export" data-tabler-size="13"></span> Export
+              </button>
+              <button class="opt-btn" id="import-sel-btn" title="Load selections from file">
+                <span data-tabler-icon="file-import" data-tabler-size="13"></span> Import
+              </button>
+            </div>
+            <input type="file" id="import-sel-file" accept=".json" style="display:none" />
+            <div id="saved-selections-list" class="saved-sel-list"></div>
+          </div>
+          <div class="panel-section" id="swatches-section">
+            <div class="panel-section-title">Swatches</div>
+            <div class="opt-group opt-group-row">
+              <button class="opt-btn" id="add-swatch-btn" title="Save current paint color" aria-label="Add swatch">
+                <span data-tabler-icon="plus" data-tabler-size="14"></span>
+              </button>
+              <button class="opt-btn" id="pick-swatch-splat-btn" title="Pick splat color — click a splat on the canvas to add a swatch" aria-label="Pick color from splat">
+                <span data-tabler-icon="color-picker" data-tabler-size="14"></span>
+              </button>
+            </div>
+            <div id="swatches-list" class="swatches-list"></div>
+          </div>
+        </div>
+
+        <div id="right-tab-panel-2" class="right-tab-panel hidden" role="tabpanel" aria-labelledby="right-tab-btn-2" hidden>
+        <div class="panel-section" id="color-grade-section">
+          <div class="panel-section-title layers-title-row">
+            Color grade
+            <span class="layers-title-actions">
+              <button class="layers-title-btn" type="button" id="cg-reset-btn" title="Reset all controls for the active layer" aria-label="Reset grade">
+                <span data-tabler-icon="reload" data-tabler-size="14"></span>
+              </button>
+              <button class="layers-title-btn accent" type="button" id="cg-bake-grade-btn" title="Bake grade into splat colors (and GPU paint on base), then reset controls" aria-label="Bake to model">
+                <span data-tabler-icon="circle-check" data-tabler-size="14"></span>
+              </button>
+            </span>
+          </div>
+          <div class="opt-group" style="flex-wrap:wrap;gap:8px">
+            <label class="radio-label"><input type="checkbox" id="cg-grade-selected-only" /> Grade selection only</label>
+          </div>
+
+          <div class="panel-subtitle">Exposure &amp; levels</div>
+          <div class="opt-group">
+            <label class="opt-label">Exposure (EV)</label>
+            <div class="slider-num-row">
+              <input type="range" id="cg-exposure" class="cg-slider cg-slider-static" min="-4" max="4" step="0.05" value="0" />
+              <input type="number" id="cg-exposure-num" class="opt-num" min="-4" max="4" step="0.05" value="0" />
+            </div>
+          </div>
+          <div class="opt-group">
+            <label class="opt-label">Contrast</label>
+            <div class="slider-num-row">
+              <input type="range" id="cg-contrast" class="cg-slider cg-slider-static" min="0.1" max="3" step="0.05" value="1" />
+              <input type="number" id="cg-contrast-num" class="opt-num" min="0.1" max="3" step="0.05" value="1" />
+            </div>
+          </div>
+          <div class="opt-group">
+            <label class="opt-label">Black point</label>
+            <div class="slider-num-row">
+              <input type="range" id="cg-black" class="cg-slider cg-slider-static" min="0" max="0.95" step="0.005" value="0" />
+              <input type="number" id="cg-black-num" class="opt-num" min="0" max="0.95" step="0.005" value="0" />
+            </div>
+          </div>
+          <div class="opt-group">
+            <label class="opt-label">White point</label>
+            <div class="slider-num-row">
+              <input type="range" id="cg-white" class="cg-slider cg-slider-static" min="0.05" max="1" step="0.005" value="1" />
+              <input type="number" id="cg-white-num" class="opt-num" min="0.05" max="1" step="0.005" value="1" />
+            </div>
+          </div>
+
+          <div class="panel-subtitle">Saturation &amp; balance</div>
+          <div class="opt-group">
+            <label class="opt-label">Saturation</label>
+            <div class="slider-num-row">
+              <input type="range" id="cg-sat" class="cg-slider cg-slider-static" min="0" max="2" step="0.02" value="1" />
+              <input type="number" id="cg-sat-num" class="opt-num" min="0" max="2" step="0.02" value="1" />
+            </div>
+          </div>
+          <div class="opt-group">
+            <label class="opt-label" title="Cooler (blue) ← → Warmer (yellow)">Temperature</label>
+            <div class="slider-num-row">
+              <input type="range" id="cg-temp" class="cg-slider cg-slider-static" min="-1" max="1" step="0.02" value="0" />
+              <input type="number" id="cg-temp-num" class="opt-num" min="-1" max="1" step="0.02" value="0" />
+            </div>
+          </div>
+          <div class="opt-group">
+            <label class="opt-label" title="Magenta ← → Green">Tint</label>
+            <div class="slider-num-row">
+              <input type="range" id="cg-tint" class="cg-slider cg-slider-static" min="-1" max="1" step="0.02" value="0" />
+              <input type="number" id="cg-tint-num" class="opt-num" min="-1" max="1" step="0.02" value="0" />
+            </div>
+          </div>
+
+          <div class="panel-subtitle">Split tone (shadows / mids / highlights)</div>
+          <p class="opt-hint" style="margin:0;font-size:10px">Pick a color and strength per tonal range (neutral gray = no cast).</p>
+          <div class="opt-group cg-wheel-row">
+            <label class="opt-label">Shadows</label>
+            <div class="cg-wheel-line">
+              <input type="color" id="cg-wheel-sh" value="#808080" title="Shadow tint" />
+              <input type="range" id="cg-wheel-sh-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Amount" />
+              <input type="number" id="cg-wheel-sh-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
+            </div>
+          </div>
+          <div class="opt-group cg-wheel-row">
+            <label class="opt-label">Mids</label>
+            <div class="cg-wheel-line">
+              <input type="color" id="cg-wheel-md" value="#808080" title="Midtone tint" />
+              <input type="range" id="cg-wheel-md-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Amount" />
+              <input type="number" id="cg-wheel-md-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
+            </div>
+          </div>
+          <div class="opt-group cg-wheel-row">
+            <label class="opt-label">Highlights</label>
+            <div class="cg-wheel-line">
+              <input type="color" id="cg-wheel-hi" value="#808080" title="Highlight tint" />
+              <input type="range" id="cg-wheel-hi-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Amount" />
+              <input type="number" id="cg-wheel-hi-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
+            </div>
+          </div>
+
+          <div class="panel-subtitle">Hue zones (8 bins)</div>
+          <p class="opt-hint" style="margin:0;font-size:10px">Hue shift · Saturation multiplier offset · Luminance offset</p>
+          <div class="cg-zones-wrap">
+            <div class="cg-zones-head"><span>Zone</span><span>H</span><span>S</span><span>V</span></div>
+            <div class="cg-zone-row"><span class="cg-zone-name">Red</span><input type="range" id="cg-s0-h" class="cg-slider cg-slider-zone-h" min="-0.25" max="0.25" step="0.005" value="0" title="Hue" /><input type="range" id="cg-s0-s" class="cg-slider cg-slider-dynamic" min="-0.9" max="3" step="0.05" value="0" title="Saturation × offset" /><input type="range" id="cg-s0-l" class="cg-slider cg-slider-dynamic" min="-0.5" max="0.5" step="0.01" value="0" title="Value / luminance" /></div>
+            <div class="cg-zone-row"><span class="cg-zone-name">Orange</span><input type="range" id="cg-s1-h" class="cg-slider cg-slider-zone-h" min="-0.25" max="0.25" step="0.005" value="0" /><input type="range" id="cg-s1-s" class="cg-slider cg-slider-dynamic" min="-0.9" max="3" step="0.05" value="0" /><input type="range" id="cg-s1-l" class="cg-slider cg-slider-dynamic" min="-0.5" max="0.5" step="0.01" value="0" /></div>
+            <div class="cg-zone-row"><span class="cg-zone-name">Yellow</span><input type="range" id="cg-s2-h" class="cg-slider cg-slider-zone-h" min="-0.25" max="0.25" step="0.005" value="0" /><input type="range" id="cg-s2-s" class="cg-slider cg-slider-dynamic" min="-0.9" max="3" step="0.05" value="0" /><input type="range" id="cg-s2-l" class="cg-slider cg-slider-dynamic" min="-0.5" max="0.5" step="0.01" value="0" /></div>
+            <div class="cg-zone-row"><span class="cg-zone-name">Green</span><input type="range" id="cg-s3-h" class="cg-slider cg-slider-zone-h" min="-0.25" max="0.25" step="0.005" value="0" /><input type="range" id="cg-s3-s" class="cg-slider cg-slider-dynamic" min="-0.9" max="3" step="0.05" value="0" /><input type="range" id="cg-s3-l" class="cg-slider cg-slider-dynamic" min="-0.5" max="0.5" step="0.01" value="0" /></div>
+            <div class="cg-zone-row"><span class="cg-zone-name">Cyan</span><input type="range" id="cg-s4-h" class="cg-slider cg-slider-zone-h" min="-0.25" max="0.25" step="0.005" value="0" /><input type="range" id="cg-s4-s" class="cg-slider cg-slider-dynamic" min="-0.9" max="3" step="0.05" value="0" /><input type="range" id="cg-s4-l" class="cg-slider cg-slider-dynamic" min="-0.5" max="0.5" step="0.01" value="0" /></div>
+            <div class="cg-zone-row"><span class="cg-zone-name">Blue</span><input type="range" id="cg-s5-h" class="cg-slider cg-slider-zone-h" min="-0.25" max="0.25" step="0.005" value="0" /><input type="range" id="cg-s5-s" class="cg-slider cg-slider-dynamic" min="-0.9" max="3" step="0.05" value="0" /><input type="range" id="cg-s5-l" class="cg-slider cg-slider-dynamic" min="-0.5" max="0.5" step="0.01" value="0" /></div>
+            <div class="cg-zone-row"><span class="cg-zone-name">Purple</span><input type="range" id="cg-s6-h" class="cg-slider cg-slider-zone-h" min="-0.25" max="0.25" step="0.005" value="0" /><input type="range" id="cg-s6-s" class="cg-slider cg-slider-dynamic" min="-0.9" max="3" step="0.05" value="0" /><input type="range" id="cg-s6-l" class="cg-slider cg-slider-dynamic" min="-0.5" max="0.5" step="0.01" value="0" /></div>
+            <div class="cg-zone-row"><span class="cg-zone-name">Magenta</span><input type="range" id="cg-s7-h" class="cg-slider cg-slider-zone-h" min="-0.25" max="0.25" step="0.005" value="0" /><input type="range" id="cg-s7-s" class="cg-slider cg-slider-dynamic" min="-0.9" max="3" step="0.05" value="0" /><input type="range" id="cg-s7-l" class="cg-slider cg-slider-dynamic" min="-0.5" max="0.5" step="0.01" value="0" /></div>
+          </div>
+        </div>
+        </div><!-- #right-tab-panel-2 -->
+        </div><!-- #right-panel-inner -->
+      </div>
+
+    </div>
+
+    <!-- Gumroad “fair price” embed (startup; hidden after contribution or snooze) -->
+    <div id="support-modal" class="support-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="support-modal-title">
+      <div class="support-modal-backdrop" id="support-modal-backdrop" tabindex="-1"></div>
+      <div class="support-modal-panel">
+        <div class="support-modal-header">
+          <h2 id="support-modal-title" class="support-modal-title">Support Photoshock</h2>
+          <button type="button" class="support-modal-close" id="support-modal-close" aria-label="Close">×</button>
+        </div>
+        <div class="support-modal-body">
+          <p class="support-modal-hint">
+            If Photoshock is useful to you, you can name a fair price on Gumroad. Loading may take a moment.
+          </p>
+          <div class="support-modal-frame-wrap">
+            <iframe
+              id="support-modal-iframe"
+              class="support-modal-iframe"
+              title="Photoshock on Gumroad"
+              loading="lazy"
+            ></iframe>
+          </div>
+          <p class="support-modal-footnote">
+            After paying, Gumroad can redirect back with
+            <code class="support-modal-code">?photoshock_contributor=1</code>
+            on your site URL — this dialog will stay hidden.
+          </p>
+          <div class="support-modal-actions">
+            <button type="button" class="menu-btn export-btn" id="support-modal-contributed">
+              I’ve contributed — don’t show this again
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Viewport snapshot: settings in modal (not menu bar) -->
+    <div id="snapshot-modal" class="snapshot-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="snapshot-modal-title">
+      <div class="snapshot-modal-backdrop" id="snapshot-modal-backdrop" tabindex="-1"></div>
+      <div class="snapshot-modal-panel">
+        <div class="snapshot-modal-header">
+          <h2 id="snapshot-modal-title" class="snapshot-modal-title">Viewport snapshot</h2>
+          <button type="button" class="snapshot-modal-close" id="snapshot-modal-close" aria-label="Close">×</button>
+        </div>
+        <div class="snapshot-modal-body">
+          <p class="snapshot-modal-hint">Renders the current view at the size you choose. Opaque uses the menu BG color; transparent PNG uses alpha behind the splats.</p>
+          <div class="snapshot-modal-row snapshot-modal-row-dim">
+            <span class="snapshot-modal-label">Size (px)</span>
+            <div class="snapshot-dim-pair">
+              <input type="number" id="snapshot-w" class="snapshot-modal-input" min="64" max="8192" value="1920" aria-label="Width in pixels" />
+              <span class="snapshot-modal-times">×</span>
+              <input type="number" id="snapshot-h" class="snapshot-modal-input" min="64" max="8192" value="1080" aria-label="Height in pixels" />
+            </div>
+          </div>
+          <div class="snapshot-modal-row">
+            <label class="snapshot-modal-label" for="snapshot-format">Format</label>
+            <select id="snapshot-format" class="snapshot-modal-select" aria-label="Image format">
+              <option value="png">PNG</option>
+              <option value="jpeg">JPEG</option>
+            </select>
+          </div>
+          <div class="snapshot-modal-row">
+            <label class="snapshot-modal-check-label">
+              <input type="checkbox" id="snapshot-transparent" />
+              Transparent background (PNG only)
+            </label>
+          </div>
+        </div>
+        <div class="snapshot-modal-footer">
+          <button type="button" class="menu-btn" id="snapshot-modal-cancel">Cancel</button>
+          <button type="button" class="menu-btn export-btn" id="snapshot-download-btn">
+            <span data-tabler-icon="camera" data-tabler-size="14"></span>
+            Download snapshot
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

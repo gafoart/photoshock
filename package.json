@@ -1,0 +1,19 @@
+{
+  "name": "photoshock",
+  "version": "1.0.0",
+  "description": "Photoshock — paint on Gaussian splats and export as PLY or SOG",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@playcanvas/splat-transform": "^1.8.0",
+    "playcanvas": "^2.16.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0",
+    "vite-plugin-pwa": "^1.2.0"
+  }
+}
