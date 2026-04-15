@@ -4,6 +4,17 @@
 
 [build.environment]
   NODE_VERSION = "20"
+  # PostHog (Vite inlines VITE_* at build time): set these in the Netlify UI or CLI — do not commit real tokens here.
+  # UI: Site configuration → Environment variables → Add variable
+  #   VITE_POSTHOG_KEY   = Project API key from https://us.posthog.com/project/settings (or EU project)
+  #   VITE_POSTHOG_HOST  = https://us.i.posthog.com  (EU: https://eu.i.posthog.com)
+  # CLI (from repo root, linked site): netlify env:set VITE_POSTHOG_KEY "phc_xxxxxxxx"
+  #                                    netlify env:set VITE_POSTHOG_HOST "https://us.i.posthog.com"
+  # Supabase (Vite inlines VITE_* at build time): add in Netlify UI or:
+  #   npx netlify env:set VITE_SUPABASE_URL "https://eqmikgxhrwwnrzcdwcfq.supabase.co"
+  #   npx netlify env:set VITE_SUPABASE_ANON_KEY "eyJhbG..."
+  # Google OAuth: enable provider in Supabase; Google Cloud redirect URI:
+  #   https://eqmikgxhrwwnrzcdwcfq.supabase.co/auth/v1/callback
 
 # SPA: only rewrite when no static file matches (default force = false)
 [[redirects]]

@@ -103,7 +103,27 @@
       </div>
 
       <div class="menu-bar-spacer" aria-hidden="true"></div>
+      <div class="menu-group menu-auth-bar hidden" id="auth-bar" aria-label="Account">
+        <div id="auth-bar-signed-out">
+          <button type="button" class="menu-btn export-btn" id="auth-bar-sign-in" title="Sign in to load splats">
+            <span data-tabler-icon="login" data-tabler-size="15"></span>
+            Sign in
+          </button>
+        </div>
+        <div id="auth-bar-signed-in" class="hidden">
+          <span class="menu-auth-email" id="auth-bar-email" title=""></span>
+          <button type="button" class="menu-btn" id="auth-bar-sign-out" title="Sign out">
+            <span data-tabler-icon="logout" data-tabler-size="14"></span>
+            Sign out
+          </button>
+        </div>
+      </div>
+      <div class="menu-sep menu-auth-sep hidden" id="auth-bar-sep" aria-hidden="true"></div>
       <div class="menu-group menu-group-end">
+        <button type="button" class="menu-btn" id="shortcuts-open-btn" title="Keyboard shortcuts" aria-label="Keyboard shortcuts">
+          <span data-tabler-icon="keyboard" data-tabler-size="15"></span>
+          Shortcuts
+        </button>
         <button type="button" class="menu-btn export-btn" id="support-open-btn" title="Open Gumroad — name a fair price">
           <span data-tabler-icon="hand-love-you" data-tabler-size="15"></span>
           Support the project
@@ -123,8 +143,8 @@
         </label>
         <div class="opt-group">
           <label class="opt-label" for="selection-depth-range">Depth</label>
-          <input type="range" id="selection-depth-range" min="0" max="100" value="50" title="Low = only nearest splats (same screen region) · High = also select deeper splats stacked behind along the view" />
-          <span id="selection-depth-label" class="opt-num sel-depth-val">50</span>
+          <input type="range" id="selection-depth-range" min="0" max="100" value="80" title="Low = only nearest splats (same screen region) · High = also select deeper splats stacked behind along the view" />
+          <span id="selection-depth-label" class="opt-num sel-depth-val">80</span>
         </div>
         <div class="opt-sep"></div>
         <div class="opt-group">
@@ -220,7 +240,7 @@
           <input type="number" id="eraser-spacing-num" class="opt-num" min="0.05" max="1" step="0.05" value="0.2" />
         </div>
         <div class="opt-group">
-          <label class="opt-label" title="Thickness along the view ray through the brush. 0 = spherical erase (default).">Depth</label>
+          <label class="opt-label" for="eraser-depth" title="Thickness along the view ray through the brush. 0 = spherical erase (default).">Brush Depth</label>
           <input type="range" id="eraser-depth" min="0" max="1" step="0.005" value="0" />
           <input type="number" id="eraser-depth-num" class="opt-num" min="0" max="1" step="0.005" value="0" />
         </div>
@@ -466,7 +486,7 @@
         <div class="panel-sep"></div>
 
         <div class="tool-group">
-          <button class="tool-btn" id="tool-box-select" data-tool="boxSelect" title="Box Select (O)">
+          <button class="tool-btn" id="tool-box-select" data-tool="boxSelect" title="Box Select (R)">
             <span data-tabler-icon="selection-rectangle" data-tabler-size="18"></span>
           </button>
           <button class="tool-btn" id="tool-lasso-select" data-tool="lassoSelect" title="Lasso Select (L)">
@@ -475,7 +495,7 @@
           <button class="tool-btn" id="tool-vector-select" data-tool="vectorSelect" title="Polygon Select (Y)">
             <span data-tabler-icon="polygon" data-tabler-size="18"></span>
           </button>
-          <button class="tool-btn" id="tool-brush-select" data-tool="brushSelect" title="Brush Select (R)">
+          <button class="tool-btn" id="tool-brush-select" data-tool="brushSelect" title="Brush Select (O)">
             <span data-tabler-icon="selection-brush" data-tabler-size="18"></span>
           </button>
           <button class="tool-btn" id="tool-color-select" data-tool="colorSelect" title="Color Select (C)">
@@ -490,7 +510,7 @@
         <div class="panel-sep"></div>
 
         <div class="tool-group">
-          <button class="tool-btn" id="tool-generate-splats" data-tool="generateSplats" title="Generate Splats (G)">
+          <button class="tool-btn" id="tool-generate-splats" data-tool="generateSplats" title="Generate Splats (U)">
             <span data-tabler-icon="braille" data-tabler-size="18"></span>
           </button>
           <button class="tool-btn" id="tool-shape-layer" data-tool="shapeLayer" title="Shape layer (N) — cube, sphere, etc. Options in top bar">
@@ -526,6 +546,9 @@
               Load a <strong>.ply</strong>, <strong>.compressed.ply</strong>, or <strong>.sog</strong> from the menu, or <strong>drag and drop</strong> a file onto this view.
               Use <strong>Import as layer</strong> to add splats without replacing the whole scene.
             </p>
+            <p id="empty-scene-auth-hint" class="empty-scene-placeholder__auth-hint hidden">
+              Sign in (top right) to load or import splat files.
+            </p>
             <div class="empty-scene-placeholder__actions">
               <button type="button" class="menu-btn export-btn" id="empty-scene-load-btn">
                 <span data-tabler-icon="file-import" data-tabler-size="14"></span>
@@ -555,6 +578,16 @@
         <div id="instructions">
           <p></p>
         </div>
+        <!-- Model import / load progress (network + processing) -->
+        <div id="load-progress-overlay" class="load-progress-overlay hidden" aria-live="polite" aria-busy="false" aria-label="Model load progress">
+          <div class="load-progress-overlay__card">
+            <p id="load-progress-title" class="load-progress-overlay__title">Loading…</p>
+            <div id="load-progress-bar" class="load-progress-overlay__bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div id="load-progress-fill" class="load-progress-overlay__fill"></div>
+            </div>
+            <p id="load-progress-detail" class="load-progress-overlay__detail"></p>
+          </div>
+        </div>
       </div>
 
       <!-- Floating gizmo toolbar (positioned to the left of the right panel) -->
@@ -571,10 +604,10 @@
           </button>
         </div>
         <div class="floating-gizmo-sep"></div>
-        <button type="button" class="floating-gizmo-btn" id="toggle-layer-gizmo-btn" title="Show or hide the 3D gizmo in the viewport" aria-label="Toggle gizmo">
+        <button type="button" class="floating-gizmo-btn" id="toggle-layer-gizmo-btn" title="Show or hide the 3D gizmo in the viewport (G)" aria-label="Toggle gizmo">
           <span data-tabler-icon="gizmo" data-tabler-size="16"></span>
         </button>
-        <button type="button" class="floating-gizmo-btn" id="toggle-viewport-grid-btn" title="XZ grid: 1-unit subdivisions, 10-unit majors, red X / blue Z, fades with distance (plane through camera target)" aria-label="Toggle grid">
+        <button type="button" class="floating-gizmo-btn" id="toggle-viewport-grid-btn" title="XZ floor grid (SuperSplat-style): 10 cm · 1 m · 10 m, red X / blue Z, fades with distance — plane through camera target" aria-label="Toggle grid">
           <span data-tabler-icon="grid-3x3" data-tabler-size="16"></span>
         </button>
         <div class="floating-gizmo-sep"></div>
@@ -643,6 +676,7 @@
         <div class="right-panel-tabstrip" role="tablist" aria-label="Side panel sections">
           <button type="button" class="right-panel-tab active" role="tab" id="right-tab-btn-1" data-right-tab="1" aria-selected="true" aria-controls="right-tab-panel-1" tabindex="0">Scene</button>
           <button type="button" class="right-panel-tab" role="tab" id="right-tab-btn-2" data-right-tab="2" aria-selected="false" aria-controls="right-tab-panel-2" tabindex="-1">Color</button>
+          <button type="button" class="right-panel-tab" role="tab" id="right-tab-btn-3" data-right-tab="3" aria-selected="false" aria-controls="right-tab-panel-3" tabindex="-1">Swatches</button>
         </div>
 
         <div id="right-tab-panel-1" class="right-tab-panel" role="tabpanel" aria-labelledby="right-tab-btn-1">
@@ -695,18 +729,6 @@
             <input type="file" id="import-sel-file" accept=".json" style="display:none" />
             <div id="saved-selections-list" class="saved-sel-list"></div>
           </div>
-          <div class="panel-section" id="swatches-section">
-            <div class="panel-section-title">Swatches</div>
-            <div class="opt-group opt-group-row">
-              <button class="opt-btn" id="add-swatch-btn" title="Save current paint color" aria-label="Add swatch">
-                <span data-tabler-icon="plus" data-tabler-size="14"></span>
-              </button>
-              <button class="opt-btn" id="pick-swatch-splat-btn" title="Pick splat color — click a splat on the canvas to add a swatch" aria-label="Pick color from splat">
-                <span data-tabler-icon="color-picker" data-tabler-size="14"></span>
-              </button>
-            </div>
-            <div id="swatches-list" class="swatches-list"></div>
-          </div>
         </div>
 
         <div id="right-tab-panel-2" class="right-tab-panel hidden" role="tabpanel" aria-labelledby="right-tab-btn-2" hidden>
@@ -714,6 +736,9 @@
           <div class="panel-section-title layers-title-row">
             Color grade
             <span class="layers-title-actions">
+              <button class="layers-title-btn" type="button" id="cg-toggle-visibility-btn" title="Hide color grade edits for the active layer" aria-label="Hide color grade edits">
+                <span data-tabler-icon="eye" data-tabler-size="14"></span>
+              </button>
               <button class="layers-title-btn" type="button" id="cg-reset-btn" title="Reset all controls for the active layer" aria-label="Reset grade">
                 <span data-tabler-icon="reload" data-tabler-size="14"></span>
               </button>
@@ -724,6 +749,37 @@
           </div>
           <div class="opt-group" style="flex-wrap:wrap;gap:8px">
             <label class="radio-label"><input type="checkbox" id="cg-grade-selected-only" /> Grade selection only</label>
+          </div>
+
+          <div class="panel-subtitle">Tone map &amp; LUT</div>
+          <div class="opt-group">
+            <label class="opt-label" for="cg-tone-mode">Tone mapping</label>
+            <select id="cg-tone-mode">
+              <option value="0">Linear</option>
+              <option value="1">Neutral</option>
+              <option value="2">ACES</option>
+              <option value="3">ACES2</option>
+              <option value="4">Filmic</option>
+              <option value="5">Hejl</option>
+            </select>
+          </div>
+          <div class="opt-group">
+            <label class="opt-label">LUT (.cube)</label>
+            <div class="slider-num-row" style="flex-wrap:wrap;gap:6px;align-items:center">
+              <span id="cg-lut-name" class="opt-hint" style="flex:1;min-width:72px">—</span>
+              <button type="button" class="opt-btn" id="cg-lut-load-btn" title="Load a 3D LUT">
+                <span data-tabler-icon="file-import" data-tabler-size="13"></span> Load
+              </button>
+              <button type="button" class="opt-btn" id="cg-lut-clear-btn" title="Remove LUT">Clear</button>
+            </div>
+            <input type="file" id="cg-lut-file" accept=".cube,.CUBE" style="display:none" />
+          </div>
+          <div class="opt-group">
+            <label class="opt-label">LUT mix</label>
+            <div class="slider-num-row">
+              <input type="range" id="cg-lut-mix" class="cg-slider cg-slider-static" min="0" max="1" step="0.02" value="1" />
+              <input type="number" id="cg-lut-mix-num" class="opt-num" min="0" max="1" step="0.02" value="1" />
+            </div>
           </div>
 
           <div class="panel-subtitle">Exposure &amp; levels</div>
@@ -780,30 +836,103 @@
           </div>
 
           <div class="panel-subtitle">Split tone (shadows / mids / highlights)</div>
-          <p class="opt-hint" style="margin:0;font-size:10px">Pick a color and strength per tonal range (neutral gray = no cast).</p>
-          <div class="opt-group cg-wheel-row">
-            <label class="opt-label">Shadows</label>
-            <div class="cg-wheel-line">
-              <input type="color" id="cg-wheel-sh" value="#808080" title="Shadow tint" />
-              <input type="range" id="cg-wheel-sh-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Amount" />
-              <input type="number" id="cg-wheel-sh-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
-            </div>
-          </div>
-          <div class="opt-group cg-wheel-row">
-            <label class="opt-label">Mids</label>
-            <div class="cg-wheel-line">
-              <input type="color" id="cg-wheel-md" value="#808080" title="Midtone tint" />
-              <input type="range" id="cg-wheel-md-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Amount" />
-              <input type="number" id="cg-wheel-md-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
-            </div>
-          </div>
-          <div class="opt-group cg-wheel-row">
-            <label class="opt-label">Highlights</label>
-            <div class="cg-wheel-line">
-              <input type="color" id="cg-wheel-hi" value="#808080" title="Highlight tint" />
-              <input type="range" id="cg-wheel-hi-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Amount" />
-              <input type="number" id="cg-wheel-hi-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
-            </div>
+          <p class="opt-hint" style="margin:0;font-size:10px">Hue/Saturation on the wheel, luminance on the bar, plus HSL and HEX controls.</p>
+          <div class="cg-split-tone-grid">
+            <section class="cg-split-tone-card" aria-label="Shadow split tone">
+              <div class="cg-split-tone-head">
+                <span>Shadows</span>
+                <button type="button" class="cg-wheel-reset-btn" id="cg-wheel-sh-reset-btn" title="Reset shadow split tone" aria-label="Reset shadow split tone">
+                  <span data-tabler-icon="reload" data-tabler-size="14"></span>
+                </button>
+              </div>
+              <input type="color" id="cg-wheel-sh" class="cg-wheel-hidden-color" value="#808080" title="Shadow tint color" />
+              <canvas id="cg-wheel-sh-canvas" class="cg-split-wheel" width="164" height="164" role="img" aria-label="Shadow hue and saturation wheel"></canvas>
+              <div class="slider-num-row cg-split-lum-row">
+                <label class="opt-label" for="cg-wheel-sh-lum">L</label>
+                <input type="range" id="cg-wheel-sh-lum" class="cg-slider cg-slider-dynamic" min="0" max="100" step="1" value="50" title="Shadow luminance" />
+                <input type="number" id="cg-wheel-sh-lum-num" class="opt-num" min="0" max="100" step="1" value="50" />
+              </div>
+              <div class="slider-num-row cg-split-strength-row">
+                <label class="opt-label" for="cg-wheel-sh-amt">Strength</label>
+                <input type="range" id="cg-wheel-sh-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Shadow tint strength" />
+                <input type="number" id="cg-wheel-sh-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
+              </div>
+              <div class="cg-split-hsl-row">
+                <label>H <input type="number" id="cg-wheel-sh-h" class="opt-num" min="0" max="360" step="1" value="0" /></label>
+                <label>S <input type="number" id="cg-wheel-sh-s" class="opt-num" min="0" max="100" step="1" value="0" /></label>
+                <label>L <input type="number" id="cg-wheel-sh-l" class="opt-num" min="0" max="100" step="1" value="50" /></label>
+              </div>
+              <div class="cg-split-hex-row">
+                <input type="text" id="cg-wheel-sh-hex" class="brush-hex-input" maxlength="9" spellcheck="false" autocomplete="off" value="#808080" title="Shadow tint hex" />
+                <button type="button" class="cg-wheel-picker-btn" id="cg-wheel-sh-pick-btn" title="Pick shadow tint from viewport" aria-label="Pick shadow tint from viewport">
+                  <span data-tabler-icon="color-picker" data-tabler-size="14"></span>
+                </button>
+              </div>
+            </section>
+
+            <section class="cg-split-tone-card" aria-label="Midtone split tone">
+              <div class="cg-split-tone-head">
+                <span>Midtones</span>
+                <button type="button" class="cg-wheel-reset-btn" id="cg-wheel-md-reset-btn" title="Reset midtone split tone" aria-label="Reset midtone split tone">
+                  <span data-tabler-icon="reload" data-tabler-size="14"></span>
+                </button>
+              </div>
+              <input type="color" id="cg-wheel-md" class="cg-wheel-hidden-color" value="#808080" title="Midtone tint color" />
+              <canvas id="cg-wheel-md-canvas" class="cg-split-wheel" width="164" height="164" role="img" aria-label="Midtone hue and saturation wheel"></canvas>
+              <div class="slider-num-row cg-split-lum-row">
+                <label class="opt-label" for="cg-wheel-md-lum">L</label>
+                <input type="range" id="cg-wheel-md-lum" class="cg-slider cg-slider-dynamic" min="0" max="100" step="1" value="50" title="Midtone luminance" />
+                <input type="number" id="cg-wheel-md-lum-num" class="opt-num" min="0" max="100" step="1" value="50" />
+              </div>
+              <div class="slider-num-row cg-split-strength-row">
+                <label class="opt-label" for="cg-wheel-md-amt">Strength</label>
+                <input type="range" id="cg-wheel-md-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Midtone tint strength" />
+                <input type="number" id="cg-wheel-md-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
+              </div>
+              <div class="cg-split-hsl-row">
+                <label>H <input type="number" id="cg-wheel-md-h" class="opt-num" min="0" max="360" step="1" value="0" /></label>
+                <label>S <input type="number" id="cg-wheel-md-s" class="opt-num" min="0" max="100" step="1" value="0" /></label>
+                <label>L <input type="number" id="cg-wheel-md-l" class="opt-num" min="0" max="100" step="1" value="50" /></label>
+              </div>
+              <div class="cg-split-hex-row">
+                <input type="text" id="cg-wheel-md-hex" class="brush-hex-input" maxlength="9" spellcheck="false" autocomplete="off" value="#808080" title="Midtone tint hex" />
+                <button type="button" class="cg-wheel-picker-btn" id="cg-wheel-md-pick-btn" title="Pick midtone tint from viewport" aria-label="Pick midtone tint from viewport">
+                  <span data-tabler-icon="color-picker" data-tabler-size="14"></span>
+                </button>
+              </div>
+            </section>
+
+            <section class="cg-split-tone-card" aria-label="Highlight split tone">
+              <div class="cg-split-tone-head">
+                <span>Highlights</span>
+                <button type="button" class="cg-wheel-reset-btn" id="cg-wheel-hi-reset-btn" title="Reset highlight split tone" aria-label="Reset highlight split tone">
+                  <span data-tabler-icon="reload" data-tabler-size="14"></span>
+                </button>
+              </div>
+              <input type="color" id="cg-wheel-hi" class="cg-wheel-hidden-color" value="#808080" title="Highlight tint color" />
+              <canvas id="cg-wheel-hi-canvas" class="cg-split-wheel" width="164" height="164" role="img" aria-label="Highlight hue and saturation wheel"></canvas>
+              <div class="slider-num-row cg-split-lum-row">
+                <label class="opt-label" for="cg-wheel-hi-lum">L</label>
+                <input type="range" id="cg-wheel-hi-lum" class="cg-slider cg-slider-dynamic" min="0" max="100" step="1" value="50" title="Highlight luminance" />
+                <input type="number" id="cg-wheel-hi-lum-num" class="opt-num" min="0" max="100" step="1" value="50" />
+              </div>
+              <div class="slider-num-row cg-split-strength-row">
+                <label class="opt-label" for="cg-wheel-hi-amt">Strength</label>
+                <input type="range" id="cg-wheel-hi-amt" class="cg-slider cg-slider-dynamic" min="0" max="1" step="0.02" value="0" title="Highlight tint strength" />
+                <input type="number" id="cg-wheel-hi-amt-num" class="opt-num" min="0" max="1" step="0.02" value="0" />
+              </div>
+              <div class="cg-split-hsl-row">
+                <label>H <input type="number" id="cg-wheel-hi-h" class="opt-num" min="0" max="360" step="1" value="0" /></label>
+                <label>S <input type="number" id="cg-wheel-hi-s" class="opt-num" min="0" max="100" step="1" value="0" /></label>
+                <label>L <input type="number" id="cg-wheel-hi-l" class="opt-num" min="0" max="100" step="1" value="50" /></label>
+              </div>
+              <div class="cg-split-hex-row">
+                <input type="text" id="cg-wheel-hi-hex" class="brush-hex-input" maxlength="9" spellcheck="false" autocomplete="off" value="#808080" title="Highlight tint hex" />
+                <button type="button" class="cg-wheel-picker-btn" id="cg-wheel-hi-pick-btn" title="Pick highlight tint from viewport" aria-label="Pick highlight tint from viewport">
+                  <span data-tabler-icon="color-picker" data-tabler-size="14"></span>
+                </button>
+              </div>
+            </section>
           </div>
 
           <div class="panel-subtitle">Hue zones (8 bins)</div>
@@ -821,9 +950,148 @@
           </div>
         </div>
         </div><!-- #right-tab-panel-2 -->
+
+        <div id="right-tab-panel-3" class="right-tab-panel hidden" role="tabpanel" aria-labelledby="right-tab-btn-3" hidden>
+          <div class="swatches-panel-frame">
+            <div class="panel-section" id="swatches-section">
+              <div class="panel-section-title">Swatches</div>
+              <div class="opt-group opt-group-row">
+                <button class="opt-btn" id="add-swatch-btn" title="Save current paint color" aria-label="Add swatch">
+                  <span data-tabler-icon="plus" data-tabler-size="14"></span>
+                </button>
+                <button class="opt-btn" id="pick-swatch-splat-btn" title="Pick splat color — click a splat on the canvas to add a swatch" aria-label="Pick color from splat">
+                  <span data-tabler-icon="color-picker" data-tabler-size="14"></span>
+                </button>
+              </div>
+              <div id="swatches-list" class="swatches-list"></div>
+            </div>
+          </div>
+        </div><!-- #right-tab-panel-3 -->
         </div><!-- #right-panel-inner -->
       </div>
 
+    </div>
+
+    <!-- Supabase auth -->
+    <div id="auth-modal" class="auth-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
+      <div class="auth-modal-backdrop" id="auth-modal-backdrop" tabindex="-1"></div>
+      <div class="auth-modal-panel">
+        <div class="auth-modal-header">
+          <h2 id="auth-modal-title" class="auth-modal-title">Sign in</h2>
+          <button type="button" class="auth-modal-close" id="auth-modal-close" aria-label="Close">×</button>
+        </div>
+        <div class="auth-modal-body">
+          <p id="auth-modal-hint" class="auth-modal-hint"></p>
+          <div id="auth-confirm-email-banner" class="auth-confirm-email-banner hidden" role="status" aria-live="polite">
+            <p class="auth-confirm-email-banner__title">Check your email</p>
+            <p class="auth-confirm-email-banner__text">
+              We sent a confirmation link to <strong id="auth-confirm-email-address"></strong>.
+              After you confirm, sign in with your password below.
+            </p>
+          </div>
+          <button type="button" class="auth-oauth-google" id="auth-google-btn" title="Sign in with Google">
+            <span data-tabler-icon="brand-google" data-tabler-size="18"></span>
+            Continue with Google
+          </button>
+          <p class="auth-divider" aria-hidden="true"><span>or</span></p>
+          <form id="auth-form" class="auth-form" autocomplete="on">
+            <label class="auth-field">
+              <span class="auth-label">Email</span>
+              <input type="email" id="auth-email" class="auth-input" name="email" autocomplete="email" required />
+            </label>
+            <label class="auth-field">
+              <span class="auth-label">Password</span>
+              <input type="password" id="auth-password" class="auth-input" name="password" autocomplete="current-password" required />
+            </label>
+            <p id="auth-modal-error" class="auth-modal-error" role="alert" hidden></p>
+            <div class="auth-modal-footer">
+              <button type="button" class="menu-btn" id="auth-mode-toggle">Need an account? Create one</button>
+              <button type="submit" class="menu-btn export-btn" id="auth-modal-submit">Sign in</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Keyboard shortcuts reference -->
+    <div id="shortcuts-modal" class="snapshot-modal shortcuts-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="shortcuts-modal-title">
+      <div class="snapshot-modal-backdrop" id="shortcuts-modal-backdrop" tabindex="-1"></div>
+      <div class="snapshot-modal-panel shortcuts-modal-panel">
+        <div class="snapshot-modal-header">
+          <h2 id="shortcuts-modal-title" class="snapshot-modal-title">Keyboard shortcuts</h2>
+          <button type="button" class="snapshot-modal-close" id="shortcuts-modal-close" aria-label="Close">×</button>
+        </div>
+        <div class="snapshot-modal-body shortcuts-modal-body">
+          <p class="snapshot-modal-hint">These work when the viewport or canvas is focused, not while typing in a field. <strong>⌘</strong> is Mac; use <strong>Ctrl</strong> on Windows/Linux.</p>
+
+          <h3 class="shortcuts-modal-subhead">Tools</h3>
+          <table class="shortcuts-modal-table" aria-label="Tool shortcuts">
+            <tbody>
+              <tr><td><kbd class="shortcuts-kbd">V</kbd></td><td>Cursor</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">B</kbd></td><td>Brush</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">X</kbd></td><td>Eraser</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">Z</kbd></td><td>Reset brush</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">K</kbd></td><td>Paint bucket</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">R</kbd></td><td>Box select (rectangle)</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">O</kbd></td><td>Brush select</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">L</kbd></td><td>Lasso select</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">Y</kbd></td><td>Polygon (vector) select</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">C</kbd></td><td>Color select</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">S</kbd></td><td>Splat select</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">U</kbd></td><td>Generate splats</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">N</kbd></td><td>Shape layer</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">M</kbd></td><td>Toggle splat mode (overlay)</td></tr>
+            </tbody>
+          </table>
+
+          <h3 class="shortcuts-modal-subhead">Selection (with a selection tool active)</h3>
+          <table class="shortcuts-modal-table" aria-label="Selection shortcuts">
+            <tbody>
+              <tr><td><kbd class="shortcuts-kbd">8</kbd></td><td>New selection (replace)</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">9</kbd></td><td>Add to selection</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">0</kbd></td><td>Subtract from selection</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">H</kbd></td><td>Toggle selection highlight</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">⇧</kbd> <kbd class="shortcuts-kbd">I</kbd></td><td>Invert selection</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">Enter</kbd></td><td>Close polygon (vector select, 3+ points)</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">Backspace</kbd></td><td>Remove last polygon vertex (vector select)</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">Delete</kbd> / <kbd class="shortcuts-kbd">Backspace</kbd></td><td>Delete selected splats, or clear selection</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">Esc</kbd></td><td>Clear selection / cancel partial shape; then cursor in some tools</td></tr>
+            </tbody>
+          </table>
+
+          <h3 class="shortcuts-modal-subhead">Camera &amp; gizmo</h3>
+          <table class="shortcuts-modal-table" aria-label="Camera shortcuts">
+            <tbody>
+              <tr><td><kbd class="shortcuts-kbd">&#96;</kbd></td><td>Toggle orbit / fly camera</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">W</kbd> <kbd class="shortcuts-kbd">A</kbd> <kbd class="shortcuts-kbd">S</kbd> <kbd class="shortcuts-kbd">D</kbd></td><td>Move (orbit: pan target; fly: move)</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">Q</kbd> / <kbd class="shortcuts-kbd">E</kbd></td><td>Up / down</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">1</kbd> <kbd class="shortcuts-kbd">2</kbd> <kbd class="shortcuts-kbd">3</kbd></td><td>Gizmo: move / rotate / scale</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">G</kbd></td><td>Show / hide layer transform gizmo</td></tr>
+              <tr><td colspan="2" class="shortcuts-modal-note">Double-click on the model (cursor tool) focuses the camera on that point.</td></tr>
+            </tbody>
+          </table>
+
+          <h3 class="shortcuts-modal-subhead">Edit &amp; layers</h3>
+          <table class="shortcuts-modal-table" aria-label="Edit shortcuts">
+            <tbody>
+              <tr><td><kbd class="shortcuts-kbd">⌘</kbd> <kbd class="shortcuts-kbd">Z</kbd></td><td>Undo</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">⌘</kbd> <kbd class="shortcuts-kbd">Y</kbd></td><td>Redo</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">⌘</kbd> <kbd class="shortcuts-kbd">⇧</kbd> <kbd class="shortcuts-kbd">Z</kbd></td><td>Redo (alternate)</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">⌘</kbd> <kbd class="shortcuts-kbd">D</kbd></td><td>Duplicate selected user layer</td></tr>
+            </tbody>
+          </table>
+
+          <h3 class="shortcuts-modal-subhead">Brush size (brush, eraser, or reset)</h3>
+          <table class="shortcuts-modal-table" aria-label="Brush size shortcuts">
+            <tbody>
+              <tr><td><kbd class="shortcuts-kbd">↑</kbd> / <kbd class="shortcuts-kbd">↓</kbd></td><td>Increase / decrease brush size</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="snapshot-modal-footer">
+          <button type="button" class="menu-btn" id="shortcuts-modal-close-btn">Close</button>
+        </div>
+      </div>
     </div>
 
     <!-- Gumroad “fair price” embed (startup; hidden after contribution or snooze) -->
@@ -870,6 +1138,10 @@
         </div>
         <div class="snapshot-modal-body">
           <p class="snapshot-modal-hint">Renders the current view at the size you choose. Opaque uses the menu BG color; transparent PNG uses alpha behind the splats.</p>
+          <div class="snapshot-modal-row">
+            <label class="snapshot-modal-label" for="snapshot-filename">File name</label>
+            <input type="text" id="snapshot-filename" class="snapshot-modal-input snapshot-modal-filename-input" autocomplete="off" spellcheck="false" title="Download file name without extension" aria-label="Export file name" />
+          </div>
           <div class="snapshot-modal-row snapshot-modal-row-dim">
             <span class="snapshot-modal-label">Size (px)</span>
             <div class="snapshot-dim-pair">

@@ -4,11 +4,16 @@ import { registerSW } from 'virtual:pwa-register';
 import { hydrateTablerIcons, warmTablerIconCache, tablerIconHtmlSync } from './tabler-icons.js';
 import { initCgGradeSliderUi, refreshCgGradeSliderTracks } from './cg-grade-slider-ui.js';
 import { initSupportModal, isSupportModalOpen, closeSupportModalSnoozed } from './support-modal.js';
+import { initPosthog, getPosthog } from './posthog-client.js';
+import { initSupabaseAuth, isSupabaseAuthEnabled, getCachedSession, getSupabase } from './supabase-client.js';
+import { initAuthModal, openAuthModal, updateAuthBar } from './auth-modal.js';
+import { parseCubeLut, sampleCubeTrilinear, lutFloatRgbToRgba8 } from './cube-lut.js';
 
 registerSW({ immediate: true });
+void initPosthog();
 
 await warmTablerIconCache([
-    'file-import', 'stack-push', 'arrow-back-up', 'arrow-forward-up', 'color-picker', 'hand-love-you',
+    'file-import', 'stack-push', 'arrow-back-up', 'arrow-forward-up', 'color-picker', 'hand-love-you', 'keyboard',
     'location', 'brush', 'eraser', 'restore', 'bucket-droplet', 'grid-3x3', 'selection-rectangle', 'lasso', 'polygon', 'selection-brush', 'color-selection', 'braille',
     'square-rounded', 'square-rounded-plus', 'square-rounded-minus',
     'cube-3d-sphere', 'grid-dots', 'square-off', 'circle-dot', 'circle',
@@ -16,10 +21,12 @@ await warmTablerIconCache([
     'square-plus', 'arrow-merge', 'arrows-move', 'rotate', 'resize', 'gizmo',
     'select-all', 'arrows-left-right', 'blur-off', 'focus-centered', 'grip-vertical',
     'file-export', 'camera', 'plus', 'camera-rotate',
-    'cube-plus', 'reload', 'circle-check',
+    'cube-plus', 'reload', 'circle-check', 'login', 'logout', 'brand-google',
 ]);
 await warmTablerIconCache(['tilt-shift'], 'filled');
 await hydrateTablerIcons(document.getElementById('app'));
+initAuthModal();
+void initSupabaseAuth((session) => updateAuthBar(session));
 initSupportModal();
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -30,6 +37,48 @@ const smoothstepJS = (e0, e1, x) => {
     const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
     return t * t * (3 - 2 * t);
 };
+
+/** Plain number or simple arithmetic (+ − * / % ** parentheses). Whitelist only — no identifiers. */
+const parseNumericOrExpr = (raw) => {
+    const s = String(raw ?? '').trim();
+    if (s === '' || s === '-' || s === '.' || s === '-.') return null;
+    const compact = s.replace(/\s+/g, '');
+    if (/^[\d+\-*/().%]+$/.test(compact)) {
+        try {
+            const v = new Function(`"use strict"; return (${compact})`)();
+            if (typeof v === 'number' && Number.isFinite(v)) return v;
+        } catch (_) { /* incomplete or invalid */ }
+    }
+    const v = parseFloat(s);
+    return Number.isFinite(v) ? v : null;
+};
+
+const numericFieldValueOrNull = (raw) => {
+    const ev = parseNumericOrExpr(raw);
+    if (ev != null && Number.isFinite(ev)) return ev;
+    const pf = parseFloat(String(raw ?? '').trim());
+    return Number.isFinite(pf) ? pf : null;
+};
+
+/** Let users type expressions (e.g. 0.4+1) in fields that were type="number". */
+const enableNumericExprTyping = (el) => {
+    if (!(el instanceof HTMLInputElement)) return;
+    if (el.type === 'number') {
+        el.type = 'text';
+        el.setAttribute('inputmode', 'decimal');
+        el.setAttribute('spellcheck', 'false');
+    }
+};
+
+document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const t = e.target;
+    if (!(t instanceof HTMLInputElement)) return;
+    const ty = (t.type || '').toLowerCase();
+    if (ty === 'button' || ty === 'submit' || ty === 'checkbox' || ty === 'radio' || ty === 'file' || ty === 'range' || ty === 'color' || ty === 'hidden' || ty === 'reset') return;
+    e.preventDefault();
+    t.blur();
+}, true);
 
 // Plateau falloff for paint (matches GPU): inner region = full strength so ALPHABLEND
 // doesn’t strand splats at low alpha (mottled / lighter random splats).
@@ -315,6 +364,7 @@ uniform vec3 uGradeWheelSh;
 uniform vec3 uGradeWheelMd;
 uniform vec3 uGradeWheelHi;
 uniform vec4 uGradeCross;       // luminance split thresholds for shadow / mid / highlight
+uniform int  uGradeEnabled;      // 1 = enabled, 0 = preview hidden
 uniform int  uGradeSelectedOnly; // 1 = apply grade only to splats in customSelection
 uniform vec3 uGradeSec0;
 uniform vec3 uGradeSec1;
@@ -325,10 +375,99 @@ uniform vec3 uGradeSec5;
 uniform vec3 uGradeSec6;
 uniform vec3 uGradeSec7;
 uniform float uLayerOpacity;    // 0–1, multiplies final splat alpha (layer / base display)
+uniform int  uGradeToneMode;      // 0 Linear, 1 Neutral, 2 ACES, 3 ACES2, 4 Filmic, 5 Hejl
+uniform vec4 uGradeLutMeta;     // x=1 enabled, y=N, z=mixin, w unused
+uniform vec3 uGradeLutDomainMin;
+uniform vec3 uGradeLutDomainInv;
+uniform sampler2D uGradeLutTex;
 
 void modifySplatCenter(inout vec3 center) {}
 void modifySplatRotationScale(vec3 oc, vec3 mc, inout vec4 rotation, inout vec3 scale) {
     // Splat view overlay (cyan center dots + ring strokes) is done in gsplatPS patch.
+}
+
+vec3 sp_uch(vec3 x) {
+    const float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+vec3 sp_neutral_tm(vec3 color) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= vec3(offset);
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+    float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / max(peak, 1e-6);
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, vec3(newPeak), g);
+}
+vec3 sp_rrt_odt_fit(vec3 v) {
+    vec3 a = v * (v + 0.0245786) - 0.000090537;
+    vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    return a / b;
+}
+vec3 sp_aces2_tm(vec3 color) {
+    const mat3 inMat = mat3(
+        0.59719, 0.07600, 0.02840,
+        0.35458, 0.90834, 0.13383,
+        0.04823, 0.01566, 0.83777
+    );
+    const mat3 outMat = mat3(
+         1.60475, -0.10208, -0.00327,
+        -0.53108,  1.10813, -0.07276,
+        -0.07367, -0.00605,  1.07602
+    );
+    vec3 v = inMat * color;
+    v = sp_rrt_odt_fit(v);
+    return outMat * v;
+}
+vec3 sp_hejl_tm(vec3 x) {
+    vec3 c = max(vec3(0.0), x - vec3(0.004));
+    return (c * (6.2 * c + 0.5)) / (c * (6.2 * c + 1.7) + 0.06);
+}
+vec3 sp_tone_map(vec3 x, int mode) {
+    if (mode <= 0) return clamp(x, 0.0, 1.0); // Linear
+    if (mode == 1) return clamp(sp_neutral_tm(x), 0.0, 1.0);
+    if (mode == 2) return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); // ACES (Narkowicz)
+    if (mode == 3) return clamp(sp_aces2_tm(x), 0.0, 1.0);
+    if (mode == 4) return clamp(sp_uch(x) / sp_uch(vec3(11.2)), 0.0, 1.0); // Filmic (Uncharted 2)
+    return clamp(sp_hejl_tm(x), 0.0, 1.0);
+}
+vec3 sp_lut_fetch(ivec3 ijk, int Ni) {
+    int xf = ijk.x + ijk.y * Ni;
+    int yf = ijk.z;
+    return texelFetch(uGradeLutTex, ivec2(xf, yf), 0).rgb;
+}
+vec3 sp_lut_apply(vec3 c) {
+    if (uGradeLutMeta.x <= 0.5) return c;
+    float N = uGradeLutMeta.y;
+    float NiF = N - 1.0;
+    int Ni = int(N + 0.5);
+    vec3 p = clamp((c - uGradeLutDomainMin) * uGradeLutDomainInv, 0.0, 1.0) * NiF;
+    vec3 p0f = floor(p);
+    vec3 p1f = min(p0f + vec3(1.0), vec3(N - 1.0));
+    vec3 f = p - p0f;
+    ivec3 i0 = ivec3(p0f);
+    ivec3 i1 = ivec3(p1f);
+    vec3 c000 = sp_lut_fetch(ivec3(i0.x, i0.y, i0.z), Ni);
+    vec3 c100 = sp_lut_fetch(ivec3(i1.x, i0.y, i0.z), Ni);
+    vec3 c010 = sp_lut_fetch(ivec3(i0.x, i1.y, i0.z), Ni);
+    vec3 c110 = sp_lut_fetch(ivec3(i1.x, i1.y, i0.z), Ni);
+    vec3 c001 = sp_lut_fetch(ivec3(i0.x, i0.y, i1.z), Ni);
+    vec3 c101 = sp_lut_fetch(ivec3(i1.x, i0.y, i1.z), Ni);
+    vec3 c011 = sp_lut_fetch(ivec3(i0.x, i1.y, i1.z), Ni);
+    vec3 c111 = sp_lut_fetch(ivec3(i1.x, i1.y, i1.z), Ni);
+    vec3 cx00 = mix(c000, c100, f.x);
+    vec3 cx10 = mix(c010, c110, f.x);
+    vec3 cx01 = mix(c001, c101, f.x);
+    vec3 cx11 = mix(c011, c111, f.x);
+    vec3 cxy0 = mix(cx00, cx10, f.y);
+    vec3 cxy1 = mix(cx01, cx11, f.y);
+    vec3 outL = mix(cxy0, cxy1, f.z);
+    return mix(c, outL, clamp(uGradeLutMeta.z, 0.0, 1.0));
 }
 
 vec3 sp_rgb2hsv(vec3 c) {
@@ -365,6 +504,8 @@ vec3 sp_grade_sectors(vec3 rgb) {
 
 vec3 sp_color_grade(vec3 col, float Lsplit) {
     vec3 g = col * exp2(uGradeBasicA.x);
+    g = sp_tone_map(g, uGradeToneMode);
+    g = sp_lut_apply(g);
     float bp = uGradeBasicA.z;
     float wp = max(uGradeBasicA.w, bp + 1e-4);
     g = (g - bp) / max(wp - bp, 1e-4);
@@ -412,10 +553,10 @@ void modifySplatColor(vec3 center, inout vec4 color) {
 
     vec3 pre = color.rgb;
     float Lsplit = clamp(dot(pre, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
-    bool applyGrade = (uGradeSelectedOnly == 0);
+    bool applyGrade = (uGradeEnabled != 0) && (uGradeSelectedOnly == 0);
     if (uGradeSelectedOnly != 0) {
         vec4 selG = loadCustomSelection();
-        applyGrade = (selG.r > 0.5);
+        applyGrade = (uGradeEnabled != 0) && (selG.r > 0.5);
     }
     if (applyGrade) color.rgb = sp_color_grade(pre, Lsplit);
     else color.rgb = pre;
@@ -445,6 +586,7 @@ uniform uGradeWheelSh: vec3f;
 uniform uGradeWheelMd: vec3f;
 uniform uGradeWheelHi: vec3f;
 uniform uGradeCross: vec4f;
+uniform uGradeEnabled: i32;
 uniform uGradeSelectedOnly: i32;
 uniform uGradeSec0: vec3f;
 uniform uGradeSec1: vec3f;
@@ -455,6 +597,103 @@ uniform uGradeSec5: vec3f;
 uniform uGradeSec6: vec3f;
 uniform uGradeSec7: vec3f;
 uniform uLayerOpacity: f32;
+uniform uGradeToneMode: i32;
+uniform uGradeLutMeta: vec4f;
+uniform uGradeLutDomainMin: vec3f;
+uniform uGradeLutDomainInv: vec3f;
+var uGradeLutTex: texture_2d<f32>;
+
+fn sp_uch(x: vec3f) -> vec3f {
+    let A = 0.15;
+    let B = 0.50;
+    let C = 0.10;
+    let D = 0.20;
+    let E = 0.02;
+    let F = 0.30;
+    return (x * (A * x + vec3f(C * B)) + vec3f(D * E)) / (x * (A * x + vec3f(B)) + vec3f(D * F)) - vec3f(E / F);
+}
+fn sp_neutral_tm_w(colorIn: vec3f) -> vec3f {
+    var color = colorIn;
+    let startCompression = 0.8 - 0.04;
+    let desaturation = 0.15;
+    let x = min(color.x, min(color.y, color.z));
+    let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
+    color -= vec3f(offset);
+    let peak = max(color.x, max(color.y, color.z));
+    if peak < startCompression { return color; }
+    let d = 1.0 - startCompression;
+    let newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / max(peak, 1e-6);
+    let g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, vec3f(newPeak), g);
+}
+fn sp_rrt_odt_fit_w(v: vec3f) -> vec3f {
+    let a = v * (v + vec3f(0.0245786)) - vec3f(0.000090537);
+    let b = v * (0.983729 * v + vec3f(0.4329510)) + vec3f(0.238081);
+    return a / b;
+}
+fn sp_aces2_tm_w(color: vec3f) -> vec3f {
+    let inMat = mat3x3f(
+        vec3f(0.59719, 0.07600, 0.02840),
+        vec3f(0.35458, 0.90834, 0.13383),
+        vec3f(0.04823, 0.01566, 0.83777)
+    );
+    let outMat = mat3x3f(
+        vec3f(1.60475, -0.10208, -0.00327),
+        vec3f(-0.53108, 1.10813, -0.07276),
+        vec3f(-0.07367, -0.00605, 1.07602)
+    );
+    var v = inMat * color;
+    v = sp_rrt_odt_fit_w(v);
+    return outMat * v;
+}
+fn sp_hejl_tm_w(x: vec3f) -> vec3f {
+    let c = max(vec3f(0.0), x - vec3f(0.004));
+    return (c * (6.2 * c + vec3f(0.5))) / (c * (6.2 * c + vec3f(1.7)) + vec3f(0.06));
+}
+fn sp_tone_map_w(x: vec3f, mode: i32) -> vec3f {
+    if mode <= 0 { return clamp(x, vec3f(0.0), vec3f(1.0)); } // Linear
+    if mode == 1 { return clamp(sp_neutral_tm_w(x), vec3f(0.0), vec3f(1.0)); }
+    if mode == 2 {
+        return clamp((x * (2.51 * x + vec3f(0.03))) / (x * (2.43 * x + vec3f(0.59)) + vec3f(0.14)), vec3f(0.0), vec3f(1.0));
+    }
+    if mode == 3 { return clamp(sp_aces2_tm_w(x), vec3f(0.0), vec3f(1.0)); }
+    if mode == 4 { return clamp(sp_uch(x) / sp_uch(vec3f(11.2)), vec3f(0.0), vec3f(1.0)); }
+    return clamp(sp_hejl_tm_w(x), vec3f(0.0), vec3f(1.0));
+}
+fn sp_lut_fetch_w(ijk: vec3i, Ni: i32) -> vec3f {
+    let xf = ijk.x + ijk.y * Ni;
+    let yf = ijk.z;
+    return textureLoad(uGradeLutTex, vec2i(xf, yf), 0).xyz;
+}
+fn sp_lut_apply_w(c: vec3f) -> vec3f {
+    if uniform.uGradeLutMeta.x <= 0.5 { return c; }
+    let N = uniform.uGradeLutMeta.y;
+    let NiF = N - 1.0;
+    let Ni = i32(N + 0.5);
+    let p = clamp((c - uniform.uGradeLutDomainMin) * uniform.uGradeLutDomainInv, vec3f(0.0), vec3f(1.0)) * NiF;
+    let p0f = floor(p);
+    let p1f = min(p0f + vec3f(1.0), vec3f(N - 1.0));
+    let f = p - p0f;
+    let i0 = vec3i(i32(p0f.x), i32(p0f.y), i32(p0f.z));
+    let i1 = vec3i(i32(p1f.x), i32(p1f.y), i32(p1f.z));
+    let c000 = sp_lut_fetch_w(vec3i(i0.x, i0.y, i0.z), Ni);
+    let c100 = sp_lut_fetch_w(vec3i(i1.x, i0.y, i0.z), Ni);
+    let c010 = sp_lut_fetch_w(vec3i(i0.x, i1.y, i0.z), Ni);
+    let c110 = sp_lut_fetch_w(vec3i(i1.x, i1.y, i0.z), Ni);
+    let c001 = sp_lut_fetch_w(vec3i(i0.x, i0.y, i1.z), Ni);
+    let c101 = sp_lut_fetch_w(vec3i(i1.x, i0.y, i1.z), Ni);
+    let c011 = sp_lut_fetch_w(vec3i(i0.x, i1.y, i1.z), Ni);
+    let c111 = sp_lut_fetch_w(vec3i(i1.x, i1.y, i1.z), Ni);
+    let cx00 = mix(c000, c100, f.x);
+    let cx10 = mix(c010, c110, f.x);
+    let cx01 = mix(c001, c101, f.x);
+    let cx11 = mix(c011, c111, f.x);
+    let cxy0 = mix(cx00, cx10, f.y);
+    let cxy1 = mix(cx01, cx11, f.y);
+    let outL = mix(cxy0, cxy1, f.z);
+    return mix(c, outL, clamp(uniform.uGradeLutMeta.z, 0.0, 1.0));
+}
 
 fn sp_rgb2hsv(c: vec3f) -> vec3f {
     let K = vec4f(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
@@ -490,6 +729,8 @@ fn sp_grade_sectors(rgb: vec3f) -> vec3f {
 
 fn sp_color_grade(col: vec3f, Lsplit: f32) -> vec3f {
     var g = col * exp2(uniform.uGradeBasicA.x);
+    g = sp_tone_map_w(g, uniform.uGradeToneMode);
+    g = sp_lut_apply_w(g);
     let bp = uniform.uGradeBasicA.z;
     let wp = max(uniform.uGradeBasicA.w, bp + 1e-4);
     g = (g - bp) / max(wp - bp, 1e-4);
@@ -550,10 +791,10 @@ fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
     }
     let pre = vec3f((*color).r, (*color).g, (*color).b);
     let Lsplit = clamp(dot(pre, vec3f(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
-    var applyGrade = uniform.uGradeSelectedOnly == 0;
+    var applyGrade = (uniform.uGradeEnabled != 0) && (uniform.uGradeSelectedOnly == 0);
     if uniform.uGradeSelectedOnly != 0 {
         let selG = loadCustomSelection();
-        applyGrade = selG.r > 0.5;
+        applyGrade = (uniform.uGradeEnabled != 0) && (selG.r > 0.5);
     }
     let gradedFull = sp_color_grade(pre, Lsplit);
     let graded = select(pre, gradedFull, applyGrade);
@@ -726,6 +967,7 @@ const device = await pc.createGraphicsDevice(canvas, {
 const appOptions = new pc.AppOptions();
 appOptions.graphicsDevice = device;
 appOptions.mouse = new pc.Mouse(canvas);
+appOptions.mouse.disableContextMenu();
 appOptions.touch = new pc.TouchDevice(canvas);
 appOptions.componentSystems = [
     pc.RenderComponentSystem, pc.CameraComponentSystem, pc.GSplatComponentSystem,
@@ -742,7 +984,47 @@ installGsplatSplatViewFragmentShaderPatch(app.graphicsDevice);
 app.setCanvasFillMode(pc.FILLMODE_NONE);
 app.setCanvasResolution(pc.RESOLUTION_AUTO);
 
+/** 2×2 neutral LUT; bound when no .cube is active so the sampler stays valid. */
+let _dummyGradeLutTex = null;
+const getDummyGradeLutTex = () => {
+    if (_dummyGradeLutTex) return _dummyGradeLutTex;
+    const t = new pc.Texture(app.graphicsDevice, {
+        width: 2,
+        height: 2,
+        format: pc.PIXELFORMAT_RGBA8,
+        mipmaps: false,
+        minFilter: pc.FILTER_NEAREST,
+        magFilter: pc.FILTER_NEAREST,
+        addressU: pc.ADDRESS_CLAMP_TO_EDGE,
+        addressV: pc.ADDRESS_CLAMP_TO_EDGE,
+        name: 'dummy-grade-lut',
+    });
+    const d = t.lock();
+    if (d) {
+        d.fill(128);
+        for (let i = 0; i < d.length; i += 4) d[i + 3] = 255;
+        t.unlock();
+    }
+    _dummyGradeLutTex = t;
+    return _dummyGradeLutTex;
+};
+
 const canvasContainer = document.getElementById('canvas-container');
+
+/** Blocks user-driven splat file load/import when Supabase auth is configured and there is no session. */
+const ensureCanLoadModel = async () => {
+    if (!isSupabaseAuthEnabled()) return true;
+    const sb = getSupabase();
+    if (!sb) return true;
+    let session = getCachedSession();
+    if (!session?.user) {
+        const { data } = await sb.auth.getSession();
+        session = data.session ?? null;
+    }
+    if (session?.user) return true;
+    openAuthModal({ reason: 'load' });
+    return false;
+};
 
 const isSplatDropFile = (name) => {
     const lower = (name || '').toLowerCase();
@@ -780,6 +1062,7 @@ canvasContainer.addEventListener('drop', async (e) => {
     canvasContainer.classList.remove('file-drop-target');
     const files = [...e.dataTransfer.files].filter((f) => isSplatDropFile(f.name));
     if (!files.length) return;
+    if (!(await ensureCanLoadModel())) return;
     for (const file of files) {
         try {
             if (e.shiftKey) await loadSplat(file);
@@ -789,6 +1072,9 @@ canvasContainer.addEventListener('drop', async (e) => {
         }
     }
 });
+canvasContainer.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+}, { capture: true });
 
 const resizeCanvasToContainer = () => {
     const w = Math.max(1, canvasContainer.clientWidth);
@@ -905,18 +1191,22 @@ const updateCamera = () => {
 updateCamera();
 app.start();
 
-// ── World XZ reference grid (Blender-style: minor 1 · major 10 · X red / Z blue · distance fade) ─
+// ── World XZ reference grid (SuperSplat-style: 10 cm · 1 m · 10 m, X red / Z blue, distance fade) ─
 const LS_VIEWPORT_GRID = 'photoshock-viewport-grid';
 let viewportGridVisible = false;
 try {
     if (localStorage.getItem(LS_VIEWPORT_GRID) === '1') viewportGridVisible = true;
 } catch (_) { /* ignore */ }
 
-const VIEWPORT_GRID_HALF = 100;
-const VIEWPORT_GRID_MAJOR = 10;
+/** Half-extent (meters) of finite line mesh; dense 10 cm lines stay within GPU budget. */
+const VIEWPORT_GRID_HALF = 60;
+const GRID_MINOR = 0.1;
+const GRID_MAJOR = 1;
+const GRID_MEGA = 10;
 
-const GRID_FADE_NEAR = 4;
-const GRID_FADE_RANGE = 78;
+/** Match supersplat infinite-grid fragment: smoothstep(400, 1000, dist). */
+const GRID_FADE_NEAR = 400;
+const GRID_FADE_RANGE = 600;
 const GRID_FADE_MIN = 0.04;
 
 const GRID_EMISSIVE_CHUNK_GLSL = /* glsl */ `
@@ -924,7 +1214,8 @@ uniform vec3 material_emissive;
 uniform float material_emissiveIntensity;
 void getEmission() {
     float dist = distance(vPositionW, view_position);
-    float fade = clamp(1.0 - (dist - ${GRID_FADE_NEAR}.0) / ${GRID_FADE_RANGE}.0, ${GRID_FADE_MIN}, 1.0);
+    float fade = 1.0 - smoothstep(${GRID_FADE_NEAR}.0, ${GRID_FADE_NEAR + GRID_FADE_RANGE}.0, dist);
+    fade = max(fade, ${GRID_FADE_MIN});
     dEmission = material_emissive * material_emissiveIntensity * fade;
 }
 `;
@@ -933,7 +1224,8 @@ uniform material_emissive: vec3f;
 uniform material_emissiveIntensity: f32;
 fn getEmission() {
     let dist = length(vPositionW - uniform.view_position);
-    let fade = clamp(1.0 - (dist - ${GRID_FADE_NEAR}.0) / ${GRID_FADE_RANGE}.0, ${GRID_FADE_MIN}, 1.0);
+    var fade = 1.0 - smoothstep(${GRID_FADE_NEAR}.0, ${GRID_FADE_NEAR + GRID_FADE_RANGE}.0, dist);
+    fade = max(fade, ${GRID_FADE_MIN});
     dEmission = uniform.material_emissive * uniform.material_emissiveIntensity * fade;
 }
 `;
@@ -952,27 +1244,68 @@ const makeViewportGridLineMaterial = (r, g, b) => {
     return mat;
 };
 
-const buildGridMinorPositions = (h, major) => {
+const gridIsMultiple = (v, period, eps = 1e-4) => {
+    const q = v / period;
+    return Math.abs(q - Math.round(q)) < eps / Math.max(period, 0.01);
+};
+
+/** 10 cm lines; skip 1 m and 10 m (drawn by coarser layers). */
+const buildGridMinorPositions = (h) => {
     const pos = [];
-    for (let z = -h; z <= h; z++) {
-        if (z % major === 0) continue;
+    const imin = Math.floor(-h / GRID_MINOR - 1e-6);
+    const imax = Math.ceil(h / GRID_MINOR + 1e-6);
+    for (let i = imin; i <= imax; i++) {
+        const z = i * GRID_MINOR;
+        if (Math.abs(z) > h + 1e-5) continue;
+        if (gridIsMultiple(z, GRID_MAJOR) || gridIsMultiple(z, GRID_MEGA)) continue;
         pos.push(-h, 0, z, h, 0, z);
     }
-    for (let x = -h; x <= h; x++) {
-        if (x % major === 0) continue;
+    for (let i = imin; i <= imax; i++) {
+        const x = i * GRID_MINOR;
+        if (Math.abs(x) > h + 1e-5) continue;
+        if (gridIsMultiple(x, GRID_MAJOR) || gridIsMultiple(x, GRID_MEGA)) continue;
         pos.push(x, 0, -h, x, 0, h);
     }
     return new Float32Array(pos);
 };
 
-const buildGridMajorPositions = (h, major) => {
+/** 1 m lines; skip 10 m and world axes (z=0 / x=0 lines). */
+const buildGridMajorPositions = (h) => {
     const pos = [];
-    for (let z = -h; z <= h; z += major) {
-        if (z === 0) continue;
+    const kmin = Math.floor(-h / GRID_MAJOR - 1e-6);
+    const kmax = Math.ceil(h / GRID_MAJOR + 1e-6);
+    for (let k = kmin; k <= kmax; k++) {
+        const z = k * GRID_MAJOR;
+        if (Math.abs(z) > h + 1e-5) continue;
+        if (gridIsMultiple(z, GRID_MEGA)) continue;
+        if (Math.abs(z) < 1e-5) continue;
         pos.push(-h, 0, z, h, 0, z);
     }
-    for (let x = -h; x <= h; x += major) {
-        if (x === 0) continue;
+    for (let k = kmin; k <= kmax; k++) {
+        const x = k * GRID_MAJOR;
+        if (Math.abs(x) > h + 1e-5) continue;
+        if (gridIsMultiple(x, GRID_MEGA)) continue;
+        if (Math.abs(x) < 1e-5) continue;
+        pos.push(x, 0, -h, x, 0, h);
+    }
+    return new Float32Array(pos);
+};
+
+/** 10 m lines (supersplat “colored axes” level density); skip axes at origin. */
+const buildGridMegaPositions = (h) => {
+    const pos = [];
+    const kmin = Math.floor(-h / GRID_MEGA - 1e-6);
+    const kmax = Math.ceil(h / GRID_MEGA + 1e-6);
+    for (let k = kmin; k <= kmax; k++) {
+        const z = k * GRID_MEGA;
+        if (Math.abs(z) > h + 1e-5) continue;
+        if (Math.abs(z) < 1e-5) continue;
+        pos.push(-h, 0, z, h, 0, z);
+    }
+    for (let k = kmin; k <= kmax; k++) {
+        const x = k * GRID_MEGA;
+        if (Math.abs(x) > h + 1e-5) continue;
+        if (Math.abs(x) < 1e-5) continue;
         pos.push(x, 0, -h, x, 0, h);
     }
     return new Float32Array(pos);
@@ -985,8 +1318,10 @@ const meshFromLinePositions = (positions) => {
     return mesh;
 };
 
-const viewportGridMinorMat = makeViewportGridLineMaterial(0.11, 0.11, 0.12);
+/* ~ supersplat 0.1 m / 1 m greys (fragment uses ~0.7); 10 m slightly brighter */
+const viewportGridMinorMat = makeViewportGridLineMaterial(0.48, 0.48, 0.5);
 const viewportGridMajorMat = makeViewportGridLineMaterial(0.62, 0.62, 0.66);
+const viewportGridMegaMat = makeViewportGridLineMaterial(0.82, 0.82, 0.86);
 const viewportGridAxisXMat = makeViewportGridLineMaterial(0.92, 0.18, 0.14);
 const viewportGridAxisZMat = makeViewportGridLineMaterial(0.22, 0.48, 1.0);
 const shapePreviewLineMat = makeViewportGridLineMaterial(0.28, 0.62, 1.0);
@@ -1006,24 +1341,26 @@ shapePreviewFillMat.depthTest = true;
 shapePreviewFillMat.update();
 
 const hG = VIEWPORT_GRID_HALF;
-const maj = VIEWPORT_GRID_MAJOR;
-const gridMinorMesh = meshFromLinePositions(buildGridMinorPositions(hG, maj));
-const gridMajorMesh = meshFromLinePositions(buildGridMajorPositions(hG, maj));
+const gridMinorMesh = meshFromLinePositions(buildGridMinorPositions(hG));
+const gridMajorMesh = meshFromLinePositions(buildGridMajorPositions(hG));
+const gridMegaMesh = meshFromLinePositions(buildGridMegaPositions(hG));
 const gridAxisXMesh = meshFromLinePositions(new Float32Array([-hG, 0, 0, hG, 0, 0]));
 const gridAxisZMesh = meshFromLinePositions(new Float32Array([0, 0, -hG, 0, 0, hG]));
 
 const miGridMinor = new pc.MeshInstance(gridMinorMesh, viewportGridMinorMat);
 const miGridMajor = new pc.MeshInstance(gridMajorMesh, viewportGridMajorMat);
+const miGridMega = new pc.MeshInstance(gridMegaMesh, viewportGridMegaMat);
 const miGridAxisX = new pc.MeshInstance(gridAxisXMesh, viewportGridAxisXMat);
 const miGridAxisZ = new pc.MeshInstance(gridAxisZMesh, viewportGridAxisZMat);
 miGridMinor.drawOrder = 0;
 miGridMajor.drawOrder = 1;
-miGridAxisX.drawOrder = 2;
-miGridAxisZ.drawOrder = 2;
+miGridMega.drawOrder = 2;
+miGridAxisX.drawOrder = 3;
+miGridAxisZ.drawOrder = 3;
 
 const viewportGridEntity = new pc.Entity('viewportGrid');
 viewportGridEntity.addComponent('render', {
-    meshInstances: [miGridMinor, miGridMajor, miGridAxisX, miGridAxisZ],
+    meshInstances: [miGridMinor, miGridMajor, miGridMega, miGridAxisX, miGridAxisZ],
     castShadows: false,
 });
 viewportGridEntity.setLocalEulerAngles(0, 0, 0);
@@ -1152,6 +1489,8 @@ let showSelectionHighlight = true;   // H toggles visibility
 let hasSelection    = false;
 let selectionSphere = [0, 0, 0, -1]; // model space, w<=0 = disabled
 let selectionMode   = 'new';         // new | add | subtract
+/** Tools that use new/add/subtract — drives viewport frame stroke (see syncViewportSelectionFrame). */
+const SELECTION_FRAME_TOOLS = ['boxSelect', 'lassoSelect', 'vectorSelect', 'brushSelect', 'colorSelect', 'splatSelect'];
 /** Snapshot at pointer-down for drag selection tools; committed on pointer-up. */
 let pendingSelectionUndoSnap = null;
 
@@ -1171,7 +1510,6 @@ const paintStrokeScratch = new pc.Vec3();
 // Erase depth (view-aligned cylinder): scratch vectors to avoid per-dab allocations
 const eraseRayWorldScratch = new pc.Vec3();
 const eraseWorldEdgeScratch = new pc.Vec3();
-const eraseCamToDabScratch = new pc.Vec3();
 const eraseModelCenterScratch = new pc.Vec3();
 const eraseModelEdgeScratch = new pc.Vec3();
 const eraseViewModelScratch = new pc.Vec3();
@@ -1185,7 +1523,6 @@ let pendingRebuild = false;
 
 // Camera interaction
 let isOrbiting = false;
-let isPanning  = false;
 let lastMouse  = { x: 0, y: 0 };
 
 // Loaded paintables: { entity, gsplatComponent, paintProcessor, paintBucketProcessor, eraseProcessor, ... }
@@ -1193,6 +1530,23 @@ const paintables = [];
 
 // CPU splat cache for export
 let gsplatDataCache = null;
+
+/** Base splats logically removed (fast delete without PLY reload): 0 = skip in CPU pick/selection. */
+let baseSplatAliveMask = null;
+
+const resetBaseSplatAliveMask = (n) => {
+    if (!n || n <= 0) {
+        baseSplatAliveMask = null;
+        return;
+    }
+    baseSplatAliveMask = new Uint8Array(n);
+    baseSplatAliveMask.fill(1);
+};
+
+const isBaseSplatAlive = (i) => {
+    if (!baseSplatAliveMask || i < 0 || i >= baseSplatAliveMask.length) return true;
+    return baseSplatAliveMask[i] !== 0;
+};
 
 // ── Layers ───────────────────────────────────────────────────────────────────
 // Layer: { id, name, visible, opacityPct (0–100), splats: [...], selectionMask: Uint8Array|null }
@@ -1207,6 +1561,8 @@ const savedSelections = [];
 const swatches = [];
 /** True after "pick from splat" — next left-click on canvas samples a splat into swatches. */
 let awaitingSwatchSplatPick = false;
+/** Split-tone picker target key ('sh'|'md'|'hi') when sampling from viewport. */
+let awaitingSplitToneSplatPick = null;
 let layerIdCounter = 1;
 let baseModelName = '';         // filename of the loaded model
 /** Viewport-only: base gsplat alpha multiplier 0–100 (not baked into splats). */
@@ -1441,10 +1797,10 @@ const useRingHitSelection = () => splatMode && splatViewStyle === 'rings';
 const LS_SELECTION_DEPTH = 'photoshock-selection-depth';
 const parseSelectionDepth = (raw) => {
     const n = parseInt(raw, 10);
-    if (!Number.isFinite(n)) return 50;
+    if (!Number.isFinite(n)) return 80;
     return Math.max(0, Math.min(100, n));
 };
-let selectionDepthControl = 50;
+let selectionDepthControl = 80;
 try {
     const s = localStorage.getItem(LS_SELECTION_DEPTH);
     if (s != null) selectionDepthControl = parseSelectionDepth(s);
@@ -1520,6 +1876,7 @@ const getSplatRotationAt = (data, layer, i) => {
  * Returns null if behind camera.
  */
 const getSplatScreenEllipse = (data, layer, i, wEnt) => {
+    if (!data.isLayerData && !isBaseSplatAlive(i)) return null;
     const cam = cameraEntity.camera;
     const wm = wEnt.getWorldTransform();
     const px = data.x[i], py = data.y[i], pz = data.z[i];
@@ -1972,6 +2329,77 @@ const brushCursor     = document.getElementById('brush-cursor');
 const boxSelectRect   = document.getElementById('box-select-rect');
 const selectionOverlaySvg = document.getElementById('selection-overlay-svg');
 const instructions    = document.getElementById('instructions');
+const loadProgressOverlay = document.getElementById('load-progress-overlay');
+const loadProgressBar = document.getElementById('load-progress-bar');
+const loadProgressFill = document.getElementById('load-progress-fill');
+const loadProgressTitle = document.getElementById('load-progress-title');
+const loadProgressDetail = document.getElementById('load-progress-detail');
+
+let modelImportProgressActive = false;
+
+const setModelImportProgressPct = (pct, detail) => {
+    const p = Math.max(0, Math.min(100, Number(pct) || 0));
+    if (loadProgressFill) {
+        loadProgressFill.classList.remove('indeterminate');
+        loadProgressFill.style.width = `${p}%`;
+    }
+    if (loadProgressBar) loadProgressBar.setAttribute('aria-valuenow', String(Math.round(p)));
+    if (loadProgressDetail && detail !== undefined) loadProgressDetail.textContent = detail ?? '';
+};
+
+const setModelImportProgressIndeterminate = (detail = 'Processing…') => {
+    if (loadProgressFill) {
+        loadProgressFill.classList.add('indeterminate');
+        loadProgressFill.style.width = '100%';
+    }
+    if (loadProgressBar) loadProgressBar.setAttribute('aria-valuenow', '0');
+    if (loadProgressDetail) loadProgressDetail.textContent = detail;
+};
+
+const showModelImportProgress = (title) => {
+    if (!loadProgressOverlay) return;
+    modelImportProgressActive = true;
+    if (loadProgressTitle) loadProgressTitle.textContent = title;
+    setModelImportProgressPct(0, '');
+    loadProgressOverlay.classList.remove('hidden');
+    loadProgressOverlay.setAttribute('aria-busy', 'true');
+};
+
+const hideModelImportProgress = () => {
+    if (!loadProgressOverlay) return;
+    if (!modelImportProgressActive) return;
+    modelImportProgressActive = false;
+    loadProgressFill?.classList.remove('indeterminate');
+    if (loadProgressFill) loadProgressFill.style.width = '0%';
+    if (loadProgressBar) loadProgressBar.setAttribute('aria-valuenow', '0');
+    if (loadProgressDetail) loadProgressDetail.textContent = '';
+    loadProgressOverlay.classList.add('hidden');
+    loadProgressOverlay.setAttribute('aria-busy', 'false');
+};
+
+/** PlayCanvas fires `progress` with (loadedBytes, totalBytes) while fetching asset data. */
+const wireAssetDownloadProgress = (asset, downloadCapPct = 88) => {
+    const fmtSize = (n) => {
+        if (!Number.isFinite(n) || n < 0) return '';
+        if (n < 1024) return `${Math.round(n)} B`;
+        if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+        return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+    };
+    const onProgress = (loaded, total) => {
+        if (!modelImportProgressActive) return;
+        let pct = 0;
+        if (total > 0) pct = (loaded / total) * downloadCapPct;
+        else if (loaded > 0) pct = Math.min(downloadCapPct * 0.92, downloadCapPct);
+        const detail = total > 0 ? `${fmtSize(loaded)} / ${fmtSize(total)}` : (loaded > 0 ? `${fmtSize(loaded)} transferred` : '');
+        setModelImportProgressPct(pct, detail);
+    };
+    asset.on('progress', onProgress);
+    return () => {
+        try {
+            asset.off('progress', onProgress);
+        } catch (_) { /* ignore */ }
+    };
+};
 
 const syncSelectionModeToolbar = () => {
     document.querySelectorAll('.sel-mode-toolbar-btn').forEach((btn) => {
@@ -1982,10 +2410,30 @@ const syncSelectionModeToolbar = () => {
     });
 };
 
+/** Viewport (#canvas-container) inset stroke: selection state + new/add/subtract when a selection tool is active. */
+const syncViewportSelectionFrame = () => {
+    if (!canvasContainer) return;
+    const selTool = SELECTION_FRAME_TOOLS.includes(activeTool);
+    let frame = 'none';
+    if (!hasSelection) {
+        frame = 'none';
+    } else if (!selTool) {
+        frame = 'idle';
+    } else if (selectionMode === 'new') {
+        frame = 'new';
+    } else if (selectionMode === 'add') {
+        frame = 'add';
+    } else {
+        frame = 'subtract';
+    }
+    canvasContainer.dataset.selectionFrame = frame;
+};
+
 const setSelectionMode = (mode) => {
     if (mode !== 'new' && mode !== 'add' && mode !== 'subtract') return;
     selectionMode = mode;
     syncSelectionModeToolbar();
+    syncViewportSelectionFrame();
 };
 
 const refreshCursorCameraHint = () => {
@@ -2054,6 +2502,7 @@ const setTool = (tool) => {
     redrawSelectionOverlays();
     clearHoverSphere();
     cancelSwatchSplatPick();
+    cancelSplitToneSplatPick();
 
     const toolBtnMap = {
         cursor: 'tool-cursor', brush: 'tool-brush', eraser: 'tool-eraser', resetBrush: 'tool-resetBrush',
@@ -2103,15 +2552,15 @@ const setTool = (tool) => {
     const msgs = {
         cursor:       'WASD move · Q up / E down · Drag orbit · Right-drag pan · Scroll zoom · Double-click focus',
         brush:        'Click & drag to paint · Scroll to zoom',
-        eraser:       'Click & drag to erase opacity · Depth = thickness along view · Scroll to zoom',
+        eraser:       'Click & drag to erase opacity · Brush depth = thickness along view · Scroll to zoom',
         resetBrush:   'Click & drag to restore original colors (clears paint & erase)',
         paintBucket:  'Click to fill all selected splats · Uses brush color, blend & intensity (B) · K',
-        boxSelect:    'Drag to draw selection rectangle (O) · In splat + ring mode, selects ring hits (front-most)',
+        boxSelect:    'Drag to draw selection rectangle (R) · In splat + ring mode, selects ring hits (front-most)',
         lassoSelect:  'Drag freehand loop (L) · Release to select enclosed splats · Alt inverts add/subtract',
         vectorSelect: 'Click polygon corners (Y) · Press Enter to close (≥3 points) · Backspace removes last point · Green dot = first vertex',
-        brushSelect:  'Click & drag to paint selection with brush · Scroll to zoom',
+        brushSelect:  'Click & drag to paint selection with brush (O) · Scroll to zoom',
         colorSelect:  'Click a splat to select all splats of similar color · Loupe shows magnified pixels under the cursor',
-        generateSplats: 'Alt+click to sample color · Click & drag to generate splats in gaps',
+        generateSplats: 'Alt+click to sample color · Click & drag to generate splats in gaps (U)',
         splatSelect:  'Click/drag — nearest splat; with splat + ring mode, picks the front ring under the cursor',
         shapeLayer:   '',
     };
@@ -2123,6 +2572,7 @@ const setTool = (tool) => {
     }
     if (tool !== 'colorSelect') hideColorPixelLoupe();
     refreshLayerGizmoAttachment();
+    syncViewportSelectionFrame();
 };
 
 // ── Inline math evaluation for number inputs ────────────────────────────────
@@ -2171,7 +2621,13 @@ document.addEventListener('focusout', (e) => {
 
 // ── Settings getters ──────────────────────────────────────────────────────────
 const g = (id) => document.getElementById(id);
-const getF = (id) => parseFloat(g(id).value);
+const getF = (id) => {
+    const el = g(id);
+    if (!el) return NaN;
+    const v = parseNumericOrExpr(el.value);
+    if (v != null) return v;
+    return parseFloat(el.value);
+};
 const getI = (id) => parseInt(g(id).value);
 
 const brushSize      = () => getF('brush-size');
@@ -2409,6 +2865,7 @@ const splatShapePreviewToLayer = () => {
 };
 
 const createDefaultColorGrade = () => ({
+    enabled: true,
     exposure: 0,
     contrast: 1,
     blackPoint: 0,
@@ -2423,17 +2880,66 @@ const createDefaultColorGrade = () => ({
     wheelHighHex: '#808080',
     wheelHighAmt: 0,
     sectors: Array.from({ length: 8 }, () => ({ h: 0, s: 0, l: 0 })),
+    toneMode: 0,
+    lutSize: 0,
+    lutRgb: null,
+    lutDomainMin: [0, 0, 0],
+    lutDomainMax: [1, 1, 1],
+    lutMix: 1,
+    lutName: '',
+    lutTexture: null,
 });
 
 let baseColorGrade = createDefaultColorGrade();
 
-const cloneColorGrade = (src = null) => JSON.parse(JSON.stringify(src ?? createDefaultColorGrade()));
+const cloneColorGrade = (src = null) => {
+    const s = src ?? createDefaultColorGrade();
+    const j = JSON.parse(JSON.stringify({
+        enabled: s.enabled ?? true,
+        exposure: s.exposure,
+        contrast: s.contrast,
+        blackPoint: s.blackPoint,
+        whitePoint: s.whitePoint,
+        saturation: s.saturation,
+        temperature: s.temperature,
+        tint: s.tint,
+        wheelShadowHex: s.wheelShadowHex,
+        wheelShadowAmt: s.wheelShadowAmt,
+        wheelMidHex: s.wheelMidHex,
+        wheelMidAmt: s.wheelMidAmt,
+        wheelHighHex: s.wheelHighHex,
+        wheelHighAmt: s.wheelHighAmt,
+        sectors: s.sectors,
+        toneMode: s.toneMode ?? 0,
+        lutSize: s.lutSize || 0,
+        lutDomainMin: s.lutDomainMin || [0, 0, 0],
+        lutDomainMax: s.lutDomainMax || [1, 1, 1],
+        lutMix: s.lutMix ?? 1,
+        lutName: s.lutName || '',
+    }));
+    if (s.lutRgb?.length && s.lutSize) {
+        j.lutRgb = new Float32Array(s.lutRgb);
+    } else {
+        j.lutRgb = null;
+    }
+    j.lutTexture = null;
+    return j;
+};
 
 const ensureLayerColorGrade = (layer) => {
     if (!layer || typeof layer !== 'object') return;
     if (!layer.colorGrade?.sectors || layer.colorGrade.sectors.length !== 8) {
         layer.colorGrade = cloneColorGrade();
+        return;
     }
+    const d = createDefaultColorGrade();
+    const g = layer.colorGrade;
+    if (g.enabled == null) g.enabled = d.enabled;
+    if (g.toneMode == null) g.toneMode = d.toneMode;
+    if (g.lutMix == null) g.lutMix = d.lutMix;
+    if (!g.lutDomainMin) g.lutDomainMin = [...d.lutDomainMin];
+    if (!g.lutDomainMax) g.lutDomainMax = [...d.lutDomainMax];
+    if (g.lutName == null) g.lutName = d.lutName;
 };
 
 const wheelRgbOffset = (hex, amt) => {
@@ -2441,6 +2947,250 @@ const wheelRgbOffset = (hex, amt) => {
     const [r, gr, b] = hexToRgb(h);
     const a = Math.max(0, Math.min(1, Number(amt) || 0));
     return [(r - 0.5) * 2 * a, (gr - 0.5) * 2 * a, (b - 0.5) * 2 * a];
+};
+
+const SPLIT_TONE_KEYS = ['sh', 'md', 'hi'];
+const splitToneEditors = new Map();
+
+const rgb01ToHex = (r, g0, b) => {
+    const toHex = (x) => Math.round(Math.max(0, Math.min(1, x)) * 255).toString(16).padStart(2, '0');
+    return `#${toHex(r)}${toHex(g0)}${toHex(b)}`;
+};
+
+const rgb01ToHsl = (r, g0, b) => {
+    const max = Math.max(r, g0, b);
+    const min = Math.min(r, g0, b);
+    const l = (max + min) * 0.5;
+    let h = 0;
+    let s = 0;
+    if (max !== min) {
+        const d = max - min;
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        if (max === r) h = ((g0 - b) / d + (g0 < b ? 6 : 0)) / 6;
+        else if (max === g0) h = ((b - r) / d + 2) / 6;
+        else h = ((r - g0) / d + 4) / 6;
+    }
+    return { h: h * 360, s: s * 100, l: l * 100 };
+};
+
+const hslToRgb01 = (hDeg, sPct, lPct) => {
+    const h = ((hDeg % 360) + 360) % 360 / 360;
+    const s = Math.max(0, Math.min(100, sPct)) / 100;
+    const l = Math.max(0, Math.min(100, lPct)) / 100;
+    if (s <= 1e-8) return [l, l, l];
+    const hue2rgb = (p, q, tRaw) => {
+        let t = tRaw;
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1 / 6) return p + (q - p) * 6 * t;
+        if (t < 1 / 2) return q;
+        if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+        return p;
+    };
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    return [hue2rgb(p, q, h + 1 / 3), hue2rgb(p, q, h), hue2rgb(p, q, h - 1 / 3)];
+};
+
+const renderSplitToneWheel = (ed) => {
+    if (!ed?.canvas) return;
+    const ctx = ed.canvas.getContext('2d');
+    if (!ctx) return;
+    const w = ed.canvas.width;
+    const h = ed.canvas.height;
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const radius = Math.min(w, h) * 0.5 - 3;
+    if (!ed.baseImageData) {
+        const img = ctx.createImageData(w, h);
+        const d = img.data;
+        for (let py = 0; py < h; py++) {
+            for (let px = 0; px < w; px++) {
+                const dx = px + 0.5 - cx;
+                const dy = py + 0.5 - cy;
+                const rr = Math.hypot(dx, dy);
+                const idx = (py * w + px) * 4;
+                if (rr > radius) {
+                    d[idx + 3] = 0;
+                    continue;
+                }
+                const sat = Math.max(0, Math.min(1, rr / radius));
+                const hue = (((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360);
+                const rgb = hslToRgb01(hue, sat * 100, 50);
+                d[idx + 0] = Math.round(rgb[0] * 255);
+                d[idx + 1] = Math.round(rgb[1] * 255);
+                d[idx + 2] = Math.round(rgb[2] * 255);
+                d[idx + 3] = 255;
+            }
+        }
+        ed.baseImageData = img;
+    }
+    ctx.clearRect(0, 0, w, h);
+    ctx.putImageData(ed.baseImageData, 0, 0);
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    const ang = ((ed.h || 0) * Math.PI) / 180;
+    const satR = Math.max(0, Math.min(1, (ed.s || 0) / 100)) * radius;
+    const px = cx + Math.cos(ang) * satR;
+    const py = cy + Math.sin(ang) * satR;
+    ctx.beginPath();
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+    ctx.lineWidth = 1.5;
+    ctx.arc(px, py, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+};
+
+const syncSplitToneEditorUi = (ed, { updateColor = true } = {}) => {
+    if (!ed) return;
+    ed.h = Math.max(0, Math.min(360, Number(ed.h) || 0));
+    ed.s = Math.max(0, Math.min(100, Number(ed.s) || 0));
+    ed.l = Math.max(0, Math.min(100, Number(ed.l) || 0));
+    const rgb = hslToRgb01(ed.h, ed.s, ed.l);
+    const hex = rgb01ToHex(rgb[0], rgb[1], rgb[2]).toLowerCase();
+    if (updateColor && ed.colorInput) ed.colorInput.value = hex;
+    if (ed.hexInput) ed.hexInput.value = hex;
+    if (ed.hInput) ed.hInput.value = String(Math.round(ed.h));
+    if (ed.sInput) ed.sInput.value = String(Math.round(ed.s));
+    if (ed.lInput) ed.lInput.value = String(Math.round(ed.l));
+    if (ed.lumRange) ed.lumRange.value = String(Math.round(ed.l));
+    if (ed.lumNum) ed.lumNum.value = String(Math.round(ed.l));
+    renderSplitToneWheel(ed);
+};
+
+const setSplitToneColorFromHex = (key, hex, { commit = true } = {}) => {
+    const ed = splitToneEditors.get(key);
+    const norm = normalizeBrushHex(hex);
+    if (!ed || !norm) return;
+    const [r, g0, b] = hexToRgb(norm);
+    const hsl = rgb01ToHsl(r, g0, b);
+    ed.h = hsl.h;
+    ed.s = hsl.s;
+    ed.l = hsl.l;
+    syncSplitToneEditorUi(ed, { updateColor: true });
+    if (commit) commitActiveColorGradeFromUI();
+};
+
+const toggleSplitToneSplatPick = (key) => {
+    if (!key) return;
+    if (awaitingSplitToneSplatPick === key) {
+        cancelSplitToneSplatPick();
+        return;
+    }
+    cancelSwatchSplatPick();
+    cancelSplitToneSplatPick();
+    awaitingSplitToneSplatPick = key;
+    canvasContainer.classList.add('swatch-splat-pick-armed');
+    g(`cg-wheel-${key}-pick-btn`)?.classList.add('accent-btn');
+};
+
+const syncSplitToneEditorsFromColorInputs = () => {
+    for (const key of SPLIT_TONE_KEYS) {
+        const ed = splitToneEditors.get(key);
+        const norm = normalizeBrushHex(ed?.colorInput?.value);
+        if (!ed || !norm) continue;
+        const [r, g0, b] = hexToRgb(norm);
+        const hsl = rgb01ToHsl(r, g0, b);
+        ed.h = hsl.h;
+        ed.s = hsl.s;
+        ed.l = hsl.l;
+        syncSplitToneEditorUi(ed, { updateColor: true });
+    }
+};
+
+const initSplitToneEditors = () => {
+    splitToneEditors.clear();
+    for (const key of SPLIT_TONE_KEYS) {
+        const ed = {
+            key,
+            colorInput: g(`cg-wheel-${key}`),
+            canvas: g(`cg-wheel-${key}-canvas`),
+            lumRange: g(`cg-wheel-${key}-lum`),
+            lumNum: g(`cg-wheel-${key}-lum-num`),
+            hInput: g(`cg-wheel-${key}-h`),
+            sInput: g(`cg-wheel-${key}-s`),
+            lInput: g(`cg-wheel-${key}-l`),
+            hexInput: g(`cg-wheel-${key}-hex`),
+            pickBtn: g(`cg-wheel-${key}-pick-btn`),
+            resetBtn: g(`cg-wheel-${key}-reset-btn`),
+            h: 0,
+            s: 0,
+            l: 50,
+            baseImageData: null,
+        };
+        if (!ed.colorInput || !ed.canvas) continue;
+        const wheelPointerToHs = (clientX, clientY) => {
+            const rect = ed.canvas.getBoundingClientRect();
+            const w = ed.canvas.width;
+            const h = ed.canvas.height;
+            const cx = w * 0.5;
+            const cy = h * 0.5;
+            const radius = Math.min(w, h) * 0.5 - 3;
+            const x = ((clientX - rect.left) / Math.max(rect.width, 1)) * w - cx;
+            const y = ((clientY - rect.top) / Math.max(rect.height, 1)) * h - cy;
+            const rr = Math.hypot(x, y);
+            ed.h = ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+            ed.s = Math.max(0, Math.min(100, (rr / Math.max(radius, 1e-6)) * 100));
+            syncSplitToneEditorUi(ed, { updateColor: true });
+            commitActiveColorGradeFromUI();
+        };
+        ed.canvas.addEventListener('pointerdown', (ev) => {
+            ev.preventDefault();
+            const onMove = (mv) => wheelPointerToHs(mv.clientX, mv.clientY);
+            const onUp = () => {
+                window.removeEventListener('pointermove', onMove);
+                window.removeEventListener('pointerup', onUp);
+            };
+            window.addEventListener('pointermove', onMove);
+            window.addEventListener('pointerup', onUp);
+            wheelPointerToHs(ev.clientX, ev.clientY);
+        });
+        const clampHslInputs = () => {
+            ed.h = Math.max(0, Math.min(360, Number(ed.hInput?.value) || 0));
+            ed.s = Math.max(0, Math.min(100, Number(ed.sInput?.value) || 0));
+            ed.l = Math.max(0, Math.min(100, Number(ed.lInput?.value) || 0));
+            syncSplitToneEditorUi(ed, { updateColor: true });
+            commitActiveColorGradeFromUI();
+        };
+        ed.hInput?.addEventListener('input', clampHslInputs);
+        ed.sInput?.addEventListener('input', clampHslInputs);
+        ed.lInput?.addEventListener('input', clampHslInputs);
+        const applyLum = () => {
+            const v = Math.max(0, Math.min(100, Number(ed.lumRange?.value ?? ed.lumNum?.value) || 0));
+            ed.l = v;
+            syncSplitToneEditorUi(ed, { updateColor: true });
+            commitActiveColorGradeFromUI();
+        };
+        ed.lumRange?.addEventListener('input', applyLum);
+        ed.lumRange?.addEventListener('change', applyLum);
+        ed.lumNum?.addEventListener('input', applyLum);
+        ed.lumNum?.addEventListener('change', applyLum);
+        ed.hexInput?.addEventListener('input', () => {
+            const norm = normalizeBrushHex(ed.hexInput?.value);
+            if (norm) setSplitToneColorFromHex(key, norm, { commit: true });
+        });
+        const commitHex = () => {
+            const norm = normalizeBrushHex(ed.hexInput?.value);
+            if (norm) setSplitToneColorFromHex(key, norm, { commit: true });
+            else if (ed.colorInput) ed.hexInput.value = ed.colorInput.value.toLowerCase();
+        };
+        ed.hexInput?.addEventListener('change', commitHex);
+        ed.hexInput?.addEventListener('blur', commitHex);
+        ed.pickBtn?.addEventListener('click', () => toggleSplitToneSplatPick(key));
+        ed.resetBtn?.addEventListener('click', () => {
+            setSplitToneColorFromHex(key, '#808080', { commit: false });
+            if (g(`cg-wheel-${key}-amt`)) g(`cg-wheel-${key}-amt`).value = '0';
+            if (g(`cg-wheel-${key}-amt-num`)) g(`cg-wheel-${key}-amt-num`).value = '0';
+            commitActiveColorGradeFromUI();
+        });
+        splitToneEditors.set(key, ed);
+    }
+    syncSplitToneEditorsFromColorInputs();
 };
 
 /** Matches GLSL `sp_rgb2hsv` / `sp_hsv2rgb` / `sp_grade_sectors` / `sp_color_grade` for export + bake. */
@@ -2497,8 +3247,89 @@ const spGradeSectorsCpu = (rgb, grade) => {
     return spHsv2rgbCpu(hsv);
 };
 
+const clamp01Cpu = (v) => Math.max(0, Math.min(1, v));
+const clampArray01Cpu = (arr) => arr.map(clamp01Cpu);
+const cpuUch = (x) => {
+    const A = 0.15;
+    const B = 0.5;
+    const C = 0.1;
+    const D = 0.2;
+    const E = 0.02;
+    const F = 0.3;
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+};
+const cpuNeutralToneMapRgb = (rgb) => {
+    const startCompression = 0.8 - 0.04;
+    const desaturation = 0.15;
+    const out = [rgb[0], rgb[1], rgb[2]];
+    const x = Math.min(out[0], out[1], out[2]);
+    const offset = x < 0.08 ? (x - 6.25 * x * x) : 0.04;
+    out[0] -= offset;
+    out[1] -= offset;
+    out[2] -= offset;
+    const peak = Math.max(out[0], out[1], out[2]);
+    if (peak < startCompression) return clampArray01Cpu(out);
+    const d = 1 - startCompression;
+    const newPeak = 1 - d * d / (peak + d - startCompression);
+    const scale = newPeak / Math.max(peak, 1e-6);
+    out[0] *= scale;
+    out[1] *= scale;
+    out[2] *= scale;
+    const g = 1 - 1 / (desaturation * (peak - newPeak) + 1);
+    out[0] = out[0] + (newPeak - out[0]) * g;
+    out[1] = out[1] + (newPeak - out[1]) * g;
+    out[2] = out[2] + (newPeak - out[2]) * g;
+    return clampArray01Cpu(out);
+};
+const cpuRrtOdtFit = (x) => {
+    const a = x * (x + 0.0245786) - 0.000090537;
+    const b = x * (0.983729 * x + 0.4329510) + 0.238081;
+    return a / Math.max(b, 1e-6);
+};
+const cpuAces2ToneMapRgb = (rgb) => {
+    const inMat = [
+        [0.59719, 0.07600, 0.02840],
+        [0.35458, 0.90834, 0.13383],
+        [0.04823, 0.01566, 0.83777],
+    ];
+    const outMat = [
+        [1.60475, -0.10208, -0.00327],
+        [-0.53108, 1.10813, -0.07276],
+        [-0.07367, -0.00605, 1.07602],
+    ];
+    const mulM3 = (m, v) => ([
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]);
+    let v = mulM3(inMat, rgb);
+    v = [cpuRrtOdtFit(v[0]), cpuRrtOdtFit(v[1]), cpuRrtOdtFit(v[2])];
+    v = mulM3(outMat, v);
+    return clampArray01Cpu(v);
+};
+const cpuHejlToneMapRgb = (rgb) => clampArray01Cpu(rgb.map((x) => {
+    const c = Math.max(0, x - 0.004);
+    return (c * (6.2 * c + 0.5)) / (c * (6.2 * c + 1.7) + 0.06);
+}));
+/** Mirrors work-buffer `sp_tone_map` (applied after exposure, before levels). */
+const cpuToneMapRgb = (rgb, mode) => {
+    const m = Math.max(0, Math.min(5, Math.floor(Number(mode) || 0)));
+    if (m <= 0) return rgb.map(clamp01Cpu);
+    if (m === 1) return cpuNeutralToneMapRgb(rgb);
+    if (m === 2) {
+        return rgb.map((x) =>
+            clamp01Cpu(((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14))),
+        );
+    }
+    if (m === 3) return cpuAces2ToneMapRgb(rgb);
+    const w = cpuUch(11.2);
+    if (m === 4) return rgb.map((x) => clamp01Cpu(cpuUch(x) / w));
+    return cpuHejlToneMapRgb(rgb);
+};
+
 const cpuSpColorGrade = (col, grade) => {
     const g = grade || createDefaultColorGrade();
+    if (g.enabled === false) return [col[0], col[1], col[2]];
     const Lsplit = Math.max(0, Math.min(1, 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]));
     const ba = [
         Math.max(-4, Math.min(4, Number(g.exposure) || 0)),
@@ -2517,6 +3348,20 @@ const cpuSpColorGrade = (col, grade) => {
     const whHi = wheelRgbOffset(g.wheelHighHex, g.wheelHighAmt);
 
     let rgb = [col[0] * 2 ** ba[0], col[1] * 2 ** ba[0], col[2] * 2 ** ba[0]];
+    rgb = cpuToneMapRgb(rgb, g.toneMode ?? 0);
+    if (g.lutRgb?.length && g.lutSize) {
+        const lutP = {
+            size: g.lutSize,
+            rgb: g.lutRgb,
+            domainMin: g.lutDomainMin || [0, 0, 0],
+            domainMax: g.lutDomainMax || [1, 1, 1],
+        };
+        const lm = Math.max(0, Math.min(1, Number(g.lutMix) ?? 1));
+        if (lm > 1e-6) {
+            const lut = sampleCubeTrilinear(rgb, lutP);
+            rgb = [rgb[0] + (lut[0] - rgb[0]) * lm, rgb[1] + (lut[1] - rgb[1]) * lm, rgb[2] + (lut[2] - rgb[2]) * lm];
+        }
+    }
     const bp = ba[2];
     const wp = Math.max(ba[3], bp + 1e-4);
     rgb = rgb.map((x) => (x - bp) / Math.max(wp - bp, 1e-4));
@@ -2555,6 +3400,9 @@ const shDcFromRgb = (r, g, b) => [
 /** True when grade matches defaults (export can skip CPU round-trip / HSV). */
 const colorGradeIsIdentity = (grade) => {
     const gd = grade || createDefaultColorGrade();
+    if (gd.enabled === false) return true;
+    if ((Number(gd.toneMode) || 0) !== 0) return false;
+    if (gd.lutRgb?.length && gd.lutSize) return false;
     if (Math.abs(Number(gd.exposure) || 0) > 1e-5) return false;
     if (Math.abs(Number(gd.contrast) - 1) > 1e-5) return false;
     if (Math.abs(Number(gd.blackPoint) || 0) > 1e-5) return false;
@@ -2573,6 +3421,49 @@ const colorGradeIsIdentity = (grade) => {
     return true;
 };
 
+const destroyGradeLutGpu = (grade) => {
+    grade?.lutTexture?.destroy?.();
+    if (grade) {
+        grade.lutTexture = null;
+        grade._lutTexSource = null;
+    }
+};
+
+const ensureGradeLutGpuTexture = (grade) => {
+    if (!grade?.lutRgb?.length || !grade.lutSize) {
+        destroyGradeLutGpu(grade);
+        return;
+    }
+    if (grade.lutTexture && grade._lutTexSource === grade.lutRgb) return;
+    const parsed = {
+        size: grade.lutSize,
+        rgb: grade.lutRgb,
+        domainMin: grade.lutDomainMin || [0, 0, 0],
+        domainMax: grade.lutDomainMax || [1, 1, 1],
+    };
+    const rgba = lutFloatRgbToRgba8(parsed);
+    const N = grade.lutSize;
+    destroyGradeLutGpu(grade);
+    const tex = new pc.Texture(app.graphicsDevice, {
+        width: N * N,
+        height: N,
+        format: pc.PIXELFORMAT_RGBA8,
+        mipmaps: false,
+        minFilter: pc.FILTER_LINEAR,
+        magFilter: pc.FILTER_LINEAR,
+        addressU: pc.ADDRESS_CLAMP_TO_EDGE,
+        addressV: pc.ADDRESS_CLAMP_TO_EDGE,
+        name: 'color-grade-lut',
+    });
+    const d = tex.lock();
+    if (d && rgba.length <= d.length) {
+        d.set(rgba);
+    }
+    tex.unlock();
+    grade.lutTexture = tex;
+    grade._lutTexSource = grade.lutRgb;
+};
+
 const applyGradeToFdcTriplets = (f0, f1, f2, i0, count, grade) => {
     if (colorGradeIsIdentity(grade)) return;
     for (let i = i0; i < i0 + count; i++) {
@@ -2586,7 +3477,13 @@ const applyGradeToFdcTriplets = (f0, f1, f2, i0, count, grade) => {
 };
 
 const clampLayerOpacityPct = (v) => {
-    const n = Number(v);
+    let n;
+    if (typeof v === 'string') {
+        n = parseNumericOrExpr(v.trim());
+        if (n == null) n = Number(v);
+    } else {
+        n = Number(v);
+    }
     if (!Number.isFinite(n)) return 100;
     return Math.max(0, Math.min(100, Math.round(n)));
 };
@@ -2613,6 +3510,26 @@ const pushLayerOpacityToGsplat = (gsplat, pct) => {
 const applyColorGradeToGsplat = (gsplat, grade) => {
     if (!gsplat?.setParameter) return;
     const gd = grade || createDefaultColorGrade();
+    ensureGradeLutGpuTexture(gd);
+    const lutOn = !!(gd.lutRgb?.length && gd.lutSize && gd.lutTexture);
+    const Nlut = lutOn ? gd.lutSize : 2;
+    const lo = gd.lutDomainMin || [0, 0, 0];
+    const hi = gd.lutDomainMax || [1, 1, 1];
+    const inv = [
+        1 / Math.max(1e-8, hi[0] - lo[0]),
+        1 / Math.max(1e-8, hi[1] - lo[1]),
+        1 / Math.max(1e-8, hi[2] - lo[2]),
+    ];
+    gsplat.setParameter('uGradeToneMode', Math.max(0, Math.min(5, Number(gd.toneMode) || 0)));
+    gsplat.setParameter('uGradeLutMeta', [
+        lutOn ? 1 : 0,
+        Nlut,
+        Math.max(0, Math.min(1, Number(gd.lutMix) ?? 1)),
+        0,
+    ]);
+    gsplat.setParameter('uGradeLutDomainMin', [lo[0], lo[1], lo[2]]);
+    gsplat.setParameter('uGradeLutDomainInv', inv);
+    gsplat.setParameter('uGradeLutTex', lutOn ? gd.lutTexture : getDummyGradeLutTex());
     gsplat.setParameter('uGradeBasicA', [
         Math.max(-4, Math.min(4, Number(gd.exposure) || 0)),
         Math.max(0.1, Math.min(3, Number(gd.contrast) || 1)),
@@ -2629,6 +3546,7 @@ const applyColorGradeToGsplat = (gsplat, grade) => {
     gsplat.setParameter('uGradeWheelMd', wheelRgbOffset(gd.wheelMidHex, gd.wheelMidAmt));
     gsplat.setParameter('uGradeWheelHi', wheelRgbOffset(gd.wheelHighHex, gd.wheelHighAmt));
     gsplat.setParameter('uGradeCross', [0.2, 0.45, 0.55, 0.8]);
+    gsplat.setParameter('uGradeEnabled', gd.enabled === false ? 0 : 1);
     for (let i = 0; i < 8; i++) {
         const s = gd.sectors[i] || { h: 0, s: 0, l: 0 };
         gsplat.setParameter(`uGradeSec${i}`, [
@@ -2707,6 +3625,9 @@ const readColorGradeFromUIInto = (grade) => {
         grade.sectors[i].s = rf(`cg-s${i}-s`, 0);
         grade.sectors[i].l = rf(`cg-s${i}-l`, 0);
     }
+    const toneEl = g('cg-tone-mode');
+    grade.toneMode = toneEl ? Math.max(0, Math.min(5, parseInt(toneEl.value, 10) || 0)) : 0;
+    grade.lutMix = rf('cg-lut-mix', 1);
 };
 
 const commitActiveColorGradeFromUI = () => {
@@ -2714,6 +3635,17 @@ const commitActiveColorGradeFromUI = () => {
     const { grade, gsplat } = getActiveColorGradeBundle();
     readColorGradeFromUIInto(grade);
     applyColorGradeToGsplat(gsplat, grade);
+};
+
+const updateCgVisibilityButton = (enabled) => {
+    const btn = g('cg-toggle-visibility-btn');
+    if (!btn) return;
+    const on = enabled !== false;
+    btn.title = on ? 'Hide color grade edits for the active layer' : 'Show color grade edits for the active layer';
+    btn.setAttribute('aria-label', on ? 'Hide color grade edits' : 'Show color grade edits');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.classList.toggle('accent', !on);
+    btn.innerHTML = tablerIconHtmlSync(on ? 'eye' : 'eye-off', { size: 14 });
 };
 
 const refreshColorGradeUIFromSelection = () => {
@@ -2747,12 +3679,20 @@ const refreshColorGradeUIFromSelection = () => {
         if (g('cg-wheel-hi')) g('cg-wheel-hi').value = grade.wheelHighHex ?? '#808080';
         setR('cg-wheel-hi-amt', grade.wheelHighAmt ?? 0);
         setR('cg-wheel-hi-amt-num', grade.wheelHighAmt ?? 0);
+        syncSplitToneEditorsFromColorInputs();
         for (let i = 0; i < 8; i++) {
             const s = grade.sectors[i] || { h: 0, s: 0, l: 0 };
             setR(`cg-s${i}-h`, s.h);
             setR(`cg-s${i}-s`, s.s);
             setR(`cg-s${i}-l`, s.l);
         }
+        const tm = g('cg-tone-mode');
+        if (tm) tm.value = String(Math.max(0, Math.min(5, Number(grade.toneMode) || 0)));
+        setR('cg-lut-mix', grade.lutMix ?? 1);
+        setR('cg-lut-mix-num', grade.lutMix ?? 1);
+        const lutLab = g('cg-lut-name');
+        if (lutLab) lutLab.textContent = grade.lutName || '—';
+        updateCgVisibilityButton(grade.enabled !== false);
     } finally {
         _syncingColorGradeUI = false;
         refreshCgGradeSliderTracks();
@@ -2761,6 +3701,7 @@ const refreshColorGradeUIFromSelection = () => {
 
 const resetActiveColorGrade = () => {
     const { grade, gsplat } = getActiveColorGradeBundle();
+    destroyGradeLutGpu(grade);
     const fresh = createDefaultColorGrade();
     for (const k of Object.keys(fresh)) {
         if (k === 'sectors') grade.sectors = fresh.sectors.map((x) => ({ ...x }));
@@ -2794,10 +3735,12 @@ const bakeColorGradeIntoActiveTarget = async () => {
             s.f_dc_0 = dc[0]; s.f_dc_1 = dc[1]; s.f_dc_2 = dc[2];
             if (baked?.outOp) s.opacity = baked.outOp[i];
         }
+        destroyGradeLutGpu(activeLayer.colorGrade);
         activeLayer.colorGrade = createDefaultColorGrade();
         await updateLayerEntity(activeLayer);
         refreshColorGradeUIFromSelection();
         pushAllColorGradesToGPU();
+        getPosthog()?.capture('color_grade_baked', { target: 'layer', splat_count: activeLayer.splats.length });
         return;
     }
 
@@ -2850,10 +3793,12 @@ const bakeColorGradeIntoActiveTarget = async () => {
     redoStack.length = 0;
     activeStroke = null;
     updateUndoRedoUI();
+    destroyGradeLutGpu(baseColorGrade);
     baseColorGrade = createDefaultColorGrade();
-    await loadSplat(file, { preserveCamera: true });
+    await loadSplat(file, { preserveCamera: true, skipAuthGate: true });
     refreshColorGradeUIFromSelection();
     pushAllColorGradesToGPU();
+    getPosthog()?.capture('color_grade_baked', { target: 'base', splat_count: gsplatDataCache?.numSplats ?? 0 });
 };
 
 const strokeTouchesLayerId = (stroke, layerId) =>
@@ -2888,6 +3833,7 @@ const bakeBrushPaintIntoModel = async () => {
         activeStroke = null;
         updateUndoRedoUI();
         await updateLayerEntity(activeLayer);
+        getPosthog()?.capture('paint_baked', { target: 'layer', splat_count: activeLayer.splats.length });
         return;
     }
 
@@ -2933,7 +3879,8 @@ const bakeBrushPaintIntoModel = async () => {
     redoStack.length = 0;
     activeStroke = null;
     updateUndoRedoUI();
-    await loadSplat(file, { preserveCamera: true });
+    getPosthog()?.capture('paint_baked', { target: 'base', splat_count: gsplatDataCache?.numSplats ?? 0 });
+    await loadSplat(file, { preserveCamera: true, skipAuthGate: true });
     pushAllColorGradesToGPU();
 };
 
@@ -3197,16 +4144,26 @@ const addLayer = () => {
     hasSelection = false;
     renderLayersUI();
     updateLayerEntity(layer);
+    getPosthog()?.capture('layer_added', { layer_name: layer.name });
 };
 
 const deleteLayer = (layerId) => {
     const idx = layers.findIndex((l) => l.id === layerId);
     if (idx < 0) return;
     const layer = layers[idx];
+    getPosthog()?.capture('layer_deleted', { layer_name: layer.name, splat_count: layer.splats.length });
     destroyLayerGsplatPaint(layer);
     const child = layersContainer.findByName(`layer-${layerId}`);
     if (child) child.destroy();
     layers.splice(idx, 1);
+    let removedSavedSel = false;
+    for (let i = savedSelections.length - 1; i >= 0; i--) {
+        if (savedSelections[i].layerId === layerId) {
+            savedSelections.splice(i, 1);
+            removedSavedSel = true;
+        }
+    }
+    if (removedSavedSel) renderSavedSelectionsList();
     if (selectedLayerId === layerId) {
         selectedLayerId = layers.length ? layers[Math.min(idx, layers.length - 1)].id : 'base';
         hasSelection = selectedLayerId === 'base'
@@ -3226,6 +4183,36 @@ const duplicateLayerDisplayName = (baseName) => {
         n++;
     }
     return name;
+};
+
+/** Unique name among saved selections (for duplicated layer selections). */
+const duplicateSavedSelectionDisplayName = (baseName) => {
+    const used = new Set(savedSelections.map((s) => s.name));
+    let name = `${baseName} copy`;
+    let n = 2;
+    while (used.has(name)) {
+        name = `${baseName} copy ${n}`;
+        n++;
+    }
+    return name;
+};
+
+/** Clone saved selections tied to `fromLayerId` onto `toLayerId` (same splat count / mask indices). */
+const duplicateSavedSelectionsForLayer = (fromLayerId, toLayerId, numSplats) => {
+    let added = false;
+    for (const s of savedSelections) {
+        if (s.layerId !== fromLayerId) continue;
+        if (s.numSplats !== numSplats || s.mask?.length !== numSplats) continue;
+        savedSelections.push({
+            id: 'sel-' + Date.now() + '-' + Math.random().toString(36).slice(2),
+            name: duplicateSavedSelectionDisplayName(s.name),
+            layerId: toLayerId,
+            numSplats,
+            mask: new Uint8Array(s.mask),
+        });
+        added = true;
+    }
+    if (added) renderSavedSelectionsList();
 };
 
 /** Deep-copy splats + transform; bakes brush from GPU so the copy matches the viewport. */
@@ -3292,6 +4279,7 @@ const duplicateLayer = async (layerId) => {
         alert(`Duplicate layer failed: ${e?.message || e}`);
         return;
     }
+    duplicateSavedSelectionsForLayer(src.id, newLayer.id, newLayer.splats.length);
     renderLayersUI();
     refreshLayerGizmoAttachment();
 };
@@ -3454,8 +4442,8 @@ let _syncingLayerTransformUI = false;
 const readLayerTransformInputsIntoModel = () => {
     if (_syncingLayerTransformUI) return;
     const num = (id, def = 0) => {
-        const v = parseFloat(g(id)?.value);
-        return Number.isFinite(v) ? v : def;
+        const v = numericFieldValueOrNull(g(id)?.value);
+        return v != null ? v : def;
     };
     const clampPos = (v) => Math.max(-1000, Math.min(1000, v));
     const clampRot = (v) => Math.max(-360, Math.min(360, v));
@@ -3626,7 +4614,7 @@ const renderLayersUI = () => {
           <button class="layer-visibility${layer.visible ? '' : ' hidden'}" title="${layer.visible ? 'Hide' : 'Show'}">${layerVisIcon(layer.visible)}</button>
           <span class="layer-icon">${tablerIconHtmlSync('layout-grid', { size: 13 })}</span>
           <span class="layer-name">${layer.name}</span>
-          <input type="number" class="layer-opacity-input" min="0" max="100" step="1" value="${layer.opacityPct}" title="Opacity %" aria-label="Layer opacity %" />
+          <input type="text" class="layer-opacity-input" inputmode="numeric" spellcheck="false" value="${layer.opacityPct}" title="Opacity %" aria-label="Layer opacity %" />
           <button class="layer-duplicate" title="Duplicate layer">
             ${tablerIconHtmlSync('copy', { size: 12 })}
           </button>
@@ -3686,7 +4674,7 @@ const renderLayersUI = () => {
       <button class="layer-visibility${baseVisible ? '' : ' hidden'}" title="${baseVisible ? 'Hide' : 'Show'}">${layerVisIcon(baseVisible)}</button>
       <span class="layer-icon">${tablerIconHtmlSync('stack-2', { size: 13 })}</span>
       <span class="layer-name">${baseModelName || 'Model'}</span>
-      <input type="number" class="layer-opacity-input" min="0" max="100" step="1" value="${baseLayerOpacityPct}" title="Opacity %" aria-label="Base opacity %" ${baseLoaded ? '' : 'disabled'} />
+      <input type="text" class="layer-opacity-input" inputmode="numeric" spellcheck="false" value="${baseLayerOpacityPct}" title="Opacity %" aria-label="Base opacity %" ${baseLoaded ? '' : 'disabled'} />
       ${baseLoaded ? `<button class="layer-delete" title="Remove base model (layers kept)">
             ${tablerIconHtmlSync('trash', { size: 12 })}
           </button>` : ''}
@@ -3740,6 +4728,7 @@ const renderLayersUI = () => {
     refreshLayerGizmoAttachment();
     refreshColorGradeUIFromSelection();
     updateEmptyScenePlaceholder();
+    renderSavedSelectionsList();
 };
 
 const LAYER_REORDER_MIME = 'application/x-photoshock-layer';
@@ -4265,6 +5254,7 @@ const updateSelectionUI = () => {
         pushSplatViewShaderUniforms(entity.gsplat);
         pushLayerOpacityToGsplat(entity.gsplat, layer.opacityPct);
     }
+    syncViewportSelectionFrame();
 };
 
 const saveSelection = () => {
@@ -4354,17 +5344,23 @@ const importSelections = () => {
     input.click();
 };
 
+/** `savedSelections[].layerId` uses `'base'` for the loaded model. */
+const activeSavedSelectionLayerKey = () =>
+    (selectedLayerId === 'base' || !selectedLayerId ? 'base' : selectedLayerId);
+
 const renderSavedSelectionsList = () => {
     const list = g('saved-selections-list');
     if (!list) return;
-    list.innerHTML = savedSelections.map(s => `
+    const lid = activeSavedSelectionLayerKey();
+    const visible = savedSelections.filter((s) => s.layerId === lid);
+    list.innerHTML = visible.map(s => `
         <div class="saved-sel-item">
             <span class="saved-sel-name" title="Load">${s.name}</span>
             <span class="saved-sel-count">${s.mask.reduce((a,b)=>a+b,0).toLocaleString()}</span>
             <button class="opt-btn small-btn" data-load="${s.id}" title="Load">Load</button>
             <button class="opt-btn small-btn" data-delete="${s.id}" title="Delete">×</button>
         </div>
-    `).join('') || '<span class="opt-hint">No saved selections</span>';
+    `).join('') || '<span class="opt-hint">No saved selections for this layer</span>';
     list.querySelectorAll('[data-load]').forEach(btn => {
         btn.addEventListener('click', () => {
             const sel = savedSelections.find(s => s.id === btn.dataset.load);
@@ -4429,7 +5425,7 @@ let colorLoupeScratch = null;
 
 const colorLoupeShouldShow = () =>
     hasRenderableSplats() &&
-    (activeTool === 'colorSelect' || awaitingSwatchSplatPick);
+    (activeTool === 'colorSelect' || awaitingSwatchSplatPick || !!awaitingSplitToneSplatPick);
 
 const hideColorPixelLoupe = () => {
     colorLoupePending = null;
@@ -4530,6 +5526,15 @@ function cancelSwatchSplatPick() {
     hideColorPixelLoupe();
 }
 
+function cancelSplitToneSplatPick() {
+    if (!awaitingSplitToneSplatPick) return;
+    const key = awaitingSplitToneSplatPick;
+    awaitingSplitToneSplatPick = null;
+    canvasContainer.classList.remove('swatch-splat-pick-armed');
+    g(`cg-wheel-${key}-pick-btn`)?.classList.remove('accent-btn');
+    hideColorPixelLoupe();
+}
+
 canvasContainer.addEventListener('mousemove', (e) => {
     if (!colorLoupeShouldShow()) {
         hideColorPixelLoupe();
@@ -4567,11 +5572,11 @@ const splatDcToHex = (fdc0, fdc1, fdc2, idx) => {
 };
 
 /** Uses active layer/base data; respects ring hit test when enabled. Call after strokeDepth is set for depth-based fallback. */
-const addSwatchFromSplatAtScreen = (screenX, screenY) => {
+const pickSplatHexAtScreen = (screenX, screenY) => {
     const data = getActiveDataCache();
     const wEnt = getWorldMatEntityForActiveTarget();
     const layer = getActiveLayer();
-    if (!data || !wEnt) return false;
+    if (!data || !wEnt) return null;
     const { numSplats, x: xA, y: yA, z: zA, fdc0, fdc1, fdc2 } = data;
     let idx = -1;
     if (useRingHitSelection()) {
@@ -4580,7 +5585,7 @@ const addSwatchFromSplatAtScreen = (screenX, screenY) => {
     }
     if (idx < 0) {
         const worldPt = getWorldPoint(screenX, screenY);
-        if (!worldPt) return false;
+        if (!worldPt) return null;
         const invMat = new pc.Mat4().copy(wEnt.getWorldTransform()).invert();
         const modelPt = new pc.Vec3();
         invMat.transformPoint(worldPt, modelPt);
@@ -4593,8 +5598,14 @@ const addSwatchFromSplatAtScreen = (screenX, screenY) => {
             if (d2 < nearestD2) { nearestD2 = d2; idx = i; }
         }
     }
-    if (idx < 0) return false;
+    if (idx < 0) return null;
     const hex = splatDcToHex(fdc0, fdc1, fdc2, idx);
+    return hex || null;
+};
+
+/** Uses active layer/base data; respects ring hit test when enabled. Call after strokeDepth is set for depth-based fallback. */
+const addSwatchFromSplatAtScreen = (screenX, screenY) => {
+    const hex = pickSplatHexAtScreen(screenX, screenY);
     if (!hex) return false;
     swatches.push({ id: 'swatch-' + Date.now(), hex });
     persistSwatches();
@@ -4618,104 +5629,456 @@ const clearSelection = (opts = {}) => {
     if (recordUndo) pushSelectionUndoFromBefore(before);
 };
 
-const yieldToMain = () => new Promise((r) => requestAnimationFrame(r));
-
-/** Copy `src[kept[j]]` into a dense Float32Array; optional rAF yields for huge clouds. */
-const filterArrayByKeptIndices = async (src, kept) => {
+/** Copy `src[kept[j]]` into a dense Float32Array (sync; used by delete-selection and similar). */
+const filterArrayByKeptIndicesSync = (src, kept) => {
     if (!src || !kept.length) return null;
     const out = new Float32Array(kept.length);
-    const chunk = 200_000;
-    const useYield = kept.length >= 120_000;
-    for (let j0 = 0; j0 < kept.length; j0 += chunk) {
-        const j1 = Math.min(j0 + chunk, kept.length);
-        for (let j = j0; j < j1; j++) out[j] = src[kept[j]];
-        if (useYield && j1 < kept.length) await yieldToMain();
+    for (let j = 0; j < kept.length; j++) out[j] = src[kept[j]];
+    return out;
+};
+
+const yieldOneFrame = () => new Promise((r) => requestAnimationFrame(r));
+
+const yieldNextMacrotask = () => new Promise((r) => setTimeout(r, 0));
+
+/** Chunked copy for delete-selection compaction — avoids multi‑second main-thread freezes. */
+const FILTER_KEPT_YIELD_EVERY = 48_000;
+
+const filterArrayByKeptIndicesAsync = async (src, kept) => {
+    if (!src || !kept.length) return null;
+    const len = kept.length;
+    const out = new Float32Array(len);
+    for (let j = 0; j < len; ) {
+        const end = Math.min(j + FILTER_KEPT_YIELD_EVERY, len);
+        for (; j < end; j++) out[j] = src[kept[j]];
+        if (j < len) await yieldNextMacrotask();
     }
     return out;
 };
 
+/** Build `kept` (non-deleted indices) with periodic macrotask yields for huge clouds. */
+const KEPT_SCAN_YIELD_EVERY = 200_000;
+
+const buildKeptIndicesFromDeleteMaskAsync = async (delMaskCopy, n, kKeep) => {
+    const kept = new Uint32Array(kKeep);
+    let kw = 0;
+    for (let i = 0; i < n; i++) {
+        if (!delMaskCopy[i]) kept[kw++] = i;
+        if (i > 0 && i % KEPT_SCAN_YIELD_EVERY === 0) await yieldNextMacrotask();
+    }
+    return kept;
+};
+
+/** Yield inside `getPaintFromGpu` merge loop so large clouds stay responsive (delete-selection). */
+const GPU_PAINT_MERGE_YIELD_EVERY = 48_000;
+/** Tighter cadence while finalizing delete (keeps UI/orbit responsive during merge). */
+const DELETE_SEL_MERGE_YIELD_EVERY = 8192;
+
+const yieldThreeFrames = async () => {
+    await yieldOneFrame();
+    await yieldOneFrame();
+    await yieldOneFrame();
+};
+
+/**
+ * One pass over `delMask`: stamps full erase into base `customOpacity` (same as eraser) and
+ * returns how many splats are selected. Avoids an extra O(n) scan before the first paint.
+ */
+const countSelectedAndStampFullEraseBaseGpu = (delMask) => {
+    if (!delMask?.length || !paintables.length || !gsplatDataCache) return 0;
+    const gsp = paintables[0].gsplatComponent;
+    const tex = gsp.getInstanceTexture('customOpacity');
+    if (!tex) return 0;
+    const d = tex.lock();
+    if (!d) return 0;
+    const numTexels = tex.width * tex.height;
+    const n = Math.min(delMask.length, gsplatDataCache.numSplats, numTexels);
+    let nDel = 0;
+    for (let i = 0; i < n; i++) {
+        if (!delMask[i]) continue;
+        nDel++;
+        const off = i * 4;
+        d[off] = 0;
+        d[off + 1] = 0;
+        d[off + 2] = 0;
+        d[off + 3] = 255;
+    }
+    tex.unlock();
+    gsp.workBufferUpdate = pc.WORKBUFFER_UPDATE_ONCE;
+    return nDel;
+};
+
+/** Same as stampFullEraseOnBaseSelectionGpu for a user layer (CPU index → GPU texel map). */
+const stampFullEraseOnLayerSelectionGpu = (layer) => {
+    if (!layer?.selectionMask?.length || !layer._gsplatPaint?.gsplatComponent) return;
+    const gsp = layer._gsplatPaint.gsplatComponent;
+    const tex = gsp.getInstanceTexture('customOpacity');
+    if (!tex) return;
+    const d = tex.lock();
+    if (!d) return;
+    const numTexels = tex.width * tex.height;
+    const map = layer._cpuToGpuSplat;
+    const n = layer.selectionMask.length;
+    for (let cpu = 0; cpu < n; cpu++) {
+        if (!layer.selectionMask[cpu]) continue;
+        const gpu = map ? map[cpu] : cpu;
+        if (gpu < 0 || gpu >= numTexels) continue;
+        const off = gpu * 4;
+        d[off] = 0;
+        d[off + 1] = 0;
+        d[off + 2] = 0;
+        d[off + 3] = 255;
+    }
+    tex.unlock();
+    gsp.workBufferUpdate = pc.WORKBUFFER_UPDATE_ONCE;
+};
+
 let removeSelectedSplatsBusy = false;
+
+// ── Delete selection: PLY encode off main thread (writePly blocks for large clouds) ─
+let plyDeleteWorker = null;
+let plyDeleteWorkerJobId = 1;
+/** @type {Map<number, { resolve: (b: ArrayBuffer) => void, reject: (e: Error) => void }>} */
+const plyDeleteWorkerCallbacks = new Map();
+
+const ensurePlyDeleteWorker = () => {
+    if (plyDeleteWorker) return plyDeleteWorker;
+    plyDeleteWorker = new Worker(new URL('./delete-selection-ply-worker.js', import.meta.url), { type: 'module' });
+    plyDeleteWorker.onmessage = (ev) => {
+        const { id, buffer, error } = ev.data;
+        const cb = plyDeleteWorkerCallbacks.get(id);
+        if (!cb) return;
+        plyDeleteWorkerCallbacks.delete(id);
+        if (error) cb.reject(new Error(error));
+        else cb.resolve(buffer);
+    };
+    plyDeleteWorker.onerror = (ev) => {
+        const err = new Error(ev.message || 'PLY worker failed');
+        for (const [, cbs] of plyDeleteWorkerCallbacks) cbs.reject(err);
+        plyDeleteWorkerCallbacks.clear();
+        try {
+            plyDeleteWorker?.terminate();
+        } catch (_) { /* ignore */ }
+        plyDeleteWorker = null;
+    };
+    return plyDeleteWorker;
+};
+
+// ── Delete selection: merge GPU readback (O(n)) off main thread (keeps UI alive) ─
+let gpuMergeWorker = null;
+let gpuMergeWorkerJobId = 1;
+/** @type {Map<number, { resolve: (v: object) => void, reject: (e: Error) => void }>} */
+const gpuMergeWorkerCallbacks = new Map();
+
+/** Below this splat count, inline merge is cheaper than worker setup + copies. */
+const MIN_SPLATS_FOR_GPU_MERGE_WORKER = 8192;
+
+const ensureGpuMergeWorker = () => {
+    if (gpuMergeWorker) return gpuMergeWorker;
+    gpuMergeWorker = new Worker(new URL('./delete-selection-gpu-merge-worker.js', import.meta.url), { type: 'module' });
+    gpuMergeWorker.onmessage = (ev) => {
+        const { id, out0, out1, out2, outOp, error } = ev.data;
+        const cb = gpuMergeWorkerCallbacks.get(id);
+        if (!cb) return;
+        gpuMergeWorkerCallbacks.delete(id);
+        if (error) cb.reject(new Error(error));
+        else {
+            cb.resolve({
+                out0: new Float32Array(out0),
+                out1: new Float32Array(out1),
+                out2: new Float32Array(out2),
+                outOp: new Float32Array(outOp),
+            });
+        }
+    };
+    gpuMergeWorker.onerror = (ev) => {
+        const err = new Error(ev.message || 'GPU merge worker failed');
+        for (const [, cbs] of gpuMergeWorkerCallbacks) cbs.reject(err);
+        gpuMergeWorkerCallbacks.clear();
+        try {
+            gpuMergeWorker?.terminate();
+        } catch (_) { /* ignore */ }
+        gpuMergeWorker = null;
+    };
+    return gpuMergeWorker;
+};
+
+const mergeGpuPaintReadbackInWorker = (n, w, h, curBlend, colorData, opacityData, fdc0, fdc1, fdc2, opacity) =>
+    new Promise((resolve, reject) => {
+        const id = gpuMergeWorkerJobId++;
+        gpuMergeWorkerCallbacks.set(id, { resolve, reject });
+        const colorBytes = colorData instanceof Uint8Array
+            ? colorData
+            : new Uint8Array(colorData.buffer, colorData.byteOffset, colorData.byteLength);
+        const opacityBytes = opacityData instanceof Uint8Array
+            ? opacityData
+            : new Uint8Array(opacityData.buffer, opacityData.byteOffset, opacityData.byteLength);
+        const colorCopy = new Uint8Array(colorBytes);
+        const opacityCopy = new Uint8Array(opacityBytes);
+        const f0 = new Float32Array(fdc0);
+        const f1 = new Float32Array(fdc1);
+        const f2 = new Float32Array(fdc2);
+        const op = new Float32Array(opacity);
+        const transfer = [
+            colorCopy.buffer,
+            opacityCopy.buffer,
+            f0.buffer,
+            f1.buffer,
+            f2.buffer,
+            op.buffer,
+        ];
+        try {
+            ensureGpuMergeWorker().postMessage(
+                {
+                    id,
+                    n,
+                    w,
+                    h,
+                    curBlend,
+                    colorBuffer: colorCopy.buffer,
+                    opacityBuffer: opacityCopy.buffer,
+                    f0Buffer: f0.buffer,
+                    f1Buffer: f1.buffer,
+                    f2Buffer: f2.buffer,
+                    opBuffer: op.buffer,
+                },
+                transfer,
+            );
+        } catch (err) {
+            gpuMergeWorkerCallbacks.delete(id);
+            reject(err);
+        }
+    });
+
+/**
+ * Encode compacted splats as binary little-endian PLY in a Web Worker (copies column data; originals stay valid).
+ */
+const encodeSplatsPlyBinaryWithWorker = (columns) =>
+    new Promise((resolve, reject) => {
+        if (!columns?.length) {
+            reject(new Error('no columns'));
+            return;
+        }
+        const rowCount = columns[0].data.length;
+        const names = [];
+        const buffers = [];
+        for (const col of columns) {
+            if (col.data.length !== rowCount) {
+                reject(new Error(`column length mismatch: ${col.name}`));
+                return;
+            }
+            names.push(col.name);
+            const a = col.data;
+            buffers.push(a.buffer.slice(a.byteOffset, a.byteOffset + a.byteLength));
+        }
+        if (typeof Worker === 'undefined') {
+            reject(new Error('Worker unavailable'));
+            return;
+        }
+        const id = plyDeleteWorkerJobId++;
+        plyDeleteWorkerCallbacks.set(id, { resolve, reject });
+        try {
+            ensurePlyDeleteWorker().postMessage({ id, names, rowCount, buffers }, buffers);
+        } catch (err) {
+            plyDeleteWorkerCallbacks.delete(id);
+            reject(err);
+        }
+    });
+
+/** While set, a base-model delete is still merging / encoding / reloading (Delete returns immediately). */
+let baseDeleteCompactionPromise = null;
+/** Keep selection-delete instant by default; compaction/reload can stall on large clouds. */
+const AUTO_COMPACT_ON_BASE_SELECTION_DELETE = false;
+/** Same policy for user layers: avoid immediate entity rebuild after selection delete. */
+const AUTO_COMPACT_ON_LAYER_SELECTION_DELETE = false;
+
+/** Chunked in-memory compaction for user-layer splat arrays after selection delete. */
+const LAYER_DELETE_FILTER_YIELD_EVERY = 40_000;
+const compactLayerSplatsByMaskAsync = async (layer, delMaskCopy) => {
+    if (!layer?.splats?.length || !delMaskCopy?.length) return;
+    const src = layer.splats;
+    const out = [];
+    for (let i = 0; i < src.length; i++) {
+        if (!delMaskCopy[i]) out.push(src[i]);
+        if (i > 0 && i % LAYER_DELETE_FILTER_YIELD_EVERY === 0) await yieldNextMacrotask();
+    }
+    layer.splats = out;
+    try {
+        await updateLayerEntity(layer);
+        applyModelRotation();
+        refreshLayerGizmoAttachment();
+    } catch (e) {
+        console.error('[layer] rebuild after selection delete', e);
+    }
+};
+
+/**
+ * Heavy path after instant GPU erase: merge paint, build compact PLY, replace base gsplat.
+ * Runs async so Delete/Backspace is not blocked for seconds. Keeps `selectionMask` until paint
+ * merge finishes so bucket stroke replay stays correct; clears it after.
+ */
+const runBaseSelectionDeleteCompaction = async (n, delMaskCopy, nDel) => {
+    const cache = gsplatDataCache;
+    if (!cache || cache.numSplats !== n) return;
+
+    instructions.innerHTML = '<p>Finalizing delete…</p>';
+
+    try {
+        await yieldOneFrame();
+        await yieldOneFrame();
+        await yieldNextMacrotask();
+
+        let painted;
+        if (strokes.length === 0) {
+            painted = applyAllCpuStrokes();
+        } else {
+            painted = (await getPaintFromGpu({
+                yieldEvery: DELETE_SEL_MERGE_YIELD_EVERY,
+                yieldBetweenTextureReads: true,
+                useWorkerMerge: true,
+                flushGpuBeforeRead: true,
+            })) ?? applyAllCpuStrokes();
+        }
+
+        selectionMask = null;
+        updateSelectionUI();
+
+        const { x: xA, y: yA, z: zA, shRest, extra } = cache;
+        const out0 = painted?.out0 ?? cache.fdc0;
+        const out1 = painted?.out1 ?? cache.fdc1;
+        const out2 = painted?.out2 ?? cache.fdc2;
+        const outOp = painted?.outOp ?? cache.opacity;
+
+        const kKeep = n - nDel;
+        const kept = await buildKeptIndicesFromDeleteMaskAsync(delMaskCopy, n, kKeep);
+
+        const columns = [];
+        const addColDel = async (name, data) => {
+            if (!data) return;
+            const colData = await filterArrayByKeptIndicesAsync(data, kept);
+            if (colData) columns.push(new Column(name, colData));
+            await yieldNextMacrotask();
+        };
+        await addColDel('x', xA);
+        await addColDel('y', yA);
+        await addColDel('z', zA);
+        await addColDel('nx', extra.nx);
+        await addColDel('ny', extra.ny);
+        await addColDel('nz', extra.nz);
+        await addColDel('f_dc_0', out0);
+        await addColDel('f_dc_1', out1);
+        await addColDel('f_dc_2', out2);
+        for (const sh of shRest) await addColDel(sh.key, sh.data);
+        await addColDel('opacity', outOp);
+        await addColDel('scale_0', extra.scale_0);
+        await addColDel('scale_1', extra.scale_1);
+        await addColDel('scale_2', extra.scale_2);
+        await addColDel('rot_0', extra.rot_0);
+        await addColDel('rot_1', extra.rot_1);
+        await addColDel('rot_2', extra.rot_2);
+        await addColDel('rot_3', extra.rot_3);
+
+        await yieldNextMacrotask();
+
+        let buffer;
+        try {
+            buffer = await encodeSplatsPlyBinaryWithWorker(columns);
+        } catch (werr) {
+            console.warn('[delete-sel] worker PLY encode failed, using main thread', werr);
+            const table = new DataTable(columns);
+            const memFs = new MemoryFileSystem();
+            const filename = 'painted.ply';
+            await writePly(
+                { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
+                memFs,
+            );
+            buffer = memFs.results?.get(filename);
+            if (!buffer) {
+                alert('Remove failed.');
+                return;
+            }
+        }
+
+        await yieldNextMacrotask();
+
+        const blob = new Blob([buffer], { type: 'application/octet-stream' });
+        const file = new File([blob], 'painted.ply', { type: 'application/octet-stream' });
+        await replaceBaseModelWithPlyFile(file, {
+            preserveCamera: true,
+            skipAuthGate: true,
+            staggerHeavyInit: true,
+        });
+    } catch (err) {
+        console.error('[delete-sel] compaction', err);
+        alert(`Could not finish deleting selection: ${err?.message || err}`);
+    } finally {
+        if (instructions.textContent?.includes('Finalizing delete')) instructions.innerHTML = '';
+    }
+};
 
 const removeSelectedSplats = async () => {
     if (removeSelectedSplatsBusy) return;
+    if (baseDeleteCompactionPromise) return;
     removeSelectedSplatsBusy = true;
     try {
         // ── User layer: CPU removal ──────────────────────────────────────────────
         const activeLayer = getActiveLayer();
         if (activeLayer) {
             if (!hasSelection || !activeLayer.selectionMask) return;
-            const before = activeLayer.splats.length;
-            activeLayer.splats = activeLayer.splats.filter((_, i) => !activeLayer.selectionMask[i]);
-            if (activeLayer.splats.length === before) { clearSelection(); return; }
+            const delMaskCopy = new Uint8Array(activeLayer.selectionMask);
+            stampFullEraseOnLayerSelectionGpu(activeLayer);
+            await yieldThreeFrames();
+            await yieldNextMacrotask();
             activeLayer.selectionMask = null;
             hasSelection = false;
             selectionSphere = [0, 0, 0, -1];
             updateSelectionUI();
-            await yieldToMain();
-            await updateLayerEntity(activeLayer);
+            if (AUTO_COMPACT_ON_LAYER_SELECTION_DELETE) {
+                const before = activeLayer.splats.length;
+                activeLayer.splats = activeLayer.splats.filter((_, i) => !delMaskCopy[i]);
+                if (activeLayer.splats.length === before) { clearSelection(); return; }
+                await updateLayerEntity(activeLayer);
+            } else {
+                // Keep this path snappy: compact in-memory splats without reloading layer entity now.
+                void compactLayerSplatsByMaskAsync(activeLayer, delMaskCopy);
+            }
             return;
         }
 
-        // ── Base model: PLY rebuild ──────────────────────────────────────────────
+        // ── Base model: instant GPU erase, then async compaction (no long main-thread block) ─
         if (!gsplatDataCache || !hasSelection || !selectionMask) return;
-        const keep = (i) => !selectionMask[i];
         const n = gsplatDataCache.numSplats;
-        const kept = [];
-        for (let i = 0; i < n; i++) if (keep(i)) kept.push(i);
-        if (kept.length === n) { clearSelection(); return; }
-        if (kept.length === 0) { alert('Cannot remove all splats.'); return; }
+        const delMaskCopy = new Uint8Array(selectionMask);
 
-        const { x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache;
-        // GPU read is async and matches the viewport without replaying every stroke × every splat.
-        const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
-        const out0 = painted?.out0 ?? gsplatDataCache.fdc0;
-        const out1 = painted?.out1 ?? gsplatDataCache.fdc1;
-        const out2 = painted?.out2 ?? gsplatDataCache.fdc2;
-        const outOp = painted?.outOp ?? gsplatDataCache.opacity;
+        drainPendingPaints();
 
-        const columns = [];
-        const addCol = async (name, data) => {
-            if (!data) return;
-            const colData = await filterArrayByKeptIndices(data, kept);
-            if (colData) columns.push(new Column(name, colData));
-        };
-        await addCol('x', xA);
-        await addCol('y', yA);
-        await addCol('z', zA);
-        await addCol('nx', extra.nx);
-        await addCol('ny', extra.ny);
-        await addCol('nz', extra.nz);
-        await addCol('f_dc_0', out0);
-        await addCol('f_dc_1', out1);
-        await addCol('f_dc_2', out2);
-        for (const sh of shRest) await addCol(sh.key, sh.data);
-        await addCol('opacity', outOp);
-        await addCol('scale_0', extra.scale_0);
-        await addCol('scale_1', extra.scale_1);
-        await addCol('scale_2', extra.scale_2);
-        await addCol('rot_0', extra.rot_0);
-        await addCol('rot_1', extra.rot_1);
-        await addCol('rot_2', extra.rot_2);
-        await addCol('rot_3', extra.rot_3);
+        const nDel = countSelectedAndStampFullEraseBaseGpu(delMaskCopy);
+        if (nDel === 0) { clearSelection(); return; }
+        if (nDel === n) { alert('Cannot remove all splats.'); return; }
+
+        await yieldThreeFrames();
+        await yieldNextMacrotask();
 
         hasSelection = false;
         selectionSphere = [0, 0, 0, -1];
-        selectionMask = null;
         updateSelectionUI();
-        await yieldToMain();
 
-        const table = new DataTable(columns);
-        const memFs = new MemoryFileSystem();
-        const filename = 'painted.ply';
-        await writePly(
-            { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
-            memFs,
-        );
-        const buffer = memFs.results?.get(filename);
-        if (!buffer) { alert('Remove failed.'); return; }
-        const blob = new Blob([buffer], { type: 'application/octet-stream' });
-        const file = new File([blob], 'painted.ply', { type: 'application/octet-stream' });
-        await loadSplat(file, { preserveCamera: true });
+        if (AUTO_COMPACT_ON_BASE_SELECTION_DELETE) {
+            baseDeleteCompactionPromise = (async () => {
+                await yieldOneFrame();
+                await yieldNextMacrotask();
+                await runBaseSelectionDeleteCompaction(n, delMaskCopy, nDel);
+            })().finally(() => {
+                baseDeleteCompactionPromise = null;
+            });
+        } else {
+            // Keep delete responsive: hide on GPU but CPU pick/selection must ignore removed indices.
+            if (!baseSplatAliveMask || baseSplatAliveMask.length !== n) resetBaseSplatAliveMask(n);
+            for (let i = 0; i < n; i++) {
+                if (delMaskCopy[i]) baseSplatAliveMask[i] = 0;
+            }
+            selectionMask = null;
+        }
     } finally {
         removeSelectedSplatsBusy = false;
     }
@@ -4797,7 +6160,7 @@ const sharpenSelectedSplats = async () => {
     if (!buffer) { alert('Sharpen failed.'); return; }
     const blob = new Blob([buffer], { type: 'application/octet-stream' });
     const file = new File([blob], 'painted.ply', { type: 'application/octet-stream' });
-    await loadSplat(file, { preserveCamera: true });
+    await loadSplat(file, { preserveCamera: true, skipAuthGate: true });
 };
 
 const selectAll = (opts = {}) => {
@@ -4807,7 +6170,11 @@ const selectAll = (opts = {}) => {
     if (!data) return;
     const n = data.numSplats;
     const mask = getActiveSelectionMask(n);
-    mask.fill(1);
+    if (!data.isLayerData && baseSplatAliveMask) {
+        for (let i = 0; i < n; i++) mask[i] = isBaseSplatAlive(i) ? 1 : 0;
+    } else {
+        mask.fill(1);
+    }
     hasSelection = true;
     selectionSphere = [0, 0, 0, 9999];
     updateSelectionUI();
@@ -4845,6 +6212,7 @@ const applyPolygonSelection = (poly, mode = selectionMode) => {
     const collectCenterHits = () => {
         const hits = [];
         for (let i = 0; i < numSplats; i++) {
+            if (!data.isLayerData && !isBaseSplatAlive(i)) continue;
             worldMat.transformPoint(new pc.Vec3(xA[i], yA[i], zA[i]), worldPt);
             cameraEntity.camera.worldToScreen(worldPt, screenPt);
             if (screenPt.z < 0) continue;
@@ -4937,6 +6305,11 @@ const recomputeSelectionSphere = () => {
     const mask = peekActiveSelectionMask();
     if (!data || !mask) { hasSelection = false; selectionSphere = [0,0,0,-1]; return; }
     const { numSplats, x: xA, y: yA, z: zA } = data;
+    if (!data.isLayerData && baseSplatAliveMask) {
+        for (let i = 0; i < numSplats; i++) {
+            if (mask[i] && !isBaseSplatAlive(i)) mask[i] = 0;
+        }
+    }
     hasSelection = mask.some(v => v > 0);
     if (!hasSelection) { selectionSphere = [0, 0, 0, -1]; return; }
 
@@ -4976,6 +6349,7 @@ const applyColorSelection = (worldPt, mode = selectionMode, screenX, screenY) =>
     if (nearestIdx < 0) {
         let nearestD2 = Infinity;
         for (let i = 0; i < numSplats; i++) {
+            if (!data.isLayerData && !isBaseSplatAlive(i)) continue;
             const dx = xA[i] - modelPt.x;
             const dy = yA[i] - modelPt.y;
             const dz = zA[i] - modelPt.z;
@@ -4991,6 +6365,10 @@ const applyColorSelection = (worldPt, mode = selectionMode, screenX, screenY) =>
     const tol = colorTolerance();
 
     for (let i = 0; i < numSplats; i++) {
+        if (!data.isLayerData && !isBaseSplatAlive(i)) {
+            if (mode === 'new') mask[i] = 0;
+            continue;
+        }
         const r = Math.max(0, 0.5 + fdc0[i] * SH_C0);
         const g = Math.max(0, 0.5 + fdc1[i] * SH_C0);
         const b = Math.max(0, 0.5 + fdc2[i] * SH_C0);
@@ -5042,6 +6420,7 @@ const brushSelectAt = (screenX, screenY, mode = brushSelectEffectiveMode ?? sele
     if (useRingHitSelection()) {
         const ringHits = [];
         for (let i = 0; i < numSplats; i++) {
+            if (!data.isLayerData && !isBaseSplatAlive(i)) continue;
             const e = getSplatScreenEllipse(data, layer, i, wEnt);
             if (e && screenHitsSplatEllipse(screenX, screenY, e)) {
                 ringHits.push({ i, d: e.distCam });
@@ -5057,6 +6436,7 @@ const brushSelectAt = (screenX, screenY, mode = brushSelectEffectiveMode ?? sele
         }
     } else {
         for (let i = 0; i < numSplats; i++) {
+            if (!data.isLayerData && !isBaseSplatAlive(i)) continue;
             const dx = xA[i] - modelPt.x;
             const dy = yA[i] - modelPt.y;
             const dz = zA[i] - modelPt.z;
@@ -5099,6 +6479,7 @@ const splatPickAt = (screenX, screenY, addToSel) => {
     if (nearestIdx < 0) {
         let nearestD2 = Infinity;
         for (let i = 0; i < numSplats; i++) {
+            if (!data.isLayerData && !isBaseSplatAlive(i)) continue;
             const dx = xA[i] - modelPt.x;
             const dy = yA[i] - modelPt.y;
             const dz = zA[i] - modelPt.z;
@@ -5139,6 +6520,7 @@ const splatDragSelectAt = (screenX, screenY, addToSel) => {
 
     const picks = [];
     for (let i = 0; i < numSplats; i++) {
+        if (!data.isLayerData && !isBaseSplatAlive(i)) continue;
         if (useRingHitSelection()) {
             const e = getSplatScreenEllipse(data, layer, i, wEnt);
             if (!e || !screenHitsSplatEllipse(screenX, screenY, e)) continue;
@@ -5184,6 +6566,7 @@ const sampleColorAt = (worldPt) => {
 
     let nearestIdx = -1, nearestD2 = Infinity;
     for (let i = 0; i < numSplats; i++) {
+        if (!isBaseSplatAlive(i)) continue;
         const dx = xA[i] - modelPt.x, dy = yA[i] - modelPt.y, dz = zA[i] - modelPt.z;
         const d2 = dx * dx + dy * dy + dz * dz;
         if (d2 < nearestD2) { nearestD2 = d2; nearestIdx = i; }
@@ -5205,6 +6588,7 @@ const countSplatsInRadius = (modelCenter, modelRadius) => {
     if (gsplatDataCache) {
         const { numSplats, x: xA, y: yA, z: zA } = gsplatDataCache;
         for (let i = 0; i < numSplats; i++) {
+            if (!isBaseSplatAlive(i)) continue;
             const dx = xA[i] - modelCenter.x, dy = yA[i] - modelCenter.y, dz = zA[i] - modelCenter.z;
             if (dx * dx + dy * dy + dz * dz <= r2) count++;
         }
@@ -5575,12 +6959,14 @@ const frameCameraOnSelectedLayer = () => {
         let minx = Infinity, miny = Infinity, minz = Infinity;
         let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
         for (let i = 0; i < numSplats; i++) {
+            if (!isBaseSplatAlive(i)) continue;
             v.set(x[i], y[i], z[i]);
             wt.transformPoint(v, v);
             minx = Math.min(minx, v.x); maxx = Math.max(maxx, v.x);
             miny = Math.min(miny, v.y); maxy = Math.max(maxy, v.y);
             minz = Math.min(minz, v.z); maxz = Math.max(maxz, v.z);
         }
+        if (!Number.isFinite(minx)) return;
         const tcx = (minx + maxx) * 0.5;
         const tcy = (miny + maxy) * 0.5;
         const tcz = (minz + maxz) * 0.5;
@@ -5605,9 +6991,9 @@ const readShapeDimsFromUI = () => {
         const x = Number.isFinite(v) ? v : def;
         return Math.max(SHAPE_DIM_MIN, Math.min(SHAPE_DIM_MAX, x));
     };
-    const px = parseFloat(g('shape-size-x')?.value);
-    const py = parseFloat(g('shape-size-y')?.value);
-    const pz = parseFloat(g('shape-size-z')?.value);
+    const px = numericFieldValueOrNull(g('shape-size-x')?.value);
+    const py = numericFieldValueOrNull(g('shape-size-y')?.value);
+    const pz = numericFieldValueOrNull(g('shape-size-z')?.value);
     return {
         sx: clamp(px, 0.5),
         sy: clamp(py, 0.5),
@@ -5616,24 +7002,36 @@ const readShapeDimsFromUI = () => {
 };
 
 const readShapeRotFromUI = () => {
-    const p = (id) => { const v = parseFloat(g(id)?.value); return Number.isFinite(v) ? v : 0; };
+    const p = (id) => numericFieldValueOrNull(g(id)?.value) ?? 0;
     return { rx: p('shape-rot-x'), ry: p('shape-rot-y'), rz: p('shape-rot-z') };
+};
+
+const syncShapeTransformInputsFromApplied = () => {
+    const d = readShapeDimsFromUI();
+    const r = readShapeRotFromUI();
+    const sf = (v) => String(Math.round(v * 10000) / 10000);
+    if (g('shape-size-x')) g('shape-size-x').value = sf(d.sx);
+    if (g('shape-size-y')) g('shape-size-y').value = sf(d.sy);
+    if (g('shape-size-z')) g('shape-size-z').value = sf(d.sz);
+    if (g('shape-rot-x')) g('shape-rot-x').value = String(Math.round(r.rx));
+    if (g('shape-rot-y')) g('shape-rot-y').value = String(Math.round(r.ry));
+    if (g('shape-rot-z')) g('shape-rot-z').value = String(Math.round(r.rz));
 };
 
 const LS_SHAPE_TOOL = 'photoshock-shape-tool-v1';
 const saveShapeToolPrefs = () => {
     try {
-        let k = parseFloat(g('shape-density-num')?.value);
-        if (!Number.isFinite(k)) k = parseFloat(g('shape-density')?.value);
-        if (!Number.isFinite(k)) k = 5;
+        let k = numericFieldValueOrNull(g('shape-density-num')?.value);
+        if (k == null) k = numericFieldValueOrNull(g('shape-density')?.value);
+        if (k == null || !Number.isFinite(k)) k = 5;
         localStorage.setItem(LS_SHAPE_TOOL, JSON.stringify({
             type: g('shape-type')?.value ?? 'cube',
-            sx: parseFloat(g('shape-size-x')?.value) || 0.5,
-            sy: parseFloat(g('shape-size-y')?.value) || 0.5,
-            sz: parseFloat(g('shape-size-z')?.value) || 0.5,
-            rx: parseFloat(g('shape-rot-x')?.value) || 0,
-            ry: parseFloat(g('shape-rot-y')?.value) || 0,
-            rz: parseFloat(g('shape-rot-z')?.value) || 0,
+            sx: numericFieldValueOrNull(g('shape-size-x')?.value) ?? 0.5,
+            sy: numericFieldValueOrNull(g('shape-size-y')?.value) ?? 0.5,
+            sz: numericFieldValueOrNull(g('shape-size-z')?.value) ?? 0.5,
+            rx: numericFieldValueOrNull(g('shape-rot-x')?.value) ?? 0,
+            ry: numericFieldValueOrNull(g('shape-rot-y')?.value) ?? 0,
+            rz: numericFieldValueOrNull(g('shape-rot-z')?.value) ?? 0,
             densityK: k,
             hollow: !!g('shape-hollow-edges')?.checked,
             color: g('shape-color')?.value ?? '#cccccc',
@@ -5670,11 +7068,9 @@ const SHAPE_DENSITY_MAX = 1_000_000; // 1000k splats
 
 /** UI density is in k (1 → 1000 splats). Clamped to SHAPE_DENSITY_MIN…MAX actual. */
 const readShapeDensityFromUI = () => {
-    const fromNum = parseFloat(g('shape-density-num')?.value);
-    let k = Number.isFinite(fromNum)
-        ? fromNum
-        : parseFloat(g('shape-density')?.value ?? '5');
-    if (!Number.isFinite(k)) k = 5;
+    let k = numericFieldValueOrNull(g('shape-density-num')?.value);
+    if (k == null) k = numericFieldValueOrNull(g('shape-density')?.value ?? '5');
+    if (k == null) k = 5;
     const raw = Math.round(k * 1000);
     return Math.max(SHAPE_DENSITY_MIN, Math.min(SHAPE_DENSITY_MAX, raw));
 };
@@ -6140,121 +7536,6 @@ app.on('update', () => {
     }
 });
 
-// Squared distance from point P to segment AB in 2D (screen space).
-const distPointSeg2Sq = (px, py, ax, ay, bx, by) => {
-    const abx = bx - ax, aby = by - ay;
-    const apx = px - ax, apy = py - ay;
-    const ab2 = abx * abx + aby * aby;
-    if (ab2 < 1e-12) return apx * apx + apy * apy;
-    let t = (apx * abx + apy * aby) / ab2;
-    t = Math.max(0, Math.min(1, t));
-    const qx = ax + t * abx, qy = ay + t * aby;
-    const dx = px - qx, dy = py - qy;
-    return dx * dx + dy * dy;
-};
-
-// ── User-layer eraser ─────────────────────────────────────────────────────────
-// Remove splats that project inside the eraser disk, or within the disk swept
-// along the screen segment since the last applied pass (covers fast drags).
-// Runs at most once per animation frame (rAF) to avoid O(n)×mousemove jank.
-const runEraseUserLayerPass = (layer, p) => {
-    // During async rebuild the previous entity is renamed to __layer_rebuild_* so
-    // the new node can use the canonical name once ready.
-    const layerEnt = layersContainer.findByName(`layer-${layer.id}`)
-        ?? layersContainer.findByName(`__layer_rebuild_${layer.id}`);
-    if (!layerEnt) return;
-
-    const { screenX, screenY, screenX0, screenY0, worldRadius, worldDab, depthWorldFull } = p;
-
-    const fov     = cameraEntity.camera.fov * (Math.PI / 180);
-    const screenR = Math.max(4, (worldRadius / (orbit.distance * Math.tan(fov / 2))) * (canvas.clientHeight / 2));
-    const screenR2 = screenR * screenR;
-
-    const camPos = cameraEntity.getPosition();
-    const halfDepthW = (depthWorldFull || 0) * 0.5;
-    let tDab = 0;
-    let useDepthAlongRay = false;
-    const V = eraseRayWorldScratch;
-    if (halfDepthW > 1e-8 && worldDab) {
-        V.sub2(worldDab, camPos);
-        const vlen = V.length();
-        if (vlen > 1e-10) {
-            V.mulScalar(1 / vlen);
-            eraseCamToDabScratch.set(worldDab.x - camPos.x, worldDab.y - camPos.y, worldDab.z - camPos.z);
-            tDab = V.dot(eraseCamToDabScratch);
-            useDepthAlongRay = true;
-        }
-    }
-
-    const worldMat  = layerEnt.getWorldTransform();
-    const sMdl      = new pc.Vec3();
-    const sWorld    = new pc.Vec3();
-    const sScreen   = new pc.Vec3();
-    const before    = layer.splats.length;
-
-    layer.splats = layer.splats.filter((s) => {
-        sMdl.set(s.x, s.y, s.z);
-        worldMat.transformPoint(sMdl, sWorld);
-        if (useDepthAlongRay) {
-            eraseCamToDabScratch.set(sWorld.x - camPos.x, sWorld.y - camPos.y, sWorld.z - camPos.z);
-            const tSplat = V.dot(eraseCamToDabScratch);
-            if (Math.abs(tSplat - tDab) > halfDepthW) return true;
-        }
-        cameraEntity.camera.worldToScreen(sWorld, sScreen);
-        if (!Number.isFinite(sScreen.x) || !Number.isFinite(sScreen.y)) return true;
-        const dsq = distPointSeg2Sq(sScreen.x, sScreen.y, screenX0, screenY0, screenX, screenY);
-        return dsq > screenR2;
-    });
-
-    if (layer.splats.length === before) return;
-    if (layer.selectionMask) layer.selectionMask = null;
-
-    if (!layer._eraseRebuild) {
-        layer._eraseRebuild = true;
-        setTimeout(() => {
-            layer._eraseRebuild = false;
-            updateLayerEntity(layer);
-        }, 110);
-    }
-};
-
-const eraseUserLayerAt = (screenX, screenY, worldRadius, worldDab, depthWorldFull) => {
-    const layer = getActiveLayer();
-    if (!layer) return;
-
-    const x0 = layer._eraseSegX0 ?? screenX;
-    const y0 = layer._eraseSegY0 ?? screenY;
-    layer._erasePending = {
-        screenX, screenY, screenX0: x0, screenY0: y0, worldRadius, worldDab, depthWorldFull,
-    };
-    if (layer._eraseRaf != null) return;
-    layer._eraseRaf = requestAnimationFrame(() => {
-        layer._eraseRaf = null;
-        const q = layer._erasePending;
-        layer._erasePending = null;
-        if (!q) return;
-        runEraseUserLayerPass(layer, q);
-        layer._eraseSegX0 = q.screenX;
-        layer._eraseSegY0 = q.screenY;
-    });
-};
-
-const flushEraseUserLayerPending = () => {
-    const layer = getActiveLayer();
-    if (!layer) return;
-    if (layer._eraseRaf != null) {
-        cancelAnimationFrame(layer._eraseRaf);
-        layer._eraseRaf = null;
-    }
-    const q = layer._erasePending;
-    if (q) {
-        layer._erasePending = null;
-        runEraseUserLayerPass(layer, q);
-    }
-    layer._eraseSegX0 = undefined;
-    layer._eraseSegY0 = undefined;
-};
-
 // ── Painting ──────────────────────────────────────────────────────────────────
 // One dab at a world-space hit point (shared by stroke interpolation).
 const applyPaintDabWorld = (worldPt, worldRadius, hardness, intensity, isErase, isReset) => {
@@ -6340,12 +7621,6 @@ const paintAt = (screenX, screenY) => {
 
     const worldPt = getWorldPoint(screenX, screenY);
     if (!worldPt) return;
-
-    // Erase on user layers: screen-space dab only (no stroke interpolation here)
-    if (isErase && getActiveLayer()) {
-        eraseUserLayerAt(screenX, screenY, worldRadius, worldPt, eraserDepth());
-        return;
-    }
 
     const minMove = worldRadius * 2 * spacing;
     if (lastPaintWorld && worldPt.distance(lastPaintWorld) < minMove) return;
@@ -6497,6 +7772,7 @@ const destroyGsplatPaintBundle = (pb) => {
 const destroyLayerGsplatPaint = (layer) => {
     destroyGsplatPaintBundle(layer?._gsplatPaint);
     if (layer) layer._gsplatPaint = null;
+    destroyGradeLutGpu(layer?.colorGrade);
 };
 
 /** Run one queued paint op on a paintable bundle (base row or layer._gsplatPaint). */
@@ -6532,6 +7808,24 @@ const applyPaintOpToPaintable = (p, op) => {
     p.entity.gsplat.workBufferUpdate = pc.WORKBUFFER_UPDATE_ONCE;
 };
 
+/** Flush the paint queue in one go (same rules as `update`) so GPU textures match committed strokes. */
+const drainPendingPaints = () => {
+    while (pendingPaints.length) {
+        const ops = pendingPaints.splice(0);
+        for (const op of ops) {
+            if (op.layerId) {
+                const lyr = layers.find((l) => l.id === op.layerId);
+                const pb = lyr?._gsplatPaint;
+                if (pb) applyPaintOpToPaintable(pb, op);
+            } else {
+                for (const p of paintables) {
+                    applyPaintOpToPaintable(p, op);
+                }
+            }
+        }
+    }
+};
+
 // ── Splat creation ────────────────────────────────────────────────────────────
 const createPaintableSplat = async (asset, opts = {}) => {
     const resource = asset.resource;
@@ -6565,12 +7859,15 @@ const createPaintableSplat = async (asset, opts = {}) => {
     // getInstanceTexture only works after streams are added and in unified mode.
     const colorTex = gsplatComponent.getInstanceTexture('customColor');
     if (colorTex) { const d = colorTex.lock(); if (d) d.fill(0); colorTex.unlock(); }
+    if (opts?.staggerHeavyInit) await yieldOneFrame();
 
     const opacityTex = gsplatComponent.getInstanceTexture('customOpacity');
     if (opacityTex) { const d = opacityTex.lock(); if (d) d.fill(0); opacityTex.unlock(); }
+    if (opts?.staggerHeavyInit) await yieldOneFrame();
 
     const selTex = gsplatComponent.getInstanceTexture('customSelection');
     if (selTex) { const d = selTex.lock(); if (d) d.fill(0); selTex.unlock(); }
+    if (opts?.staggerHeavyInit) await yieldOneFrame();
 
     // Apply work-buffer modifier and per-instance parameters AFTER the placement exists.
     gsplatComponent.setWorkBufferModifier({ glsl: MODIFIER_GLSL, wgsl: MODIFIER_WGSL });
@@ -6609,6 +7906,7 @@ const createPaintableSplat = async (asset, opts = {}) => {
     // We use PlayCanvas's internal getProp() API to pull every standard
     // Gaussian Splat property so the exported file is a valid 3DGS file.
     const data = await resolveGsplatCpuData(resource.gsplatData);
+    if (opts?.staggerHeavyInit) await yieldOneFrame();
 
     if (data) {
         const n = data.numSplats;
@@ -6619,6 +7917,7 @@ const createPaintableSplat = async (asset, opts = {}) => {
             const k = `f_rest_${i}`;
             const a = data.getProp(k);
             if (a) shRest.push({ key: k, data: new Float32Array(a) });
+            if (opts?.staggerHeavyInit && i % 6 === 5) await yieldOneFrame();
         }
 
         // Collect extra standard Gaussian Splat properties (scale, rotation, normals).
@@ -6629,24 +7928,43 @@ const createPaintableSplat = async (asset, opts = {}) => {
             'rot_0',   'rot_1',   'rot_2',   'rot_3',
         ];
         const extra = {};
-        for (const prop of EXTRA_PROPS) {
+        for (let pi = 0; pi < EXTRA_PROPS.length; pi++) {
+            const prop = EXTRA_PROPS[pi];
             const a = data.getProp(prop);
             if (a) extra[prop] = new Float32Array(a);
+            if (opts?.staggerHeavyInit && pi === 2) await yieldOneFrame();
         }
+
+        const xCol = new Float32Array(data.getProp('x'));
+        if (opts?.staggerHeavyInit) await yieldOneFrame();
+        const yCol = new Float32Array(data.getProp('y'));
+        if (opts?.staggerHeavyInit) await yieldOneFrame();
+        const zCol = new Float32Array(data.getProp('z'));
+        if (opts?.staggerHeavyInit) await yieldOneFrame();
+        const f0 = new Float32Array(data.getProp('f_dc_0'));
+        if (opts?.staggerHeavyInit) await yieldOneFrame();
+        const f1 = new Float32Array(data.getProp('f_dc_1'));
+        if (opts?.staggerHeavyInit) await yieldOneFrame();
+        const f2 = new Float32Array(data.getProp('f_dc_2'));
+        if (opts?.staggerHeavyInit) await yieldOneFrame();
+        const op = new Float32Array(data.getProp('opacity'));
+        if (opts?.staggerHeavyInit) await yieldOneFrame();
 
         gsplatDataCache = {
             numSplats: n,
-            x:       new Float32Array(data.getProp('x')),
-            y:       new Float32Array(data.getProp('y')),
-            z:       new Float32Array(data.getProp('z')),
-            fdc0:    new Float32Array(data.getProp('f_dc_0')),
-            fdc1:    new Float32Array(data.getProp('f_dc_1')),
-            fdc2:    new Float32Array(data.getProp('f_dc_2')),
-            opacity: new Float32Array(data.getProp('opacity')),
+            x:       xCol,
+            y:       yCol,
+            z:       zCol,
+            fdc0:    f0,
+            fdc1:    f1,
+            fdc2:    f2,
+            opacity: op,
             shRest,
             extra,   // scale, rotation, normals, etc.
         };
         selectionMask = new Uint8Array(n);
+        resetBaseSplatAliveMask(n);
+        if (opts?.staggerHeavyInit) await yieldOneFrame();
     }
 
     applyModelRotation();
@@ -6729,12 +8047,14 @@ const removeBaseModel = () => {
     }
     paintables.length = 0;
     gsplatDataCache = null;
+    baseSplatAliveMask = null;
     selectionMask = null;
     strokes.length = 0;
     redoStack.length = 0;
     activeStroke = null;
     baseModelName = '';
     baseTransform = createDefaultLayerTransform();
+    destroyGradeLutGpu(baseColorGrade);
     baseColorGrade = createDefaultColorGrade();
     baseLayerOpacityPct = 100;
     updateUndoRedoUI();
@@ -6751,9 +8071,11 @@ const removeBaseModel = () => {
 
 /** Load PLY/SOG as a CPU splat layer (does not replace the scene). */
 const importSplatAsLayer = async (source) => {
+    if (!(await ensureCanLoadModel())) return;
     emptySceneLoadingDepth++;
     updateEmptyScenePlaceholder();
-    instructions.innerHTML = '<p>Importing layer…</p>';
+    showModelImportProgress('Importing layer…');
+    instructions.innerHTML = '';
 
     let loadUrl;
     let originalUrl;
@@ -6766,11 +8088,16 @@ const importSplatAsLayer = async (source) => {
 
     try {
         await new Promise((resolve, reject) => {
+        let detachProgress = null;
         const assetName = `importLayer-${Date.now()}`;
         const asset = new pc.Asset(assetName, 'gsplat', { url: loadUrl, filename: originalUrl }, gsplatAssetDataForFilename(originalUrl));
         app.assets.add(asset);
+        detachProgress = wireAssetDownloadProgress(asset);
         asset.once('load', async (a) => {
             try {
+                detachProgress?.();
+                detachProgress = null;
+                setModelImportProgressIndeterminate('Reading splat data…');
                 const resource = a.resource;
                 const data = await resolveGsplatCpuData(resource.gsplatData);
                 if (!data?.numSplats) {
@@ -6779,6 +8106,7 @@ const importSplatAsLayer = async (source) => {
                     reject(new Error('No splat data'));
                     return;
                 }
+                setModelImportProgressIndeterminate('Preparing splats…');
                 const splats = gsplatDataToSplats(data);
                 const baseName = source instanceof File
                     ? source.name.replace(/\.[^/.]+$/, '')
@@ -6803,9 +8131,15 @@ const importSplatAsLayer = async (source) => {
                 if (source instanceof File) URL.revokeObjectURL(loadUrl);
                 instructions.innerHTML = '';
                 renderLayersUI();
+                setModelImportProgressIndeterminate('Building layer view…');
                 updateLayerEntity(layer).then(() => {
                     applyModelRotation();
                     refreshLayerGizmoAttachment();
+                    frameCameraOnSelectedLayer();
+                    getPosthog()?.capture('layer_imported', {
+                        file_name: source instanceof File ? source.name : (originalUrl.split('/').pop() ?? ''),
+                        splat_count: splats.length,
+                    });
                     resolve();
                 }).catch((err) => {
                     instructions.innerHTML = `<p style="color:#f88">${err?.message || err}</p>`;
@@ -6818,6 +8152,8 @@ const importSplatAsLayer = async (source) => {
             }
         });
         asset.once('error', (msg) => {
+            detachProgress?.();
+            detachProgress = null;
             if (source instanceof File) URL.revokeObjectURL(loadUrl);
             instructions.innerHTML = `<p style="color:#f88">Load error: ${msg}</p>`;
             reject(new Error(msg));
@@ -6825,6 +8161,7 @@ const importSplatAsLayer = async (source) => {
         app.assets.load(asset);
         });
     } finally {
+        hideModelImportProgress();
         emptySceneLoadingDepth--;
         updateEmptyScenePlaceholder();
     }
@@ -6875,6 +8212,7 @@ const unloadAll = () => {
     }
     strokes.length = 0; redoStack.length = 0;
     activeStroke = null; gsplatDataCache = null;
+    baseSplatAliveMask = null;
     selectionMask = null; hasSelection = false;
     showSelectionHighlight = true;
     { const cb = g('sel-show-highlight'); if (cb) cb.checked = true; }
@@ -6883,6 +8221,7 @@ const unloadAll = () => {
     selectedLayerId = 'base';
     baseModelName = '';
     baseTransform = createDefaultLayerTransform();
+    destroyGradeLutGpu(baseColorGrade);
     baseColorGrade = createDefaultColorGrade();
     baseLayerOpacityPct = 100;
     for (const c of layersContainer.children.slice()) c.destroy();
@@ -6891,10 +8230,123 @@ const unloadAll = () => {
     renderLayersUI();
 };
 
-const loadSplat = async (source, opts = {}) => {
+/**
+ * Swap the base gsplat for a new PLY blob without unloadAll() — keeps user layers, orbit, and
+ * global rotation. Clears paint/selection undo stacks (indices no longer match). Used after
+ * delete-selected and similar compacting edits.
+ */
+const replaceBaseModelWithPlyFile = async (file, opts = {}) => {
+    if (!opts.skipAuthGate && !(await ensureCanLoadModel())) return;
+    const loadUrl = URL.createObjectURL(file);
+    const originalUrl = file.name || 'model.ply';
     emptySceneLoadingDepth++;
     updateEmptyScenePlaceholder();
-    instructions.innerHTML = '<p>Loading…</p>';
+    showModelImportProgress('Updating model…');
+    instructions.innerHTML = '';
+
+    try {
+        await new Promise((resolve, reject) => {
+            let detachProgress = null;
+            const assetName = `base-replace-${Date.now()}`;
+            const asset = new pc.Asset(assetName, 'gsplat', { url: loadUrl, filename: originalUrl }, gsplatAssetDataForFilename(originalUrl));
+            app.assets.add(asset);
+            detachProgress = wireAssetDownloadProgress(asset);
+            asset.once('load', async (a) => {
+                try {
+                    detachProgress?.();
+                    detachProgress = null;
+                    setModelImportProgressIndeterminate('Building scene…');
+                    const preserve = opts.preserveCamera;
+                    const savedOrbit = preserve ? { target: orbit.target.clone(), distance: orbit.distance, yaw: orbit.yaw, pitch: orbit.pitch } : null;
+                    const savedNavMode = preserve ? cameraNavMode : null;
+                    const savedFly = preserve ? { pos: flyCam.pos.clone(), yaw: flyCam.yaw, pitch: flyCam.pitch } : null;
+                    const savedRot = preserve ? { ...globalModelRotation } : null;
+                    const savedLayerId = selectedLayerId;
+
+                    for (const p of paintables) {
+                        p.paintProcessor.destroy?.();
+                        p.eraseProcessor.destroy?.();
+                        p.resetColorProcessor.destroy?.();
+                        p.resetOpacityProcessor.destroy?.();
+                        p.entity.destroy();
+                    }
+                    paintables.length = 0;
+
+                    strokes.length = 0;
+                    redoStack.length = 0;
+                    activeStroke = null;
+                    updateUndoRedoUI();
+
+                    for (let i = savedSelections.length - 1; i >= 0; i--) {
+                        if (savedSelections[i].layerId === 'base') savedSelections.splice(i, 1);
+                    }
+
+                    if (opts.staggerHeavyInit) {
+                        await yieldThreeFrames();
+                        await yieldNextMacrotask();
+                    }
+                    await createPaintableSplat(a, opts);
+
+                    if (preserve) {
+                        if (savedNavMode === 'fly' && savedFly) {
+                            flyCam.pos.copy(savedFly.pos);
+                            flyCam.yaw = savedFly.yaw;
+                            flyCam.pitch = savedFly.pitch;
+                            cameraNavMode = 'fly';
+                        } else if (savedOrbit) {
+                            orbit.target.copy(savedOrbit.target);
+                            orbit.distance = savedOrbit.distance;
+                            orbit.yaw = savedOrbit.yaw;
+                            orbit.pitch = savedOrbit.pitch;
+                            cameraNavMode = 'orbit';
+                        }
+                        syncCameraNavToolbar();
+                        updateCamera();
+                    }
+                    if (preserve && savedRot && paintables.length) {
+                        globalModelRotation = { x: savedRot.x, y: savedRot.y, z: savedRot.z };
+                        applyModelRotation();
+                    }
+
+                    if (layers.some((l) => l.id === savedLayerId)) selectedLayerId = savedLayerId;
+                    else selectedLayerId = 'base';
+
+                    setTool(activeTool);
+                    URL.revokeObjectURL(loadUrl);
+                    instructions.innerHTML = '';
+                    renderLayersUI();
+                    renderSavedSelectionsList();
+                    getPosthog()?.capture('base_model_replaced', { splat_count: gsplatDataCache?.numSplats ?? 0 });
+                    resolve();
+                } catch (err) {
+                    instructions.innerHTML = `<p style="color:#f88">Error: ${err.message}</p>`;
+                    console.error('replaceBaseModelWithPlyFile error:', err);
+                    reject(err);
+                }
+            });
+            asset.once('error', (msg) => {
+                detachProgress?.();
+                detachProgress = null;
+                URL.revokeObjectURL(loadUrl);
+                instructions.innerHTML = `<p style="color:#f88">Load error: ${msg}</p>`;
+                console.error('replaceBaseModelWithPlyFile asset error:', msg);
+                reject(new Error(msg));
+            });
+            app.assets.load(asset);
+        });
+    } finally {
+        hideModelImportProgress();
+        emptySceneLoadingDepth--;
+        updateEmptyScenePlaceholder();
+    }
+};
+
+const loadSplat = async (source, opts = {}) => {
+    if (!opts.skipAuthGate && !(await ensureCanLoadModel())) return;
+    emptySceneLoadingDepth++;
+    updateEmptyScenePlaceholder();
+    showModelImportProgress('Loading model…');
+    instructions.innerHTML = '';
 
     let loadUrl, originalUrl;
     if (source instanceof File) {
@@ -6906,10 +8358,15 @@ const loadSplat = async (source, opts = {}) => {
 
     try {
         await new Promise((resolve, reject) => {
+            let detachProgress = null;
             const asset = new pc.Asset('splat', 'gsplat', { url: loadUrl, filename: originalUrl }, gsplatAssetDataForFilename(originalUrl));
             app.assets.add(asset);
+            detachProgress = wireAssetDownloadProgress(asset);
             asset.once('load', async (a) => {
                 try {
+                    detachProgress?.();
+                    detachProgress = null;
+                    setModelImportProgressIndeterminate('Building scene…');
                     const preserve = opts.preserveCamera;
                     const savedOrbit = preserve ? { target: orbit.target.clone(), distance: orbit.distance, yaw: orbit.yaw, pitch: orbit.pitch } : null;
                     const savedNavMode = preserve ? cameraNavMode : null;
@@ -6944,6 +8401,11 @@ const loadSplat = async (source, opts = {}) => {
                     if (source instanceof File) URL.revokeObjectURL(loadUrl);
                     instructions.innerHTML = '';
                     renderLayersUI();
+                    if (!preserve) frameCameraOnSelectedLayer();
+                    getPosthog()?.capture('splat_loaded', {
+                        file_name: source instanceof File ? source.name : (source.split('/').pop() ?? ''),
+                        splat_count: gsplatDataCache?.numSplats ?? 0,
+                    });
                     resolve();
                 } catch (err) {
                     instructions.innerHTML = `<p style="color:#f88">Error: ${err.message}</p>`;
@@ -6952,6 +8414,8 @@ const loadSplat = async (source, opts = {}) => {
                 }
             });
             asset.once('error', (msg) => {
+                detachProgress?.();
+                detachProgress = null;
                 instructions.innerHTML = `<p style="color:#f88">Load error: ${msg}</p>`;
                 console.error('Asset load error:', msg);
                 reject(new Error(msg));
@@ -6959,6 +8423,7 @@ const loadSplat = async (source, opts = {}) => {
             app.assets.load(asset);
         });
     } finally {
+        hideModelImportProgress();
         emptySceneLoadingDepth--;
         updateEmptyScenePlaceholder();
     }
@@ -7129,7 +8594,7 @@ const applyAllCpuStrokes = () => {
 };
 
 // Read paint from GPU textures (guarantees export matches what you see)
-const getPaintFromGpu = async () => {
+const getPaintFromGpu = async (opts = {}) => {
     if (!gsplatDataCache || !paintables.length) return null;
     const p = paintables[0];
     const colorTex = p.gsplatComponent.getInstanceTexture('customColor');
@@ -7138,15 +8603,30 @@ const getPaintFromGpu = async () => {
     const w = colorTex.width, h = colorTex.height;
     if (w <= 0 || h <= 0) return null;
     const n = gsplatDataCache.numSplats;
+    const readOptsBase = { mipLevel: 0, face: 0, immediate: true };
+    if (opts.flushGpuBeforeRead && typeof app.graphicsDevice?.submit === 'function') {
+        app.graphicsDevice.submit();
+        await yieldNextMacrotask();
+    }
     let colorData, opacityData;
     try {
-        colorData = await colorTex.read(0, 0, w, h, { immediate: true });
-        opacityData = await opacityTex.read(0, 0, w, h, { immediate: true });
+        colorData = await colorTex.read(0, 0, w, h, readOptsBase);
+        if (opts.yieldBetweenTextureReads) await yieldNextMacrotask();
+        opacityData = await opacityTex.read(0, 0, w, h, readOptsBase);
     } catch (_) { return null; }
     const { fdc0, fdc1, fdc2, opacity } = gsplatDataCache;
     const curBlend = blendMode();
+    const tryWorker = opts.useWorkerMerge && typeof Worker !== 'undefined' && n >= MIN_SPLATS_FOR_GPU_MERGE_WORKER;
+    if (tryWorker) {
+        try {
+            return await mergeGpuPaintReadbackInWorker(n, w, h, curBlend, colorData, opacityData, fdc0, fdc1, fdc2, opacity);
+        } catch (werr) {
+            console.warn('[getPaintFromGpu] worker merge failed, using main thread', werr);
+        }
+    }
     const out0 = new Float32Array(fdc0), out1 = new Float32Array(fdc1), out2 = new Float32Array(fdc2);
     const outOp = new Float32Array(opacity);
+    const yieldEvery = opts?.yieldEvery ?? 0;
     for (let i = 0; i < n; i++) {
         const off = Math.min(i, w * h - 1) * 4;
         const cr = colorData[off] / 255, cg = colorData[off + 1] / 255, cb = colorData[off + 2] / 255, ca = colorData[off + 3] / 255;
@@ -7163,6 +8643,7 @@ const getPaintFromGpu = async () => {
             out0[i] = (fR - 0.5) / SH_C0; out1[i] = (fG - 0.5) / SH_C0; out2[i] = (fB - 0.5) / SH_C0;
         }
         if (ea > 0) outOp[i] = invSigmoid(sigmoid(opacity[i]) * (1 - Math.min(1, ea)));
+        if (yieldEvery > 0 && i > 0 && i % yieldEvery === 0) await yieldOneFrame();
     }
     return { out0, out1, out2, outOp };
 };
@@ -7544,7 +9025,8 @@ const exportToFile = async () => {
     // DataTable v2 API: constructor takes only the columns array
     const table    = new DataTable(columns);
     const memFs    = new MemoryFileSystem();
-    const filename = 'painted.ply';
+    const base     = getDefaultSnapshotExportBasename();
+    const filename = `${base}.ply`;
 
     try {
         await writePly(
@@ -7562,6 +9044,7 @@ const exportToFile = async () => {
 
     const blob = new Blob([buffer], { type: 'application/octet-stream' });
     await triggerBlobDownload(blob, filename);
+    getPosthog()?.capture('splat_exported', { format: 'ply', file_name: filename, splat_count: gsplatDataCache?.numSplats ?? 0 });
 };
 
 // ── Mouse events ──────────────────────────────────────────────────────────────
@@ -7574,18 +9057,37 @@ const getEffectiveSelMode = (altKey) => {
     return m;
 };
 
+/** UI that sits above the canvas rect; PlayCanvas still maps coords to the canvas, so we hit-test the stack. */
+const VIEWPORT_POINTER_UI_BLOCK_SELECTOR = '#floating-gizmo-bar, #left-panel, #right-panel, #options-bar, #menu-bar, #snapshot-modal, #support-modal, #shortcuts-modal, #auth-modal';
+
+const elementBlocksViewportPointerInput = (el) => el instanceof Element && !!el.closest(VIEWPORT_POINTER_UI_BLOCK_SELECTOR);
+
+const eventShouldIgnoreViewportPointer = (e) => {
+    const direct = e?.element;
+    if (elementBlocksViewportPointerInput(direct)) return true;
+    const ne = e?.event;
+    if (!ne || typeof ne.clientX !== 'number') return false;
+    const stack = typeof document.elementsFromPoint === 'function' ? document.elementsFromPoint(ne.clientX, ne.clientY) : [];
+    for (let i = 0; i < stack.length; i++) {
+        const el = stack[i];
+        if (el === canvas) break;
+        if (elementBlocksViewportPointerInput(el)) return true;
+    }
+    return false;
+};
+
 app.mouse.on(pc.EVENT_MOUSEDOWN, async (e) => {
+    if (eventShouldIgnoreViewportPointer(e)) return;
+
     lastMouse.x = e.x; lastMouse.y = e.y;
 
     const isLeft  = e.button === pc.MOUSEBUTTON_LEFT;
     const isRight = e.button === pc.MOUSEBUTTON_RIGHT;
 
+    if (isRight) e.event?.preventDefault?.();
+
     if (isLeft && activeTool === 'cursor') {
         isOrbiting = true;
-        canvasContainer.classList.add('is-dragging');
-    }
-    if (isRight) {
-        isPanning = true;
         canvasContainer.classList.add('is-dragging');
     }
 
@@ -7598,6 +9100,19 @@ app.mouse.on(pc.EVENT_MOUSEDOWN, async (e) => {
             strokeDepth = null;
         }
         cancelSwatchSplatPick();
+        return;
+    }
+
+    if (awaitingSplitToneSplatPick) {
+        if (hasRenderableSplats()) {
+            strokeDepth = await pickStrokeDepth(e.x, e.y, false);
+            if (strokeDepth != null) {
+                const pickedHex = pickSplatHexAtScreen(e.x, e.y);
+                if (pickedHex) setSplitToneColorFromHex(awaitingSplitToneSplatPick, pickedHex, { commit: true });
+            }
+            strokeDepth = null;
+        }
+        cancelSplitToneSplatPick();
         return;
     }
 
@@ -7649,13 +9164,6 @@ app.mouse.on(pc.EVENT_MOUSEDOWN, async (e) => {
         if (!hasRenderableSplats()) return;
         strokeDepth = await pickStrokeDepth(e.x, e.y, false);
         if (strokeDepth == null) return;
-        if (activeTool === 'eraser') {
-            const ly = getActiveLayer();
-            if (ly) {
-                ly._eraseSegX0 = undefined;
-                ly._eraseSegY0 = undefined;
-            }
-        }
         isPainting = true;
         lastPaintWorld = null;
         activeStroke = {
@@ -7789,29 +9297,6 @@ app.mouse.on(pc.EVENT_MOUSEMOVE, (e) => {
         updateCamera();
     }
 
-    // Camera pan (right-drag, any tool)
-    if (isPanning) {
-        const scale = orbit.distance * 0.002;
-        const right = cameraEntity.right;
-        const up    = cameraEntity.up;
-        if (cameraNavMode === 'orbit') {
-            orbit.target.x -= right.x * dx * scale;
-            orbit.target.y -= right.y * dx * scale;
-            orbit.target.z -= right.z * dx * scale;
-            orbit.target.x += up.x * dy * scale;
-            orbit.target.y += up.y * dy * scale;
-            orbit.target.z += up.z * dy * scale;
-        } else {
-            flyCam.pos.x -= right.x * dx * scale;
-            flyCam.pos.y -= right.y * dx * scale;
-            flyCam.pos.z -= right.z * dx * scale;
-            flyCam.pos.x += up.x * dy * scale;
-            flyCam.pos.y += up.y * dy * scale;
-            flyCam.pos.z += up.z * dy * scale;
-        }
-        updateCamera();
-    }
-
     // Paint / erase / reset
     if (isPainting && (activeTool === 'brush' || activeTool === 'eraser' || activeTool === 'resetBrush')) {
         paintAt(e.x, e.y);
@@ -7862,8 +9347,7 @@ app.mouse.on(pc.EVENT_MOUSEUP, (e) => {
     const isLeft  = e.button === pc.MOUSEBUTTON_LEFT;
     const isRight = e.button === pc.MOUSEBUTTON_RIGHT;
     if (isLeft)  isOrbiting = false;
-    if (isRight) isPanning  = false;
-    if (!isPanning && !isOrbiting) canvasContainer.classList.remove('is-dragging');
+    if (!isOrbiting) canvasContainer.classList.remove('is-dragging');
 
     if (!isLeft) return;
 
@@ -7879,7 +9363,6 @@ app.mouse.on(pc.EVENT_MOUSEUP, (e) => {
         strokes.push(activeStroke);
         updateUndoRedoUI();
     }
-    if (isPainting && activeTool === 'eraser') flushEraseUserLayerPending();
     isPainting = false; activeStroke = null; lastPaintWorld = null;
     strokeDepth = null;   // reset for the next stroke
 
@@ -7944,7 +9427,7 @@ app.mouse.on(pc.EVENT_MOUSEUP, (e) => {
 
 // Scroll: zoom (ignore wheel events that occur right after double-click)
 let lastDblClickTime = 0;
-const WHEEL_UI_ROOT_SELECTOR = '#right-panel, #left-panel, #options-bar, #menu-bar, #snapshot-modal, #support-modal';
+const WHEEL_UI_ROOT_SELECTOR = '#right-panel, #left-panel, #options-bar, #menu-bar, #floating-gizmo-bar, #snapshot-modal, #support-modal, #shortcuts-modal, #auth-modal';
 window.addEventListener('wheel', (e) => {
     if (Date.now() - lastDblClickTime < 300) return;
     if (e.target instanceof Element && e.target.closest(WHEEL_UI_ROOT_SELECTOR)) return;
@@ -8001,8 +9484,20 @@ window.addEventListener('keydown', (e) => {
             e.preventDefault();
             return;
         }
+        if (awaitingSplitToneSplatPick) {
+            cancelSplitToneSplatPick();
+            e.preventDefault();
+            return;
+        }
         if (isSupportModalOpen()) {
             closeSupportModalSnoozed();
+            e.preventDefault();
+            return;
+        }
+        const shortcutsModalEsc = g('shortcuts-modal');
+        if (shortcutsModalEsc?.classList.contains('is-open')) {
+            shortcutsModalEsc.classList.remove('is-open');
+            shortcutsModalEsc.setAttribute('aria-hidden', 'true');
             e.preventDefault();
             return;
         }
@@ -8013,6 +9508,10 @@ window.addEventListener('keydown', (e) => {
             e.preventDefault();
             return;
         }
+    }
+
+    if (g('shortcuts-modal')?.classList.contains('is-open')) {
+        return;
     }
 
     const key = e.key.toLowerCase();
@@ -8087,7 +9586,7 @@ window.addEventListener('keydown', (e) => {
         return;
     }
 
-    if (NAV_KEYS.includes(key)) {
+    if (NAV_KEYS.includes(key) && !e.ctrlKey && !e.metaKey) {
         keysNav[key] = true;
         e.preventDefault();
         return;
@@ -8095,11 +9594,16 @@ window.addEventListener('keydown', (e) => {
     if (e.ctrlKey || e.metaKey) {
         if (key === 'z') { e.preventDefault(); undo(); return; }
         if (key === 'y' || (e.shiftKey && key === 'z')) { e.preventDefault(); redo(); return; }
+        if (key === 'd') {
+            e.preventDefault();
+            if (selectedLayerId && selectedLayerId !== 'base') void duplicateLayer(selectedLayerId);
+            return;
+        }
     }
 
     switch (key) {
         case 'v': setTool('cursor');       break;
-        case 'r': setTool('brushSelect');  break;
+        case 'r': setTool('boxSelect');    break;
         case 'c': setTool('colorSelect');  break;
         case 'x': setTool('eraser');       break;
         case 'z': setTool('resetBrush');   break;
@@ -8118,14 +9622,21 @@ window.addEventListener('keydown', (e) => {
             break;
         case 'b': setTool('brush');        break;
         case 'k': setTool('paintBucket');  break;
-        case 'o': setTool('boxSelect'); break;
+        case 'o': setTool('brushSelect');  break;
         case 'l': setTool('lassoSelect'); break;
         case 'y': setTool('vectorSelect'); break;
         case 'm':
             e.preventDefault();
             setSplatMode(!splatMode);
             break;
-        case 'g': setTool('generateSplats'); break;
+        case 'g':
+            e.preventDefault();
+            layerGizmoVisible = !layerGizmoVisible;
+            try { localStorage.setItem(LS_LAYER_GIZMO_VISIBLE, layerGizmoVisible ? '1' : '0'); } catch (_) { /* ignore */ }
+            updateLayerGizmoToggleButton();
+            refreshLayerGizmoAttachment();
+            break;
+        case 'u': setTool('generateSplats'); break;
         case 'n': setTool('shapeLayer');     break;
         case 's': setTool('splatSelect');   break;
         case 'i': if (e.shiftKey) { e.preventDefault(); invertSelection({ recordUndo: true }); } break;
@@ -8203,8 +9714,14 @@ g('add-layer-btn').addEventListener('click', addLayer);
     .forEach((id) => {
         const el = g(id);
         if (!el) return;
+        enableNumericExprTyping(el);
         el.addEventListener('input', readLayerTransformInputsIntoModel);
         el.addEventListener('change', readLayerTransformInputsIntoModel);
+        el.addEventListener('blur', () => {
+            if (_syncingLayerTransformUI) return;
+            readLayerTransformInputsIntoModel();
+            syncLayerTransformUI();
+        });
     });
 g('lt-reset-btn')?.addEventListener('click', resetActiveLayerTransform);
 g('add-shape-preview-btn')?.addEventListener('click', () => placeShapePreviewAtOrbitTarget());
@@ -8224,8 +9741,15 @@ g('shape-color-hex')?.addEventListener('change', () => {
 });
 g('shape-type')?.addEventListener('change', onShapePreviewTopologyChanged);
 ['shape-size-x', 'shape-size-y', 'shape-size-z', 'shape-rot-x', 'shape-rot-y', 'shape-rot-z'].forEach((id) => {
-    g(id)?.addEventListener('input', onShapePreviewTransformInputsChanged);
-    g(id)?.addEventListener('change', onShapePreviewTransformInputsChanged);
+    const el = g(id);
+    if (!el) return;
+    enableNumericExprTyping(el);
+    el.addEventListener('input', onShapePreviewTransformInputsChanged);
+    el.addEventListener('change', onShapePreviewTransformInputsChanged);
+    el.addEventListener('blur', () => {
+        onShapePreviewTransformInputsChanged();
+        syncShapeTransformInputsFromApplied();
+    });
 });
 g('shape-hollow-edges')?.addEventListener('change', onShapePreviewTopologyChanged);
 
@@ -8239,6 +9763,7 @@ g('pick-swatch-splat-btn')?.addEventListener('click', () => {
         return;
     }
     if (!hasRenderableSplats()) return;
+    cancelSplitToneSplatPick();
     awaitingSwatchSplatPick = true;
     canvasContainer.classList.add('swatch-splat-pick-armed');
     g('pick-swatch-splat-btn')?.classList.add('accent-btn');
@@ -8249,7 +9774,9 @@ renderSwatchesList();
 
 g('file-input').addEventListener('change', async (e) => {
     const file = e.target.files[0];
-    if (file) await loadSplat(file);
+    if (file) {
+        if (await ensureCanLoadModel()) await loadSplat(file);
+    }
     e.target.value = '';
 });
 g('empty-scene-load-btn')?.addEventListener('click', () => g('file-input')?.click());
@@ -8275,8 +9802,34 @@ const LS_SNAPSHOT_H = 'photoshock-snapshot-h';
 const LS_SNAPSHOT_FMT = 'photoshock-snapshot-fmt';
 const LS_SNAPSHOT_TRANSP = 'photoshock-snapshot-transparent';
 
+/** Safe single path segment for downloads (no slashes etc.). */
+const sanitizeSnapshotExportBasename = (raw) => {
+    let s = String(raw ?? '').trim();
+    if (!s) return '';
+    s = s.replace(/[\\/:*?"<>|]+/g, '-');
+    s = s.replace(/\s+/g, ' ').trim();
+    s = s.replace(/^[\s.-]+|[\s.-]+$/g, '');
+    if (s === '.' || s === '..') return '';
+    const lower = s.toLowerCase();
+    if (lower.endsWith('.png')) s = s.slice(0, -4).trim();
+    else if (lower.endsWith('.jpeg')) s = s.slice(0, -5).trim();
+    else if (lower.endsWith('.jpg')) s = s.slice(0, -4).trim();
+    if (!s || s === '.' || s === '..') return '';
+    return s.length > 120 ? s.slice(0, 120).trim() : s;
+};
+
+/** Top layer in the panel (first user layer), else loaded base model title. */
+const getDefaultSnapshotExportBasename = () => {
+    const top = layers.length ? String(layers[0].name ?? '').trim() : '';
+    const base = String(baseModelName ?? '').trim();
+    const pick = top || base || 'Model';
+    return sanitizeSnapshotExportBasename(pick) || 'export';
+};
+
 const clampSnapshotDim = (v, fallback) => {
-    const n = parseInt(String(v), 10);
+    const s = String(v ?? '').trim();
+    const ev = parseNumericOrExpr(s);
+    const n = ev != null && Number.isFinite(ev) ? Math.round(ev) : parseInt(s, 10);
     if (!Number.isFinite(n)) return fallback;
     return Math.max(64, Math.min(8192, n));
 };
@@ -8388,7 +9941,10 @@ const takeViewportSnapshot = async () => {
             });
         }
         const ext = mime === 'image/jpeg' ? 'jpg' : 'png';
-        void triggerBlobDownload(blob, `photoshock-viewport-${Date.now()}.${ext}`);
+        let base = sanitizeSnapshotExportBasename(g('snapshot-filename')?.value);
+        if (!base) base = getDefaultSnapshotExportBasename();
+        void triggerBlobDownload(blob, `${base}.${ext}`);
+        getPosthog()?.capture('viewport_snapshot_taken', { format: ext, width: w, height: h, transparent: wantTransparent, basename: base });
     } catch (err) {
         console.error('[snapshot]', err);
         alert(`Snapshot failed: ${err?.message || err}`);
@@ -8409,7 +9965,9 @@ const openSnapshotModal = () => {
     snapshotModalEl.classList.add('is-open');
     snapshotModalEl.setAttribute('aria-hidden', 'false');
     syncSnapshotTransparentEnabled();
-    g('snapshot-w')?.focus();
+    const fn = g('snapshot-filename');
+    if (fn) fn.value = getDefaultSnapshotExportBasename();
+    fn?.focus();
 };
 const closeSnapshotModal = () => {
     if (!snapshotModalEl) return;
@@ -8422,9 +9980,28 @@ g('snapshot-modal-backdrop')?.addEventListener('click', closeSnapshotModal);
 g('snapshot-modal-close')?.addEventListener('click', closeSnapshotModal);
 g('snapshot-modal-cancel')?.addEventListener('click', closeSnapshotModal);
 
+const shortcutsModalEl = g('shortcuts-modal');
+const openShortcutsModal = () => {
+    if (!shortcutsModalEl) return;
+    shortcutsModalEl.classList.add('is-open');
+    shortcutsModalEl.setAttribute('aria-hidden', 'false');
+    g('shortcuts-modal-close')?.focus();
+};
+const closeShortcutsModal = () => {
+    if (!shortcutsModalEl) return;
+    shortcutsModalEl.classList.remove('is-open');
+    shortcutsModalEl.setAttribute('aria-hidden', 'true');
+};
+g('shortcuts-open-btn')?.addEventListener('click', openShortcutsModal);
+g('shortcuts-modal-backdrop')?.addEventListener('click', closeShortcutsModal);
+g('shortcuts-modal-close')?.addEventListener('click', closeShortcutsModal);
+g('shortcuts-modal-close-btn')?.addEventListener('click', closeShortcutsModal);
+
 (() => {
     try {
         const wEl = g('snapshot-w'), hEl = g('snapshot-h'), fEl = g('snapshot-format'), tEl = g('snapshot-transparent');
+        enableNumericExprTyping(wEl);
+        enableNumericExprTyping(hEl);
         const sw = localStorage.getItem(LS_SNAPSHOT_W);
         const sh = localStorage.getItem(LS_SNAPSHOT_H);
         const sf = localStorage.getItem(LS_SNAPSHOT_FMT);
@@ -8543,6 +10120,7 @@ const linkSlider = (id, labelId, fmt) => {
 const linkSliderNum = (sliderId, numId, min, max, step, fmt = (v) => v, onCommit = null) => {
     const slider = g(sliderId), num = g(numId);
     if (!slider || !num) return;
+    enableNumericExprTyping(num);
     const clamp = (v) => Math.max(min, Math.min(max, v));
     const snapToStep = (v) => {
         if (!Number.isFinite(step) || step <= 0) return clamp(v);
@@ -8552,8 +10130,8 @@ const linkSliderNum = (sliderId, numId, min, max, step, fmt = (v) => v, onCommit
     const maybeCommit = () => { if (onCommit) onCommit(); };
     const syncToNum = () => { num.value = fmt(parseFloat(slider.value)); };
     const commitNum = () => {
-        let v = parseFloat(num.value);
-        if (!Number.isFinite(v)) {
+        let v = parseNumericOrExpr(String(num.value).trim());
+        if (v == null || !Number.isFinite(v)) {
             syncToNum();
             return;
         }
@@ -8565,8 +10143,11 @@ const linkSliderNum = (sliderId, numId, min, max, step, fmt = (v) => v, onCommit
     const onNumInput = () => {
         const raw = String(num.value).trim();
         if (raw === '' || raw === '-' || raw === '.' || raw === '-.') return;
-        const v = parseFloat(raw);
-        if (!Number.isFinite(v)) return;
+        let v = parseNumericOrExpr(raw);
+        if (v == null || !Number.isFinite(v)) {
+            v = parseFloat(raw);
+            if (!Number.isFinite(v)) return;
+        }
         slider.value = String(clamp(v));
     };
     slider.addEventListener('input', () => { syncToNum(); maybeCommit(); });
@@ -8623,20 +10204,61 @@ linkSliderNum('cg-tint', 'cg-tint-num', -1, 1, 0.02, (v) => v.toFixed(2), cgComm
 linkSliderNum('cg-wheel-sh-amt', 'cg-wheel-sh-amt-num', 0, 1, 0.02, (v) => v.toFixed(2), cgCommit);
 linkSliderNum('cg-wheel-md-amt', 'cg-wheel-md-amt-num', 0, 1, 0.02, (v) => v.toFixed(2), cgCommit);
 linkSliderNum('cg-wheel-hi-amt', 'cg-wheel-hi-amt-num', 0, 1, 0.02, (v) => v.toFixed(2), cgCommit);
-['cg-wheel-sh', 'cg-wheel-md', 'cg-wheel-hi'].forEach((id) => {
-    g(id)?.addEventListener('input', cgCommit);
-    g(id)?.addEventListener('change', cgCommit);
-});
+linkSliderNum('cg-lut-mix', 'cg-lut-mix-num', 0, 1, 0.02, (v) => v.toFixed(2), cgCommit);
+initSplitToneEditors();
 for (let i = 0; i < 8; i++) {
     for (const ax of ['h', 's', 'l']) {
         g(`cg-s${i}-${ax}`)?.addEventListener('input', cgCommit);
     }
 }
 g('cg-reset-btn')?.addEventListener('click', resetActiveColorGrade);
+g('cg-toggle-visibility-btn')?.addEventListener('click', () => {
+    const { grade, gsplat } = getActiveColorGradeBundle();
+    grade.enabled = !(grade.enabled !== false);
+    updateCgVisibilityButton(grade.enabled !== false);
+    applyColorGradeToGsplat(gsplat, grade);
+});
 g('cg-bake-grade-btn')?.addEventListener('click', () => { bakeColorGradeIntoActiveTarget(); });
 g('brush-bake-paint-btn')?.addEventListener('click', () => { bakeBrushPaintIntoModel(); });
 g('paint-bucket-bake-btn')?.addEventListener('click', () => { bakeBrushPaintIntoModel(); });
 g('cg-grade-selected-only')?.addEventListener('change', () => { pushAllColorGradesToGPU(); });
+g('cg-tone-mode')?.addEventListener('change', cgCommit);
+g('cg-lut-load-btn')?.addEventListener('click', () => g('cg-lut-file')?.click());
+g('cg-lut-clear-btn')?.addEventListener('click', () => {
+    const { grade, gsplat } = getActiveColorGradeBundle();
+    destroyGradeLutGpu(grade);
+    grade.lutSize = 0;
+    grade.lutRgb = null;
+    grade.lutName = '';
+    grade.lutDomainMin = [0, 0, 0];
+    grade.lutDomainMax = [1, 1, 1];
+    grade.lutMix = 1;
+    refreshColorGradeUIFromSelection();
+    applyColorGradeToGsplat(gsplat, grade);
+});
+g('cg-lut-file')?.addEventListener('change', async (ev) => {
+    const input = ev.target;
+    const file = input?.files?.[0];
+    if (input) input.value = '';
+    if (!file) return;
+    try {
+        const text = await file.text();
+        const parsed = parseCubeLut(text);
+        const { grade, gsplat } = getActiveColorGradeBundle();
+        destroyGradeLutGpu(grade);
+        grade.lutSize = parsed.size;
+        grade.lutRgb = parsed.rgb;
+        grade.lutDomainMin = [...parsed.domainMin];
+        grade.lutDomainMax = [...parsed.domainMax];
+        grade.lutName = file.name.replace(/\.cube$/i, '') || 'LUT';
+        grade.lutMix = 1;
+        refreshColorGradeUIFromSelection();
+        applyColorGradeToGsplat(gsplat, grade);
+    } catch (err) {
+        console.error('[cube-lut]', err);
+        alert(`Could not load LUT: ${err?.message || err}`);
+    }
+});
 g('sel-show-highlight')?.addEventListener('change', (e) => {
     showSelectionHighlight = !!e.target.checked;
     updateSelectionUI();
@@ -8704,6 +10326,13 @@ refreshLayerGizmoAttachment();
     const tabs = document.querySelectorAll('.right-panel-tab[data-right-tab]');
     const p1 = g('right-tab-panel-1');
     const p2 = g('right-tab-panel-2');
+    const p3 = g('right-tab-panel-3');
+    const setPanel = (el, on) => {
+        if (!el) return;
+        el.classList.toggle('hidden', !on);
+        if (on) el.removeAttribute('hidden');
+        else el.setAttribute('hidden', '');
+    };
     const activate = (id) => {
         tabs.forEach((t) => {
             const on = t.dataset.rightTab === id;
@@ -8711,18 +10340,9 @@ refreshLayerGizmoAttachment();
             t.setAttribute('aria-selected', on ? 'true' : 'false');
             t.tabIndex = on ? 0 : -1;
         });
-        if (p1) {
-            const on = id === '1';
-            p1.classList.toggle('hidden', !on);
-            if (on) p1.removeAttribute('hidden');
-            else p1.setAttribute('hidden', '');
-        }
-        if (p2) {
-            const on = id === '2';
-            p2.classList.toggle('hidden', !on);
-            if (on) p2.removeAttribute('hidden');
-            else p2.setAttribute('hidden', '');
-        }
+        setPanel(p1, id === '1');
+        setPanel(p2, id === '2');
+        setPanel(p3, id === '3');
         try { localStorage.setItem(LS_RIGHT_PANEL_TAB, id); } catch (_) { /* ignore */ }
     };
     tabs.forEach((t) => {
@@ -8730,7 +10350,7 @@ refreshLayerGizmoAttachment();
     });
     let initial = '1';
     try { initial = localStorage.getItem(LS_RIGHT_PANEL_TAB) || '1'; } catch (_) { /* ignore */ }
-    if (initial !== '1' && initial !== '2') initial = '1';
+    if (!['1', '2', '3'].includes(initial)) initial = '1';
     activate(initial);
 })();
 

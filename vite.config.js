@@ -4,6 +4,9 @@ import { VitePWA } from 'vite-plugin-pwa';
 export default defineConfig({
   root: '.',
   publicDir: 'public',
+  server: {
+    hmr: { overlay: false },
+  },
   build: {
     target: 'es2022', // top-level await (PlayCanvas device init)
   },

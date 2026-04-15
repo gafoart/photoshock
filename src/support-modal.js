@@ -1,8 +1,10 @@
 /**
  * Startup lightbox embedding the Gumroad “name a fair price” page.
  * — Close / backdrop: snooze (localStorage) so the prompt can return later.
- * — Permanent hide: purchase detected (URL / Gumroad postMessage) or “I’ve contributed”.
+ * — Permanent hide: purchase detected (URL / Gumroad postMessage) or “I've contributed”.
  */
+import { getPosthog } from './posthog-client.js';
+
 const LS_CONTRIBUTOR = 'photoshock-support-contributor';
 const LS_DISMISS_UNTIL = 'photoshock-support-dismiss-until';
 const DISMISS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -29,6 +31,7 @@ export function openSupportModal() {
     root.setAttribute('aria-hidden', 'false');
     if (!iframe.getAttribute('src')) iframe.setAttribute('src', url);
     requestAnimationFrame(() => closeBtn?.focus());
+    getPosthog()?.capture('support_modal_opened');
 }
 
 function tryParseJson(data) {
@@ -77,6 +80,7 @@ export function initSupportModal(opts = {}) {
         try {
             localStorage.setItem(LS_CONTRIBUTOR, '1');
         } catch (_) { /* ignore */ }
+        getPosthog()?.capture('contributor_marked');
         hide();
     };
 
