@@ -577,6 +577,15 @@ input, textarea, select {
   border: 1px solid var(--border);
   border-radius: 4px;
 }
+.shortcuts-tool-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.shortcuts-tool-label > svg {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
 
 /* ── Auth (Supabase) ── */
 .menu-auth-bar {
