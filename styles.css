@@ -1873,6 +1873,11 @@ select:focus { border-color: var(--accent); }
   min-height: 0;
   z-index: 1;
 }
+
+/* FPS overlay (created in main.js; class for theme tweaks) */
+#viewer-fps-hud.viewer-fps-hud {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
 /*
  * Selection frame: must use ::after so the ring paints above the opaque WebGL canvas.
  * (Inset box-shadow on #canvas-container itself sits under the canvas and reads as ~1px.)

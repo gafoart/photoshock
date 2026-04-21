@@ -4,6 +4,8 @@
 
 [build.environment]
   NODE_VERSION = "20"
+  # Subpath on https://photoshock.internektools.com/v0.5/ — must include trailing slash for Vite.
+  VITE_BASE = "/v0.5/"
   # PostHog (Vite inlines VITE_* at build time): set these in the Netlify UI or CLI — do not commit real tokens here.
   # UI: Site configuration → Environment variables → Add variable
   #   VITE_POSTHOG_KEY   = Project API key from https://us.posthog.com/project/settings (or EU project)
@@ -16,7 +18,24 @@
   # Google OAuth: enable provider in Supabase; Google Cloud redirect URI:
   #   https://eqmikgxhrwwnrzcdwcfq.supabase.co/auth/v1/callback
 
-# SPA: only rewrite when no static file matches (default force = false)
+# ── Subpath /v0.5: built assets live at dist/assets/* but browsers request /v0.5/assets/* ──
+[[redirects]]
+  from = "/v0.5"
+  to = "/v0.5/"
+  status = 301
+
+[[redirects]]
+  from = "/v0.5/"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/v0.5/*"
+  to = "/:splat"
+  status = 200
+  force = false
+
+# SPA fallback at site root (optional; remove if this site only uses /v0.5/)
 [[redirects]]
   from = "/*"
   to = "/index.html"

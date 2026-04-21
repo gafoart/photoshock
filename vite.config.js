@@ -2,6 +2,8 @@ import { defineConfig } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
+  // Netlify: set `VITE_BASE=/v0.5/` in [build.environment] so the app is served under that path.
+  base: process.env.VITE_BASE || '/',
   root: '.',
   publicDir: 'public',
   server: {
@@ -38,8 +40,8 @@ export default defineConfig({
         background_color: '#24252b',
         display: 'standalone',
         orientation: 'any',
-        scope: '/',
-        start_url: '/',
+        scope: process.env.VITE_BASE || '/',
+        start_url: process.env.VITE_BASE || '/',
         icons: [
           {
             src: 'brand/48.png',

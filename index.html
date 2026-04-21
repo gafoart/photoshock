@@ -709,6 +709,27 @@
               <label class="transform-axis">Y <input type="number" id="lt-scl-y" class="transform-num" inputmode="decimal" step="any" min="0.01" max="10" title="Scale Y (0.01…10)" placeholder="1" /></label>
               <label class="transform-axis">Z <input type="number" id="lt-scl-z" class="transform-num" inputmode="decimal" step="any" min="0.01" max="10" title="Scale Z (0.01…10)" placeholder="1" /></label>
             </div>
+            <div class="panel-subtitle" style="margin-top:10px">Render box (clip)</div>
+            <div class="opt-group" style="flex-wrap:wrap;gap:8px">
+              <label class="radio-label"><input type="checkbox" id="rb-enabled" /> Enable render box</label>
+              <button class="opt-btn" type="button" id="rb-edit-gizmo-btn" title="Edit clipping box with gizmo (translate/scale)">Edit Box Gizmo</button>
+              <button class="opt-btn" type="button" id="rb-fit-btn" title="Fit render box to current layer bounds">Fit</button>
+              <button class="opt-btn" type="button" id="rb-reset-btn" title="Disable and reset render box">Reset</button>
+            </div>
+            <div class="transform-grid">
+              <span class="transform-label" title="Render box center (layer local)">
+                <span data-tabler-icon="focus-centered" data-tabler-size="14"></span>
+              </span>
+              <label class="transform-axis">X <input type="number" id="rb-cx" class="transform-num" inputmode="decimal" step="any" min="-1000" max="1000" title="Render box center X" placeholder="0" /></label>
+              <label class="transform-axis">Y <input type="number" id="rb-cy" class="transform-num" inputmode="decimal" step="any" min="-1000" max="1000" title="Render box center Y" placeholder="0" /></label>
+              <label class="transform-axis">Z <input type="number" id="rb-cz" class="transform-num" inputmode="decimal" step="any" min="-1000" max="1000" title="Render box center Z" placeholder="0" /></label>
+              <span class="transform-label" title="Render box size (layer local)">
+                <span data-tabler-icon="box" data-tabler-size="14"></span>
+              </span>
+              <label class="transform-axis">X <input type="number" id="rb-sx" class="transform-num" inputmode="decimal" step="any" min="0.01" max="5000" title="Render box size X" placeholder="2" /></label>
+              <label class="transform-axis">Y <input type="number" id="rb-sy" class="transform-num" inputmode="decimal" step="any" min="0.01" max="5000" title="Render box size Y" placeholder="2" /></label>
+              <label class="transform-axis">Z <input type="number" id="rb-sz" class="transform-num" inputmode="decimal" step="any" min="0.01" max="5000" title="Render box size Z" placeholder="2" /></label>
+            </div>
           </div>
           <div class="panel-section" id="saved-selections-section">
             <div class="panel-section-title">Saved Selections</div>
@@ -1067,6 +1088,7 @@
               <tr><td><kbd class="shortcuts-kbd">Q</kbd> / <kbd class="shortcuts-kbd">E</kbd></td><td>Up / down</td></tr>
               <tr><td><kbd class="shortcuts-kbd">1</kbd> <kbd class="shortcuts-kbd">2</kbd> <kbd class="shortcuts-kbd">3</kbd></td><td>Gizmo: move / rotate / scale</td></tr>
               <tr><td><kbd class="shortcuts-kbd">G</kbd></td><td>Show / hide layer transform gizmo</td></tr>
+              <tr><td><kbd class="shortcuts-kbd">⇧</kbd> <kbd class="shortcuts-kbd">F</kbd></td><td>Show / hide FPS (top-left of viewer)</td></tr>
               <tr><td colspan="2" class="shortcuts-modal-note">Double-click on the model (cursor tool) focuses the camera on that point.</td></tr>
             </tbody>
           </table>

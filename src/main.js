@@ -356,6 +356,11 @@ uniform vec4 uSelectionColor;  // rgb = highlight color, a = intensity (0-1)
 uniform int  uSplatMode;        // 0=off 1=centers (cyan dots) 2=rings (colored rim stroke) — see gsplatPS patch
 uniform vec4 uHoverSphere;      // xyz = model-space center, w = radius (0 = off)
 uniform vec4 uHoverColor;       // rgb = tint, a = strength
+uniform int  uRenderBoxEnabled; // 1 = clip to render box in layer-local space
+uniform vec3 uRenderBoxCenter;
+uniform vec3 uRenderBoxHalf;
+// modifySplatColor receives world-space centers; map back to splat/model space for box + hover.
+uniform mat4 uWorldToModel;
 
 // Per-layer color grade (viewport; baked on export / Bake to model)
 uniform vec4 uGradeBasicA;      // exposure (EV), contrast, blackPoint, whitePoint
@@ -526,6 +531,14 @@ vec3 sp_color_grade(vec3 col, float Lsplit) {
 }
 
 void modifySplatColor(vec3 center, inout vec4 color) {
+    vec3 mpos = (uWorldToModel * vec4(center, 1.0)).xyz;
+    if (uRenderBoxEnabled != 0) {
+        vec3 dBox = abs(mpos - uRenderBoxCenter);
+        if (any(greaterThan(dBox, uRenderBoxHalf))) {
+            color = vec4(0.0);
+            return;
+        }
+    }
     // Paint colour blend
     vec4 c = loadCustomColor();
     if (c.a > 0.0) {
@@ -543,7 +556,7 @@ void modifySplatColor(vec3 center, inout vec4 color) {
 
     // Brush hover preview: tint splats inside the hover sphere
     if (uHoverSphere.w > 0.0) {
-        float nd = length(center - uHoverSphere.xyz) / uHoverSphere.w;
+        float nd = length(mpos - uHoverSphere.xyz) / uHoverSphere.w;
         if (nd < 1.0) {
             float f = clamp((1.0 - nd) * uHoverColor.a, 0.0, 1.0);
             color.rgb = mix(color.rgb, uHoverColor.rgb, f);
@@ -554,7 +567,7 @@ void modifySplatColor(vec3 center, inout vec4 color) {
     vec3 pre = color.rgb;
     float Lsplit = clamp(dot(pre, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
     bool applyGrade = (uGradeEnabled != 0) && (uGradeSelectedOnly == 0);
-    if (uGradeSelectedOnly != 0) {
+    if (uGradeEnabled != 0 && uGradeSelectedOnly != 0) {
         vec4 selG = loadCustomSelection();
         applyGrade = (uGradeEnabled != 0) && (selG.r > 0.5);
     }
@@ -580,6 +593,10 @@ uniform uSelectionColor: vec4f;
 uniform uSplatMode:     i32;
 uniform uHoverSphere:   vec4f;
 uniform uHoverColor:    vec4f;
+uniform uRenderBoxEnabled: i32;
+uniform uRenderBoxCenter: vec3f;
+uniform uRenderBoxHalf: vec3f;
+uniform uWorldToModel: mat4x4f;
 uniform uGradeBasicA: vec4f;
 uniform uGradeBasicB: vec4f;
 uniform uGradeWheelSh: vec3f;
@@ -754,6 +771,14 @@ fn modifySplatCenter(center: ptr<function, vec3f>) {}
 fn modifySplatRotationScale(oc: vec3f, mc: vec3f, rotation: ptr<function, vec4f>, scale: ptr<function, vec3f>) {
 }
 fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
+    let mpos = (uniform.uWorldToModel * vec4f(center, 1.0)).xyz;
+    if uniform.uRenderBoxEnabled != 0 {
+        let dBox = abs(mpos - uniform.uRenderBoxCenter);
+        if any(dBox > uniform.uRenderBoxHalf) {
+            (*color) = vec4f(0.0);
+            return;
+        }
+    }
     let c = loadCustomColor();
     if c.a > 0.0 {
         if uniform.uBlendMode == 1 {
@@ -780,7 +805,7 @@ fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
     }
     // Brush hover preview
     if uniform.uHoverSphere.w > 0.0 {
-        let nd = length(center - uniform.uHoverSphere.xyz) / uniform.uHoverSphere.w;
+        let nd = length(mpos - uniform.uHoverSphere.xyz) / uniform.uHoverSphere.w;
         if nd < 1.0 {
             let f = clamp((1.0 - nd) * uniform.uHoverColor.a, 0.0, 1.0);
             (*color).r = mix((*color).r, uniform.uHoverColor.r, f);
@@ -792,15 +817,20 @@ fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
     let pre = vec3f((*color).r, (*color).g, (*color).b);
     let Lsplit = clamp(dot(pre, vec3f(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
     var applyGrade = (uniform.uGradeEnabled != 0) && (uniform.uGradeSelectedOnly == 0);
-    if uniform.uGradeSelectedOnly != 0 {
+    if uniform.uGradeEnabled != 0 && uniform.uGradeSelectedOnly != 0 {
         let selG = loadCustomSelection();
         applyGrade = (uniform.uGradeEnabled != 0) && (selG.r > 0.5);
     }
-    let gradedFull = sp_color_grade(pre, Lsplit);
-    let graded = select(pre, gradedFull, applyGrade);
-    (*color).r = graded.x;
-    (*color).g = graded.y;
-    (*color).b = graded.z;
+    if applyGrade {
+        let graded = sp_color_grade(pre, Lsplit);
+        (*color).r = graded.x;
+        (*color).g = graded.y;
+        (*color).b = graded.z;
+    } else {
+        (*color).r = pre.x;
+        (*color).g = pre.y;
+        (*color).b = pre.z;
+    }
     if uniform.uShowSelection > 0 {
         let sel = loadCustomSelection();
         if sel.r > 0.5 {
@@ -984,6 +1014,11 @@ installGsplatSplatViewFragmentShaderPatch(app.graphicsDevice);
 app.setCanvasFillMode(pc.FILLMODE_NONE);
 app.setCanvasResolution(pc.RESOLUTION_AUTO);
 
+// GPU-side splat ordering when supported (WebGPU always; WebGL2 if engine exposes it).
+try {
+    app.scene.gsplat.gpuSorting = true;
+} catch (_) { /* ignore */ }
+
 /** 2×2 neutral LUT; bound when no .cube is active so the sampler stays valid. */
 let _dummyGradeLutTex = null;
 const getDummyGradeLutTex = () => {
@@ -1044,6 +1079,571 @@ const resolveGsplatCpuData = async (rawData) => {
     const d = rawData.decompress();
     return d && typeof d.then === 'function' ? await d : d;
 };
+
+/** Local splat files at or above this size use staggered CPU cache init (yield between copies). */
+const GSPLAT_LARGE_FILE_STAGGER_BYTES = 50 * 1024 * 1024;
+
+/** Optional viewport resolution scale (0.5–1). Smaller = faster GPU, softer image. `?rscale=0.75` or localStorage `photoshock-render-scale`. */
+const LS_RENDER_SCALE = 'photoshock-render-scale';
+/** Default on: cap effective scale for huge splat counts (set `0` to disable). `?auto_rscale=0` */
+const LS_AUTO_RSCALE = 'photoshock-auto-rscale';
+/** Default on: adaptive performance governor (budget + rscale) for huge scenes. `?adaptive_perf=0` */
+const LS_ADAPTIVE_PERF = 'photoshock-adaptive-perf';
+/** Apply soft cap when total splats ≥ this (export still uses full data). */
+const RSCALE_AUTO_MIN_SPLATS = 500_000;
+/** Max effective scale when auto kicks in (≈39% fewer pixels vs 1.0 at 0.78). */
+const RSCALE_AUTO_CAP = 0.78;
+/** Runtime cap managed by adaptive controller (null = disabled). */
+let adaptiveRenderScaleCap = null;
+
+const getRenderScaleFactor = () => {
+    let s = 1;
+    try {
+        const u = new URLSearchParams(location.search).get('rscale');
+        if (u != null) {
+            const v = parseFloat(u);
+            if (Number.isFinite(v)) s = v;
+        } else {
+            const ls = localStorage.getItem(LS_RENDER_SCALE);
+            if (ls != null) {
+                const v = parseFloat(ls);
+                if (Number.isFinite(v)) s = v;
+            }
+        }
+    } catch (_) { /* ignore */ }
+    return Math.min(1, Math.max(0.5, s));
+};
+
+/**
+ * User rscale plus optional automatic cap for very large models (better FPS on fill-bound GPUs).
+ * Skips auto when `?rscale=` is present (explicit tuning) or `photoshock-auto-rscale=0` / `?auto_rscale=0`.
+ */
+const getEffectiveRenderScaleFactor = () => {
+    const base = getRenderScaleFactor();
+    const n = gsplatDataCache?.numSplats ?? 0;
+    if (n < RSCALE_AUTO_MIN_SPLATS) {
+        return adaptiveRenderScaleCap == null ? base : Math.min(base, adaptiveRenderScaleCap);
+    }
+    let autoOn = true;
+    try {
+        if (localStorage.getItem(LS_AUTO_RSCALE) === '0') autoOn = false;
+    } catch (_) { /* ignore */ }
+    try {
+        const q = new URLSearchParams(location.search);
+        if (q.get('auto_rscale') === '0') autoOn = false;
+        if (q.get('auto_rscale') === '1') autoOn = true;
+        if (q.get('rscale') != null) return adaptiveRenderScaleCap == null ? base : Math.min(base, adaptiveRenderScaleCap);
+    } catch (_) { /* ignore */ }
+    const autoCapped = autoOn ? Math.min(base, RSCALE_AUTO_CAP) : base;
+    return adaptiveRenderScaleCap == null ? autoCapped : Math.min(autoCapped, adaptiveRenderScaleCap);
+};
+
+/** Reuse engine Float32Array columns when possible — avoids an extra full copy. */
+const floatPropToCache = (buf) => {
+    if (buf == null) return null;
+    return buf instanceof Float32Array ? buf : new Float32Array(buf);
+};
+
+/**
+ * Build deferred higher-order SH columns (f_rest_*) once; large duplicate of GPU data.
+ * Call before any path that reads `gsplatDataCache.shRest`.
+ */
+const ensureBaseGsplatShRestHydratedFromDeferred = () => {
+    const c = gsplatDataCache;
+    if (!c || c.shRest != null || !c._cpuGsplatDataForShRest) return;
+    const data = c._cpuGsplatDataForShRest;
+    const shRest = [];
+    for (let i = 0; i < 45; i++) {
+        const k = `f_rest_${i}`;
+        const a = data.getProp(k);
+        if (a) shRest.push({ key: k, data: floatPropToCache(a) });
+    }
+    c.shRest = shRest;
+    c._cpuGsplatDataForShRest = null;
+};
+
+// ── Spatial base chunks (distance-cull splats; optional for huge models) ───────
+/** `?chunks=1` or localStorage `photoshock-base-chunks=1`, or auto when splat count ≥ min. */
+const LS_BASE_CHUNKS = 'photoshock-base-chunks';
+const BASE_CHUNK_GRID_DIVISIONS = 3;
+const BASE_CHUNK_MIN_SPLATS = 350_000;
+/** Smaller multiplier = fewer distant chunks enabled at once (major FPS lever with chunking). */
+const BASE_CHUNK_STREAM_RADIUS_MULT = 2.25;
+/** SuperSplat-like safety valve: cap active rendered splats (0 disables budget clamp). */
+const LS_BASE_SPLAT_BUDGET = 'photoshock-base-splat-budget';
+const DEFAULT_BASE_SPLAT_BUDGET = 1_200_000;
+/** Frustum-like cone prefilter (behind camera / extreme side chunks). */
+const BASE_CHUNK_VIEW_CONE_PAD_DEG = 16;
+
+/** Huge splat counts / files: start orbit closer to scene center (fewer splats on screen → faster). */
+const CLOSE_ORBIT_SPLAT_THRESHOLD = 350_000;
+const CLOSE_ORBIT_FILE_BYTES = 45 * 1024 * 1024;
+/** distance ≈ longest box half-edge (was 2.8× = very wide shot). */
+const CLOSE_ORBIT_DIST_MULT = 1.08;
+const TIGHT_ORBIT_SPLAT_THRESHOLD = 1_200_000;
+const TIGHT_ORBIT_FILE_BYTES = 200 * 1024 * 1024;
+/** “Inside” the scan — still outside center but much closer than full-scene framing. */
+const TIGHT_ORBIT_DIST_MULT = 0.72;
+
+let baseSpatialChunkingActive = false;
+let baseSpatialStreamRadius = null;
+/** When spatial chunking is on, layer eye toggles this; `updateSpatialBaseChunkVisibility` respects it. */
+let baseLayerHiddenByUser = false;
+/** Runtime budget managed by adaptive controller (null = user/default budget only). */
+let adaptiveBaseSplatBudget = null;
+
+const getConfiguredBaseSplatBudget = () => {
+    let budget = DEFAULT_BASE_SPLAT_BUDGET;
+    try {
+        const q = new URLSearchParams(location.search).get('sbudget');
+        if (q != null) {
+            const v = parseInt(q, 10);
+            if (Number.isFinite(v)) budget = v;
+        } else {
+            const ls = localStorage.getItem(LS_BASE_SPLAT_BUDGET);
+            if (ls != null) {
+                const v = parseInt(ls, 10);
+                if (Number.isFinite(v)) budget = v;
+            }
+        }
+    } catch (_) { /* ignore */ }
+    return Math.max(0, budget | 0);
+};
+
+const getBaseSplatBudget = () => {
+    const manual = getConfiguredBaseSplatBudget();
+    return adaptiveBaseSplatBudget == null ? manual : Math.min(manual, adaptiveBaseSplatBudget);
+};
+
+const shouldSpatialChunkBase = (numSplats, opts = {}) => {
+    if (opts.spatialChunkBase === false) return false;
+    if (opts.spatialChunkBase === true) return true;
+    try {
+        const q = new URLSearchParams(location.search).get('chunks');
+        if (q === '0' || q === 'false') return false;
+        if (q === '1') return true;
+        if (localStorage.getItem(LS_BASE_CHUNKS) === '1') return true;
+    } catch (_) { /* ignore */ }
+    return numSplats >= BASE_CHUNK_MIN_SPLATS;
+};
+
+const sliceF32ByIndices = (arr, indices) => {
+    if (!arr) return null;
+    const n = indices.length;
+    const out = new Float32Array(n);
+    for (let j = 0; j < n; j++) out[j] = arr[indices[j]];
+    return out;
+};
+
+/**
+ * Spatial partition for chunking: counting-sort style (one Uint32 slab + cursors).
+ * Avoids O(n) JS `[]` push/GC churn from Map-of-arrays on multi-million splat scenes.
+ */
+const partitionCacheIndicesByGrid = (cache, divs) => {
+    const { x, y, z, numSplats } = cache;
+    if (!x || !y || !z || !numSplats) return [];
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (let i = 0; i < numSplats; i++) {
+        minX = Math.min(minX, x[i]);
+        maxX = Math.max(maxX, x[i]);
+        minY = Math.min(minY, y[i]);
+        maxY = Math.max(maxY, y[i]);
+        minZ = Math.min(minZ, z[i]);
+        maxZ = Math.max(maxZ, z[i]);
+    }
+    const sx = (maxX - minX) / divs || 1;
+    const sy = (maxY - minY) / divs || 1;
+    const sz = (maxZ - minZ) / divs || 1;
+    const d = divs;
+    const cellCount = d * d * d;
+    const counts = new Int32Array(cellCount);
+    for (let i = 0; i < numSplats; i++) {
+        let ix = Math.floor((x[i] - minX) / sx);
+        let iy = Math.floor((y[i] - minY) / sy);
+        let iz = Math.floor((z[i] - minZ) / sz);
+        ix = Math.max(0, Math.min(d - 1, ix));
+        iy = Math.max(0, Math.min(d - 1, iy));
+        iz = Math.max(0, Math.min(d - 1, iz));
+        const ci = ix + iy * d + iz * d * d;
+        counts[ci]++;
+    }
+    const starts = new Int32Array(cellCount);
+    let acc = 0;
+    for (let c = 0; c < cellCount; c++) {
+        starts[c] = acc;
+        acc += counts[c];
+    }
+    const bucketData = new Uint32Array(numSplats);
+    const next = new Int32Array(starts);
+    for (let i = 0; i < numSplats; i++) {
+        let ix = Math.floor((x[i] - minX) / sx);
+        let iy = Math.floor((y[i] - minY) / sy);
+        let iz = Math.floor((z[i] - minZ) / sz);
+        ix = Math.max(0, Math.min(d - 1, ix));
+        iy = Math.max(0, Math.min(d - 1, iy));
+        iz = Math.max(0, Math.min(d - 1, iz));
+        const ci = ix + iy * d + iz * d * d;
+        const pos = next[ci]++;
+        bucketData[pos] = i;
+    }
+    const out = [];
+    for (let c = 0; c < cellCount; c++) {
+        const cnt = counts[c];
+        if (cnt === 0) continue;
+        const start = starts[c];
+        out.push({ indices: bucketData.subarray(start, start + cnt) });
+    }
+    return out;
+};
+
+const computeCacheBoundingRadius = (cache) => {
+    const { x, y, z, numSplats } = cache;
+    if (!x?.length || !numSplats) return 10;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (let i = 0; i < numSplats; i++) {
+        minX = Math.min(minX, x[i]);
+        maxX = Math.max(maxX, x[i]);
+        minY = Math.min(minY, y[i]);
+        maxY = Math.max(maxY, y[i]);
+        minZ = Math.min(minZ, z[i]);
+        maxZ = Math.max(maxZ, z[i]);
+    }
+    const cx = (minX + maxX) * 0.5;
+    const cy = (minY + maxY) * 0.5;
+    const cz = (minZ + maxZ) * 0.5;
+    let r = 0;
+    for (let i = 0; i < numSplats; i++) {
+        const dx = x[i] - cx;
+        const dy = y[i] - cy;
+        const dz = z[i] - cz;
+        r = Math.max(r, Math.sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    return Math.max(r, 0.5);
+};
+
+const dataTableFromGsplatCacheIndices = (cache, indices) => {
+    ensureBaseGsplatShRestHydratedFromDeferred();
+    const columns = [];
+    const push = (name, arr) => {
+        if (!arr) return;
+        columns.push(new Column(name, sliceF32ByIndices(arr, indices)));
+    };
+    push('x', cache.x);
+    push('y', cache.y);
+    push('z', cache.z);
+    const ex = cache.extra;
+    if (ex) {
+        push('nx', ex.nx);
+        push('ny', ex.ny);
+        push('nz', ex.nz);
+    }
+    push('f_dc_0', cache.fdc0);
+    push('f_dc_1', cache.fdc1);
+    push('f_dc_2', cache.fdc2);
+    if (cache.shRest?.length) {
+        for (const sh of cache.shRest) push(sh.key, sh.data);
+    }
+    push('opacity', cache.opacity);
+    if (ex) {
+        push('scale_0', ex.scale_0);
+        push('scale_1', ex.scale_1);
+        push('scale_2', ex.scale_2);
+        push('rot_0', ex.rot_0);
+        push('rot_1', ex.rot_1);
+        push('rot_2', ex.rot_2);
+        push('rot_3', ex.rot_3);
+    }
+    return new DataTable(columns);
+};
+
+const initPaintableBundleOnEntity = (entity, gsplatComponent, resource, opts) => {
+    const fmt = resource.format;
+    if (!fmt.extraStreams?.find((s) => s.name === 'customColor')) {
+        fmt.addExtraStreams([
+            { name: 'customColor',    format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+            { name: 'customOpacity',  format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+            { name: 'customSelection', format: pc.PIXELFORMAT_RGBA8, storage: pc.GSPLAT_STREAM_INSTANCE },
+        ]);
+    }
+    const colorTex = gsplatComponent.getInstanceTexture('customColor');
+    if (colorTex) { const d = colorTex.lock(); if (d) d.fill(0); colorTex.unlock(); }
+    if (opts?.staggerHeavyInit) { /* caller may await outside */ }
+
+    const opacityTex = gsplatComponent.getInstanceTexture('customOpacity');
+    if (opacityTex) { const d = opacityTex.lock(); if (d) d.fill(0); opacityTex.unlock(); }
+
+    const selTex = gsplatComponent.getInstanceTexture('customSelection');
+    if (selTex) { const d = selTex.lock(); if (d) d.fill(0); selTex.unlock(); }
+
+    gsplatComponent.setWorkBufferModifier({ glsl: MODIFIER_GLSL, wgsl: MODIFIER_WGSL });
+    gsplatComponent.setParameter('uBlendMode',     0);
+    gsplatComponent.setParameter('uShowSelection', 0);
+    gsplatComponent.setParameter('uSelectionColor', selectionHighlightColor());
+    pushSplatViewShaderUniforms(gsplatComponent);
+    gsplatComponent.setParameter('uHoverSphere',   [0, 0, 0, 0]);
+    gsplatComponent.setParameter('uHoverColor',    [1, 1, 1, 0]);
+    applyColorGradeToGsplat(gsplatComponent, baseColorGrade);
+    pushLayerOpacityToGsplat(gsplatComponent, baseLayerOpacityPct);
+    applyRenderBoxToGsplat(gsplatComponent, baseRenderBox);
+    pushWorldToModelUniform(gsplatComponent);
+
+    const processors = createGsplatPaintProcessors(gsplatComponent);
+    return { entity, gsplatComponent, ...processors };
+};
+
+/**
+ * Replace the single loaded base gsplat with several spatial chunks (same CPU cache; multiple GPU draws).
+ * Far chunks are disabled each frame for FPS (see updateSpatialBaseChunkVisibility).
+ */
+const replaceMonolithicBaseWithSpatialChunks = async (firstAsset, opts = {}) => {
+    if (!gsplatDataCache || paintables.length !== 1) return;
+    ensureBaseGsplatShRestHydratedFromDeferred();
+    const parts = partitionCacheIndicesByGrid(gsplatDataCache, BASE_CHUNK_GRID_DIVISIONS);
+    if (parts.length <= 1) return;
+
+    const pb = paintables.pop();
+    pb.paintProcessor?.destroy?.();
+    pb.eraseProcessor?.destroy?.();
+    pb.resetColorProcessor?.destroy?.();
+    pb.resetOpacityProcessor?.destroy?.();
+    pb.entity.destroy();
+    try {
+        app.assets.remove(firstAsset);
+    } catch (_) { /* ignore */ }
+
+    const cache = gsplatDataCache;
+    const rScene = computeCacheBoundingRadius(cache);
+    baseSpatialStreamRadius = Math.max(18, rScene * BASE_CHUNK_STREAM_RADIUS_MULT);
+    baseSpatialChunkingActive = true;
+
+    setModelImportProgressIndeterminate(`Spatial chunks 0/${parts.length}…`);
+
+    for (let pi = 0; pi < parts.length; pi++) {
+        const { indices } = parts[pi];
+        if (!indices.length) continue;
+        setModelImportProgressIndeterminate(`Spatial chunks ${pi + 1}/${parts.length}…`);
+        await yieldNextMacrotask();
+
+        let sx = 0;
+        let sy = 0;
+        let sz = 0;
+        const nk = indices.length;
+        for (let j = 0; j < nk; j++) {
+            const ii = indices[j];
+            sx += cache.x[ii];
+            sy += cache.y[ii];
+            sz += cache.z[ii];
+        }
+        const inv = 1 / nk;
+        const chunkCenterLocal = new pc.Vec3(sx * inv, sy * inv, sz * inv);
+        let minx = Infinity;
+        let miny = Infinity;
+        let minz = Infinity;
+        let maxx = -Infinity;
+        let maxy = -Infinity;
+        let maxz = -Infinity;
+        for (let j = 0; j < nk; j++) {
+            const ii = indices[j];
+            const x = cache.x[ii];
+            const y = cache.y[ii];
+            const z = cache.z[ii];
+            minx = Math.min(minx, x);
+            miny = Math.min(miny, y);
+            minz = Math.min(minz, z);
+            maxx = Math.max(maxx, x);
+            maxy = Math.max(maxy, y);
+            maxz = Math.max(maxz, z);
+        }
+
+        const table = dataTableFromGsplatCacheIndices(cache, indices);
+        const memFs = new MemoryFileSystem();
+        const filename = `base-chunk-${pi}.ply`;
+        await writePly(
+            { filename, plyData: { comments: [], elements: [{ name: 'vertex', dataTable: table }] } },
+            memFs,
+        );
+        const buffer = memFs.results?.get(filename);
+        if (!buffer) {
+            console.error('[photoshock] chunk PLY failed', pi);
+            continue;
+        }
+        const blob = new Blob([buffer], { type: 'application/octet-stream' });
+        const file = new File([blob], filename, { type: 'application/octet-stream' });
+        const loadUrl = URL.createObjectURL(file);
+
+        await new Promise((resolve, reject) => {
+            const asset = new pc.Asset(`baseChunk-${pi}`, 'gsplat', { url: loadUrl, filename });
+            app.assets.add(asset);
+            asset.once('load', (a) => {
+                URL.revokeObjectURL(loadUrl);
+                const entity = new pc.Entity(`baseChunk-${pi}`);
+                const gsplatComponent = entity.addComponent('gsplat', { asset: a, unified: true });
+                baseContainer.addChild(entity);
+                const bundle = initPaintableBundleOnEntity(entity, gsplatComponent, a.resource, opts);
+                paintables.push({
+                    ...bundle,
+                    chunkGlobalIndices: indices,
+                    chunkCenterLocal,
+                    chunkSplatCount: nk,
+                    chunkBoundsLocal: {
+                        min: [minx, miny, minz],
+                        max: [maxx, maxy, maxz],
+                    },
+                });
+                entity.enabled = true;
+                resolve();
+            });
+            asset.once('error', (msg) => {
+                URL.revokeObjectURL(loadUrl);
+                reject(new Error(msg));
+            });
+            app.assets.load(asset);
+        });
+        await yieldNextMacrotask();
+    }
+    try {
+        // SuperSplat-style global budget concept; effective mainly when engine-side LOD exists.
+        app.scene.gsplat.splatBudget = getBaseSplatBudget();
+    } catch (_) { /* ignore */ }
+    invalidateBaseChunkVisibilityCamCache();
+    updateSpatialBaseChunkVisibility();
+    pruneUnusedGsplatAssetsFromRegistry();
+};
+
+/** Skip chunk enable/disable when camera has not moved (orbit idle); big win vs O(chunks) every frame. */
+const _chunkVisLastCam = new pc.Vec3(NaN, NaN, NaN);
+const _chunkVisScratch = new pc.Vec3();
+const _chunkVisToCenter = new pc.Vec3();
+const CHUNK_VIS_CAM_EPS = 0.02;
+/** SuperSplat-like progressive reveal: cap newly enabled chunks per visibility pass. */
+const BASE_CHUNK_ENABLES_PER_PASS = 3;
+/** Keep already-enabled chunks a bit longer to reduce flicker/churn while orbiting fast. */
+const BASE_CHUNK_ENABLE_HYSTERESIS = 1.08;
+
+const invalidateBaseChunkVisibilityCamCache = () => {
+    _chunkVisLastCam.set(NaN, NaN, NaN);
+};
+
+const updateSpatialBaseChunkVisibility = () => {
+    if (!baseSpatialChunkingActive || !paintables.length) return;
+    if (baseLayerHiddenByUser) {
+        for (const p of paintables) {
+            p.entity.enabled = false;
+        }
+        return;
+    }
+    const cam = cameraEntity.getPosition();
+    if (Number.isFinite(_chunkVisLastCam.x) && cam.distance(_chunkVisLastCam) < CHUNK_VIS_CAM_EPS) {
+        return;
+    }
+    _chunkVisLastCam.copy(cam);
+    const wt = baseContainer.getWorldTransform();
+    const R = baseSpatialStreamRadius ?? 100;
+    const RKeep = R * BASE_CHUNK_ENABLE_HYSTERESIS;
+    const budget = getBaseSplatBudget();
+    const camComp = cameraEntity.camera;
+    const forward = cameraEntity.forward;
+    const vfovRad = (camComp?.fov ?? 60) * Math.PI / 180;
+    const hfovRad = 2 * Math.atan(Math.tan(vfovRad * 0.5) * (camComp?.aspectRatio ?? 1.777));
+    const coneCos = Math.cos(Math.max(vfovRad, hfovRad) * 0.5 + BASE_CHUNK_VIEW_CONE_PAD_DEG * Math.PI / 180);
+    const candidates = [];
+    const rb = baseRenderBox;
+    const rbOn = !!rb?.enabled;
+    const rbHalf = getRenderBoxHalfVec(rb);
+    const rbcx = clampRenderBoxNumber(rb?.center?.x, 0);
+    const rbcy = clampRenderBoxNumber(rb?.center?.y, 0);
+    const rbcz = clampRenderBoxNumber(rb?.center?.z, 0);
+    for (const p of paintables) {
+        if (!p.chunkCenterLocal) {
+            p.entity.enabled = false;
+            continue;
+        }
+        if (rbOn) {
+            const b = p.chunkBoundsLocal;
+            if (b?.min && b?.max) {
+                const rbMinX = rbcx - rbHalf[0];
+                const rbMinY = rbcy - rbHalf[1];
+                const rbMinZ = rbcz - rbHalf[2];
+                const rbMaxX = rbcx + rbHalf[0];
+                const rbMaxY = rbcy + rbHalf[1];
+                const rbMaxZ = rbcz + rbHalf[2];
+                const noOverlap =
+                    b.max[0] < rbMinX || b.min[0] > rbMaxX ||
+                    b.max[1] < rbMinY || b.min[1] > rbMaxY ||
+                    b.max[2] < rbMinZ || b.min[2] > rbMaxZ;
+                if (noOverlap) {
+                    p.entity.enabled = false;
+                    continue;
+                }
+            } else {
+                const lx = p.chunkCenterLocal.x;
+                const ly = p.chunkCenterLocal.y;
+                const lz = p.chunkCenterLocal.z;
+                if (Math.abs(lx - rbcx) > rbHalf[0] || Math.abs(ly - rbcy) > rbHalf[1] || Math.abs(lz - rbcz) > rbHalf[2]) {
+                    p.entity.enabled = false;
+                    continue;
+                }
+            }
+        }
+        const world = _chunkVisScratch.copy(p.chunkCenterLocal);
+        wt.transformPoint(world, world);
+        const dist = cam.distance(world);
+        const allowedR = p.entity.enabled ? RKeep : R;
+        if (dist >= allowedR) {
+            p.entity.enabled = false;
+            continue;
+        }
+        _chunkVisToCenter.sub2(world, cam);
+        const len = _chunkVisToCenter.length();
+        if (len > 1e-3) {
+            const facing = forward.dot(_chunkVisToCenter) / len;
+            if (facing < coneCos) {
+                p.entity.enabled = false;
+                continue;
+            }
+        }
+        candidates.push({ p, dist });
+    }
+    candidates.sort((a, b) => a.dist - b.dist);
+    let used = 0;
+    let enabledAny = false;
+    const wantEnabled = new Set();
+    for (const c of candidates) {
+        const count = c.p.chunkSplatCount ?? c.p.chunkGlobalIndices?.length ?? 0;
+        const underBudget = budget <= 0 || used + count <= budget || !enabledAny;
+        const on = underBudget;
+        if (on) {
+            wantEnabled.add(c.p);
+            enabledAny = true;
+            used += count;
+        }
+    }
+    // Disable immediately when out of desired set.
+    for (const p of paintables) {
+        if (!p.entity.enabled) continue;
+        if (!wantEnabled.has(p)) p.entity.enabled = false;
+    }
+    // Enable progressively to avoid frame spikes when turning quickly.
+    let enablesLeft = BASE_CHUNK_ENABLES_PER_PASS;
+    for (const c of candidates) {
+        if (!wantEnabled.has(c.p)) continue;
+        if (c.p.entity.enabled) continue;
+        if (enablesLeft <= 0) break;
+        c.p.entity.enabled = true;
+        enablesLeft--;
+    }
+};
+
 ['dragenter', 'dragover'].forEach((ev) => {
     canvasContainer.addEventListener(ev, (e) => {
         if (![...e.dataTransfer.types].includes('Files')) return;
@@ -1077,8 +1677,9 @@ canvasContainer.addEventListener('contextmenu', (e) => {
 }, { capture: true });
 
 const resizeCanvasToContainer = () => {
-    const w = Math.max(1, canvasContainer.clientWidth);
-    const h = Math.max(1, canvasContainer.clientHeight);
+    const rs = getEffectiveRenderScaleFactor();
+    const w = Math.max(1, Math.round(canvasContainer.clientWidth * rs));
+    const h = Math.max(1, Math.round(canvasContainer.clientHeight * rs));
     app.resizeCanvas(w, h);
 };
 
@@ -1328,6 +1929,25 @@ const shapePreviewLineMat = makeViewportGridLineMaterial(0.28, 0.62, 1.0);
 shapePreviewLineMat.depthTest = true;
 shapePreviewLineMat.depthWrite = true;
 shapePreviewLineMat.update();
+const renderBoxWireMat = makeViewportGridLineMaterial(1.0, 0.82, 0.26);
+renderBoxWireMat.depthTest = true;
+renderBoxWireMat.depthWrite = true;
+renderBoxWireMat.update();
+const renderBoxLinePositions = new Float32Array([
+    -0.5, -0.5, -0.5,  0.5, -0.5, -0.5,
+    -0.5, -0.5,  0.5,  0.5, -0.5,  0.5,
+    -0.5,  0.5, -0.5,  0.5,  0.5, -0.5,
+    -0.5,  0.5,  0.5,  0.5,  0.5,  0.5,
+    -0.5, -0.5, -0.5, -0.5,  0.5, -0.5,
+     0.5, -0.5, -0.5,  0.5,  0.5, -0.5,
+    -0.5, -0.5,  0.5, -0.5,  0.5,  0.5,
+     0.5, -0.5,  0.5,  0.5,  0.5,  0.5,
+    -0.5, -0.5, -0.5, -0.5, -0.5,  0.5,
+     0.5, -0.5, -0.5,  0.5, -0.5,  0.5,
+    -0.5,  0.5, -0.5, -0.5,  0.5,  0.5,
+     0.5,  0.5, -0.5,  0.5,  0.5,  0.5,
+]);
+const renderBoxWireMesh = meshFromLinePositions(renderBoxLinePositions);
 
 const shapePreviewFillMat = new pc.StandardMaterial();
 shapePreviewFillMat.diffuse = new pc.Color(0.18, 0.48, 0.95);
@@ -1376,6 +1996,7 @@ const updateViewportGridToggleButton = () => {
 // Camera WASD + QE navigation (always active)
 const _navStep = new pc.Vec3();
 app.on('update', (dt) => {
+    pushAllWorldToModelUniforms();
     const dtClamped = Math.min(dt, 0.1);
     let moved = false;
     const fwd = cameraEntity.forward;
@@ -1402,6 +2023,7 @@ app.on('update', (dt) => {
         if (keysNav.e) { flyCam.pos.y -= speed; moved = true; }
     }
     if (moved) updateCamera();
+    updateSpatialBaseChunkVisibility();
     if (viewportGridEntity.enabled) {
         if (cameraNavMode === 'orbit') {
             viewportGridEntity.setPosition(orbit.target.x, orbit.target.y, orbit.target.z);
@@ -1416,8 +2038,9 @@ app.on('update', (dt) => {
     }
 });
 
-// Enable gsplat IDs for accurate picking in unified mode
-app.scene.gsplat.enableIds = true;
+// Leave scene.gsplat.enableIds false (default): enabling adds a pcId stream + GSPLAT_ID
+// shader path and extra bandwidth. Photoshock uses CPU splat picking (pickFrontSplatAtScreen)
+// and depth-based stroke picking, not engine gsplat pick IDs.
 
 // ── World-point hit via GPU depth picker ──────────────────────────────────────
 // On each stroke start (mousedown) we use the Picker to read the actual GPU
@@ -1531,6 +2154,222 @@ const paintables = [];
 // CPU splat cache for export
 let gsplatDataCache = null;
 
+// Debug overlay: add ?perf=1 or set localStorage photoshock-perf=1 — FPS, frame ms, API, splat count
+let photoshockPerfHudEl = null;
+let photoshockPerfFpsEma = 0;
+
+/** Top-left viewer FPS (Shift+F); persisted in localStorage. */
+const LS_VIEWER_FPS_HUD = 'photoshock-viewer-fps';
+let viewerFpsHudEl = null;
+let viewerFpsHudVisible = false;
+
+const initViewerFpsHud = () => {
+    if (!canvasContainer || viewerFpsHudEl) return;
+    try {
+        viewerFpsHudEl = document.createElement('div');
+        viewerFpsHudEl.id = 'viewer-fps-hud';
+        viewerFpsHudEl.className = 'viewer-fps-hud';
+        viewerFpsHudEl.setAttribute('role', 'status');
+        viewerFpsHudEl.setAttribute('aria-live', 'polite');
+        try {
+            viewerFpsHudVisible = localStorage.getItem(LS_VIEWER_FPS_HUD) === '1';
+        } catch (_) { /* ignore */ }
+        viewerFpsHudEl.setAttribute('aria-hidden', viewerFpsHudVisible ? 'false' : 'true');
+        Object.assign(viewerFpsHudEl.style, {
+            position: 'absolute',
+            top: '8px',
+            left: '8px',
+            zIndex: '12',
+            font: '12px/1.25 ui-monospace, monospace',
+            color: '#e8f4ff',
+            background: 'rgba(0,0,0,0.52)',
+            padding: '5px 9px',
+            borderRadius: '6px',
+            pointerEvents: 'none',
+            whiteSpace: 'nowrap',
+            display: viewerFpsHudVisible ? 'block' : 'none',
+        });
+        canvasContainer.appendChild(viewerFpsHudEl);
+    } catch (_) { /* ignore */ }
+};
+
+const toggleViewerFpsHud = () => {
+    initViewerFpsHud();
+    if (!viewerFpsHudEl) return;
+    viewerFpsHudVisible = !viewerFpsHudVisible;
+    viewerFpsHudEl.style.display = viewerFpsHudVisible ? 'block' : 'none';
+    viewerFpsHudEl.setAttribute('aria-hidden', viewerFpsHudVisible ? 'false' : 'true');
+    try {
+        localStorage.setItem(LS_VIEWER_FPS_HUD, viewerFpsHudVisible ? '1' : '0');
+    } catch (_) { /* ignore */ }
+};
+
+// ── Adaptive large-scene FPS governor (SuperSplat-like budget balancing) ─────
+const ADAPT_TARGET_FPS = 36;
+const ADAPT_INTERVAL_S = 0.6;
+const ADAPT_BUDGET_MIN = 280_000;
+const ADAPT_RSCALE_MIN = 0.56;
+const ADAPT_RSCALE_STEP_DOWN = 0.05;
+const ADAPT_RSCALE_STEP_UP = 0.02;
+const ADAPT_GOOD_WINDOWS_FOR_UPSCALE = 4;
+
+let adaptTimer = 0;
+let adaptGoodWindows = 0;
+
+const isAdaptivePerfEnabled = () => {
+    let enabled = true;
+    try {
+        if (localStorage.getItem(LS_ADAPTIVE_PERF) === '0') enabled = false;
+    } catch (_) { /* ignore */ }
+    try {
+        const q = new URLSearchParams(location.search).get('adaptive_perf');
+        if (q === '0' || q === 'false') enabled = false;
+        if (q === '1' || q === 'true') enabled = true;
+    } catch (_) { /* ignore */ }
+    return enabled;
+};
+
+const hasExplicitQueryParam = (name) => {
+    try {
+        return new URLSearchParams(location.search).get(name) != null;
+    } catch (_) {
+        return false;
+    }
+};
+
+const tickAdaptivePerfController = (dt) => {
+    if (!isAdaptivePerfEnabled()) return;
+    const n = gsplatDataCache?.numSplats ?? 0;
+    if (n < BASE_CHUNK_MIN_SPLATS) {
+        adaptiveBaseSplatBudget = null;
+        adaptiveRenderScaleCap = null;
+        adaptTimer = 0;
+        adaptGoodWindows = 0;
+        return;
+    }
+    adaptTimer += dt;
+    if (adaptTimer < ADAPT_INTERVAL_S) return;
+    adaptTimer = 0;
+
+    const fps = photoshockPerfFpsEma;
+    if (!Number.isFinite(fps) || fps <= 0) return;
+
+    const canAdaptBudget = baseSpatialChunkingActive && !hasExplicitQueryParam('sbudget');
+    const canAdaptRscale = !hasExplicitQueryParam('rscale');
+    let changedBudget = false;
+    let changedRscale = false;
+
+    if (fps < ADAPT_TARGET_FPS - 3) {
+        adaptGoodWindows = 0;
+        if (canAdaptBudget) {
+            const cur = adaptiveBaseSplatBudget ?? getConfiguredBaseSplatBudget();
+            const next = Math.max(ADAPT_BUDGET_MIN, Math.floor(cur * 0.88));
+            if (next < cur) {
+                adaptiveBaseSplatBudget = next;
+                changedBudget = true;
+            }
+        }
+        if (canAdaptRscale) {
+            const curCap = adaptiveRenderScaleCap ?? 1;
+            const nextCap = Math.max(ADAPT_RSCALE_MIN, curCap - ADAPT_RSCALE_STEP_DOWN);
+            if (nextCap < curCap - 1e-4) {
+                adaptiveRenderScaleCap = nextCap;
+                changedRscale = true;
+            }
+        }
+    } else if (fps > ADAPT_TARGET_FPS + 8) {
+        adaptGoodWindows++;
+        if (adaptGoodWindows >= ADAPT_GOOD_WINDOWS_FOR_UPSCALE) {
+            adaptGoodWindows = 0;
+            if (canAdaptBudget && adaptiveBaseSplatBudget != null) {
+                const up = Math.ceil(adaptiveBaseSplatBudget * 1.12);
+                const maxB = getConfiguredBaseSplatBudget();
+                const next = Math.min(maxB, up);
+                if (next > adaptiveBaseSplatBudget) {
+                    adaptiveBaseSplatBudget = next;
+                    if (adaptiveBaseSplatBudget >= maxB) adaptiveBaseSplatBudget = null;
+                    changedBudget = true;
+                }
+            }
+            if (canAdaptRscale && adaptiveRenderScaleCap != null) {
+                const nextCap = Math.min(1, adaptiveRenderScaleCap + ADAPT_RSCALE_STEP_UP);
+                if (nextCap > adaptiveRenderScaleCap + 1e-4) {
+                    adaptiveRenderScaleCap = nextCap >= 0.999 ? null : nextCap;
+                    changedRscale = true;
+                }
+            }
+        }
+    } else {
+        adaptGoodWindows = 0;
+    }
+
+    if (changedBudget) {
+        invalidateBaseChunkVisibilityCamCache();
+        updateSpatialBaseChunkVisibility();
+    }
+    if (changedRscale) {
+        resizeCanvasToContainer();
+    }
+};
+
+try {
+    if (canvasContainer
+        && (new URLSearchParams(location.search).get('perf') === '1'
+            || localStorage.getItem('photoshock-perf') === '1')) {
+        photoshockPerfHudEl = document.createElement('div');
+        photoshockPerfHudEl.setAttribute('aria-hidden', 'true');
+        Object.assign(photoshockPerfHudEl.style, {
+            position: 'fixed',
+            left: '8px',
+            bottom: '8px',
+            zIndex: '9999',
+            font: '12px/1.3 ui-monospace, monospace',
+            color: '#cfe8ff',
+            background: 'rgba(0,0,0,0.55)',
+            padding: '6px 10px',
+            borderRadius: '6px',
+            pointerEvents: 'none',
+            whiteSpace: 'pre-wrap',
+            maxWidth: 'min(90vw, 28rem)',
+        });
+        canvasContainer.appendChild(photoshockPerfHudEl);
+    }
+} catch (_) { /* ignore */ }
+
+initViewerFpsHud();
+
+app.on('update', (dt) => {
+    const instFps = dt > 1e-6 ? 1 / dt : 0;
+    photoshockPerfFpsEma = photoshockPerfFpsEma === 0 ? instFps : photoshockPerfFpsEma * 0.92 + instFps * 0.08;
+    tickAdaptivePerfController(dt);
+    const tickViewerFps = viewerFpsHudEl && viewerFpsHudVisible;
+    if (!photoshockPerfHudEl && !tickViewerFps) return;
+    if (tickViewerFps) {
+        const rsE = getEffectiveRenderScaleFactor();
+        const rsBase = getRenderScaleFactor();
+        const autoNote = rsE < rsBase - 1e-4 ? ' auto' : '';
+        const rsHint = rsE < 0.999 ? `  ·  ${rsE.toFixed(2)}×${autoNote}` : '';
+        viewerFpsHudEl.textContent = `${photoshockPerfFpsEma.toFixed(0)} FPS  ${(dt * 1000).toFixed(1)} ms${rsHint}`;
+    }
+    if (photoshockPerfHudEl) {
+        const n = gsplatDataCache?.numSplats ?? 0;
+        const api = device.isWebGPU ? 'WebGPU' : 'WebGL2';
+        const rsE = getEffectiveRenderScaleFactor();
+        const rsBase = getRenderScaleFactor();
+        const sb = getBaseSplatBudget();
+        const activeChunkSplats = baseSpatialChunkingActive
+            ? paintables.reduce((s, pb) => s + (pb.entity.enabled ? (pb.chunkSplatCount ?? pb.chunkGlobalIndices?.length ?? 0) : 0), 0)
+            : n;
+        const rsLine = rsE < 0.999
+            ? (rsE < rsBase - 1e-4 ? `  rscale ${rsE.toFixed(2)} (auto cap, user ${rsBase.toFixed(2)})` : `  rscale ${rsE}`)
+            : '';
+        const chunkLine = baseSpatialChunkingActive
+            ? `  visible ${activeChunkSplats.toLocaleString()} / ${n.toLocaleString()}  sbudget ${sb.toLocaleString()}`
+            : `  splats ${n.toLocaleString()}`;
+        photoshockPerfHudEl.textContent = `FPS ~${photoshockPerfFpsEma.toFixed(0)}  frame ${(dt * 1000).toFixed(2)} ms\n${api}${rsLine}${chunkLine}`;
+    }
+});
+
 /** Base splats logically removed (fast delete without PLY reload): 0 = skip in CPU pick/selection. */
 let baseSplatAliveMask = null;
 
@@ -1576,11 +2415,28 @@ const createDefaultLayerTransform = () => ({
 });
 let baseTransform = createDefaultLayerTransform();
 
+const createDefaultRenderBox = () => ({
+    enabled: false,
+    center: { x: 0, y: 0, z: 0 },
+    size: { x: 2, y: 2, z: 2 },
+});
+let baseRenderBox = createDefaultRenderBox();
+
 const ensureUserLayerTransform = (layer) => {
     if (!layer || typeof layer !== 'object') return;
     if (!layer.position) layer.position = { x: 0, y: 0, z: 0 };
     if (!layer.rotation) layer.rotation = { x: 0, y: 0, z: 0 };
     if (!layer.scale) layer.scale = { x: 1, y: 1, z: 1 };
+};
+
+const ensureLayerRenderBox = (layer) => {
+    if (!layer || typeof layer !== 'object') return;
+    if (!layer.renderBox || typeof layer.renderBox !== 'object') {
+        layer.renderBox = createDefaultRenderBox();
+    }
+    if (!layer.renderBox.center) layer.renderBox.center = { x: 0, y: 0, z: 0 };
+    if (!layer.renderBox.size) layer.renderBox.size = { x: 2, y: 2, z: 2 };
+    if (typeof layer.renderBox.enabled !== 'boolean') layer.renderBox.enabled = !!layer.renderBox.enabled;
 };
 
 /** Reusable scratch for export baking (world TRS applied to splat attributes). */
@@ -2075,6 +2931,32 @@ app.root.addChild(baseContainer);
 const layersContainer = new pc.Entity('layersContainer');
 app.root.addChild(layersContainer);
 
+/**
+ * PlayCanvas keeps loaded gsplat `Asset` entries in `app.assets` after entities are destroyed.
+ * Dropping unreferenced assets releases CPU-side resource data (and associated GPU memory).
+ */
+const pruneUnusedGsplatAssetsFromRegistry = () => {
+    const keep = new Set();
+    for (const p of paintables) {
+        const id = p.entity?.gsplat?.asset?.id;
+        if (id != null) keep.add(id);
+    }
+    for (const layer of layers) {
+        const ent = layersContainer.findByName(`layer-${layer.id}`);
+        const id = ent?.gsplat?.asset?.id;
+        if (id != null) keep.add(id);
+    }
+    const list = app.assets.list();
+    for (let i = list.length - 1; i >= 0; i--) {
+        const a = list[i];
+        if (a.type !== 'gsplat' || a.loading) continue;
+        if (keep.has(a.id)) continue;
+        try {
+            app.assets.remove(a);
+        } catch (_) { /* ignore */ }
+    }
+};
+
 // ── Layer transform gizmos (viewport handles for selected layer or base) ──────
 const LS_LAYER_GIZMO_VISIBLE = 'photoshock-layer-gizmo-visible';
 const LS_LAYER_GIZMO_MODE = 'photoshock-layer-gizmo-mode';
@@ -2106,6 +2988,9 @@ let shapePlacementDrag = null;
 let shapePlaceSession = 0;
 let syncingShapeUIFromPreview = false;
 let gizmoTargetIsShapePreview = false;
+let gizmoTargetIsRenderBox = false;
+let activeRenderBoxGizmoEntity = null;
+let renderBoxGizmoEditMode = false;
 
 /** Local-space centroid of base splats (mean xyz); translate gizmo attaches here. */
 const baseGizmoPivotCentroidLocal = new pc.Vec3(0, 0, 0);
@@ -2184,6 +3069,7 @@ const syncActiveTargetTransformFromGizmoEntity = () => {
         baseTransform.scale.x = clampScl(s.x);
         baseTransform.scale.y = clampScl(s.y);
         baseTransform.scale.z = clampScl(s.z);
+        applyBaseEntityTransform();
     } else {
         const lyr = layers.find((l) => l.id === selectedLayerId);
         if (!lyr) return;
@@ -2221,6 +3107,22 @@ const onLayerGizmoTransformChanged = () => {
         saveShapeToolPrefs();
         return;
     }
+    if (gizmoTargetIsRenderBox && activeRenderBoxGizmoEntity) {
+        const rb = getActiveRenderBox();
+        if (!rb) return;
+        const p = activeRenderBoxGizmoEntity.getLocalPosition();
+        const s = activeRenderBoxGizmoEntity.getLocalScale();
+        rb.enabled = true;
+        rb.center.x = clampRenderBoxNumber(p.x, 0);
+        rb.center.y = clampRenderBoxNumber(p.y, 0);
+        rb.center.z = clampRenderBoxNumber(p.z, 0);
+        rb.size.x = clampRenderBoxSize(s.x, 2);
+        rb.size.y = clampRenderBoxSize(s.y, 2);
+        rb.size.z = clampRenderBoxSize(s.z, 2);
+        syncLayerTransformUI();
+        applyActiveRenderBoxToRuntime();
+        return;
+    }
     syncActiveTargetTransformFromGizmoEntity();
 };
 
@@ -2246,6 +3148,16 @@ const updateLayerGizmoModeButtons = () => {
     });
 };
 
+const updateRenderBoxGizmoEditButton = () => {
+    const btn = g('rb-edit-gizmo-btn');
+    if (!btn) return;
+    btn.classList.toggle('accent', renderBoxGizmoEditMode);
+    btn.textContent = renderBoxGizmoEditMode ? 'Editing Box Gizmo' : 'Edit Box Gizmo';
+    btn.title = renderBoxGizmoEditMode
+        ? 'Stop editing clipping box with gizmo'
+        : 'Edit clipping box with gizmo (translate/scale)';
+};
+
 const updateFloatingGizmoBarVisibility = () => {
     const bar = g('floating-gizmo-bar');
     if (!bar) return;
@@ -2261,6 +3173,8 @@ const refreshLayerGizmoAttachment = () => {
     layerTranslateGizmo.detach();
     layerRotateGizmo.detach();
     layerScaleGizmo.detach();
+    gizmoTargetIsRenderBox = false;
+    activeRenderBoxGizmoEntity = null;
     updateLayerGizmoToggleButton();
     updateFloatingGizmoBarVisibility();
     if (!layerGizmoVisible) return;
@@ -2273,6 +3187,14 @@ const refreshLayerGizmoAttachment = () => {
         return;
     }
     gizmoTargetIsShapePreview = false;
+    refreshActiveRenderBoxPreview();
+    const rb = getActiveRenderBox();
+    if (renderBoxGizmoEditMode && rb?.enabled && activeRenderBoxGizmoEntity) {
+        gizmoTargetIsRenderBox = true;
+        if (layerGizmoMode === 'scale') layerScaleGizmo.attach([activeRenderBoxGizmoEntity]);
+        else layerTranslateGizmo.attach([activeRenderBoxGizmoEntity]);
+        return;
+    }
 
     let ent = null;
     if (selectedLayerId === 'base' || !selectedLayerId) {
@@ -2841,6 +3763,7 @@ const splatShapePreviewToLayer = () => {
         visible: true,
         opacityPct: 100,
         colorGrade: cloneColorGrade(),
+        renderBox: createDefaultRenderBox(),
         ...createDefaultLayerTransform(),
         splats,
         selectionMask: null,
@@ -3507,6 +4430,56 @@ const pushLayerOpacityToGsplat = (gsplat, pct) => {
     gsplat.setParameter('uLayerOpacity', opacityPctToUniform(pct));
 };
 
+const clampRenderBoxNumber = (v, def) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return def;
+    return Math.max(-100000, Math.min(100000, n));
+};
+const clampRenderBoxSize = (v, def = 2) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return def;
+    return Math.max(0.01, Math.min(100000, n));
+};
+const getRenderBoxHalfVec = (rb) => {
+    const b = rb || createDefaultRenderBox();
+    return [
+        clampRenderBoxSize(b.size?.x, 2) * 0.5,
+        clampRenderBoxSize(b.size?.y, 2) * 0.5,
+        clampRenderBoxSize(b.size?.z, 2) * 0.5,
+    ];
+};
+
+/** Work-buffer `modifySplatColor` gets world-space centers; inverse maps to splat/model space for box + hover. */
+const _scratchWorldToModelForModifier = new pc.Mat4();
+const pushWorldToModelUniform = (gsplat) => {
+    if (!gsplat?.setParameter) return;
+    const ent = gsplat.entity;
+    if (!ent) return;
+    _scratchWorldToModelForModifier.copy(ent.getWorldTransform()).invert();
+    gsplat.setParameter('uWorldToModel', _scratchWorldToModelForModifier.data);
+};
+const pushAllWorldToModelUniforms = () => {
+    for (const p of paintables) {
+        pushWorldToModelUniform(p.gsplatComponent);
+    }
+    for (const layer of layers) {
+        const ent = layersContainer.findByName(`layer-${layer.id}`);
+        if (ent?.gsplat) pushWorldToModelUniform(ent.gsplat);
+    }
+};
+
+const applyRenderBoxToGsplat = (gsplat, rb) => {
+    if (!gsplat?.setParameter) return;
+    const box = rb || createDefaultRenderBox();
+    gsplat.setParameter('uRenderBoxEnabled', box.enabled ? 1 : 0);
+    gsplat.setParameter('uRenderBoxCenter', [
+        clampRenderBoxNumber(box.center?.x, 0),
+        clampRenderBoxNumber(box.center?.y, 0),
+        clampRenderBoxNumber(box.center?.z, 0),
+    ]);
+    gsplat.setParameter('uRenderBoxHalf', getRenderBoxHalfVec(box));
+};
+
 const applyColorGradeToGsplat = (gsplat, grade) => {
     if (!gsplat?.setParameter) return;
     const gd = grade || createDefaultColorGrade();
@@ -3546,7 +4519,7 @@ const applyColorGradeToGsplat = (gsplat, grade) => {
     gsplat.setParameter('uGradeWheelMd', wheelRgbOffset(gd.wheelMidHex, gd.wheelMidAmt));
     gsplat.setParameter('uGradeWheelHi', wheelRgbOffset(gd.wheelHighHex, gd.wheelHighAmt));
     gsplat.setParameter('uGradeCross', [0.2, 0.45, 0.55, 0.8]);
-    gsplat.setParameter('uGradeEnabled', gd.enabled === false ? 0 : 1);
+    gsplat.setParameter('uGradeEnabled', (gd.enabled === false || colorGradeIsIdentity(gd)) ? 0 : 1);
     for (let i = 0; i < 8; i++) {
         const s = gd.sectors[i] || { h: 0, s: 0, l: 0 };
         gsplat.setParameter(`uGradeSec${i}`, [
@@ -3560,9 +4533,9 @@ const applyColorGradeToGsplat = (gsplat, grade) => {
 };
 
 const pushAllColorGradesToGPU = () => {
-    if (paintables[0]) {
-        applyColorGradeToGsplat(paintables[0].gsplatComponent, baseColorGrade);
-        pushLayerOpacityToGsplat(paintables[0].gsplatComponent, baseLayerOpacityPct);
+    for (const p of paintables) {
+        applyColorGradeToGsplat(p.gsplatComponent, baseColorGrade);
+        pushLayerOpacityToGsplat(p.gsplatComponent, baseLayerOpacityPct);
     }
     for (const layer of layers) {
         ensureLayerColorGrade(layer);
@@ -3596,6 +4569,14 @@ const getActiveColorGradeBundle = () => {
     ensureLayerColorGrade(layer);
     const ent = layersContainer.findByName(`layer-${layer.id}`);
     return { grade: layer.colorGrade, gsplat: ent?.gsplat ?? null, label: layer.name };
+};
+
+const applyColorGradeBundleToGpu = (grade, bundleGsplat) => {
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        for (const p of paintables) applyColorGradeToGsplat(p.gsplatComponent, grade);
+    } else if (bundleGsplat) {
+        applyColorGradeToGsplat(bundleGsplat, grade);
+    }
 };
 
 const readColorGradeFromUIInto = (grade) => {
@@ -3634,7 +4615,7 @@ const commitActiveColorGradeFromUI = () => {
     if (_syncingColorGradeUI) return;
     const { grade, gsplat } = getActiveColorGradeBundle();
     readColorGradeFromUIInto(grade);
-    applyColorGradeToGsplat(gsplat, grade);
+    applyColorGradeBundleToGpu(grade, gsplat);
 };
 
 const updateCgVisibilityButton = (enabled) => {
@@ -3708,7 +4689,7 @@ const resetActiveColorGrade = () => {
         else grade[k] = fresh[k];
     }
     refreshColorGradeUIFromSelection();
-    applyColorGradeToGsplat(gsplat, grade);
+    applyColorGradeBundleToGpu(grade, gsplat);
 };
 
 /** Bake current color grade (and optional GPU paint for base) into SH DC, reset grade UI. */
@@ -3767,6 +4748,7 @@ const bakeColorGradeIntoActiveTarget = async () => {
         const dc = shDcFromRgb(outRgb[0], outRgb[1], outRgb[2]);
         o0[i] = dc[0]; o1[i] = dc[1]; o2[i] = dc[2];
     }
+    ensureBaseGsplatShRestHydratedFromDeferred();
     const { x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache;
     const columns = [];
     const addCol = (name, data) => { if (data) columns.push(new Column(name, data)); };
@@ -3851,6 +4833,7 @@ const bakeBrushPaintIntoModel = async () => {
     const o1 = new Float32Array(painted.out1);
     const o2 = new Float32Array(painted.out2);
     const oOp = new Float32Array(painted.outOp);
+    ensureBaseGsplatShRestHydratedFromDeferred();
     const { x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache;
     const columns = [];
     const addCol = (name, data) => { if (data) columns.push(new Column(name, data)); };
@@ -4019,6 +5002,7 @@ const syncDisplayUniforms = (p) => {
     pushSplatViewShaderUniforms(p.gsplatComponent);
     applyColorGradeToGsplat(p.gsplatComponent, baseColorGrade);
     pushLayerOpacityToGsplat(p.gsplatComponent, baseLayerOpacityPct);
+    pushWorldToModelUniform(p.gsplatComponent);
 };
 
 const syncSplatViewStyleToolbar = () => {
@@ -4063,11 +5047,13 @@ let globalModelRotation = { x: 0, y: 0, z: 180 };
 
 const applyBaseEntityTransform = () => {
     if (!paintables.length) return;
-    const e = paintables[0].entity;
     const t = baseTransform;
-    e.setLocalPosition(t.position.x, t.position.y, t.position.z);
-    e.setLocalEulerAngles(t.rotation.x, t.rotation.y, t.rotation.z);
-    e.setLocalScale(t.scale.x, t.scale.y, t.scale.z);
+    for (const pb of paintables) {
+        const e = pb.entity;
+        e.setLocalPosition(t.position.x, t.position.y, t.position.z);
+        e.setLocalEulerAngles(t.rotation.x, t.rotation.y, t.rotation.z);
+        e.setLocalScale(t.scale.x, t.scale.y, t.scale.z);
+    }
 };
 
 const applySingleLayerEntityTransform = (layer) => {
@@ -4082,6 +5068,7 @@ const applySingleLayerEntityTransform = (layer) => {
 const applyAllLayerEntityTransforms = () => {
     applyBaseEntityTransform();
     for (const layer of layers) applySingleLayerEntityTransform(layer);
+    refreshActiveRenderBoxPreview();
 };
 
 const applyModelRotation = () => {
@@ -4137,6 +5124,7 @@ const addLayer = () => {
         splats: [],
         selectionMask: null,
         colorGrade: cloneColorGrade(),
+        renderBox: createDefaultRenderBox(),
         ...createDefaultLayerTransform(),
     };
     layers.push(layer);
@@ -4249,6 +5237,7 @@ const duplicateLayer = async (layerId) => {
                 ? new Uint8Array(src.selectionMask)
                 : null,
         colorGrade: cloneColorGrade(src.colorGrade),
+        renderBox: JSON.parse(JSON.stringify(src.renderBox ?? createDefaultRenderBox())),
         ...createDefaultLayerTransform(),
     };
     newLayer.position = { ...src.position };
@@ -4349,6 +5338,7 @@ const separateSelectionToNewLayer = async () => {
         splats: picked,
         selectionMask: null,
         colorGrade: cloneColorGrade(src.colorGrade),
+        renderBox: JSON.parse(JSON.stringify(src.renderBox ?? createDefaultRenderBox())),
         ...createDefaultLayerTransform(),
     };
     newLayer.position = { ...src.position };
@@ -4497,6 +5487,157 @@ const resetActiveLayerTransform = () => {
     refreshLayerGizmoAttachment();
 };
 
+const getActiveRenderBox = () => {
+    if (selectedLayerId === 'base' || !selectedLayerId) return baseRenderBox;
+    const layer = layers.find((l) => l.id === selectedLayerId);
+    if (!layer) return null;
+    ensureLayerRenderBox(layer);
+    return layer.renderBox;
+};
+
+const ensureRenderBoxPreviewEntityForParent = (parent) => {
+    if (!parent) return null;
+    let ent = parent.findByName('render-box-preview');
+    if (!ent) {
+        ent = new pc.Entity('render-box-preview');
+        parent.addChild(ent);
+        const mi = new pc.MeshInstance(renderBoxWireMesh, renderBoxWireMat);
+        mi.cull = false;
+        mi.drawOrder = 210;
+        ent.addComponent('render', { castShadows: false, meshInstances: [mi] });
+    }
+    return ent;
+};
+
+const refreshActiveRenderBoxPreview = () => {
+    const rb = getActiveRenderBox();
+    if (!rb) return;
+    let parent = null;
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        parent = paintables[0]?.entity ?? null;
+    } else {
+        parent = layersContainer.findByName(`layer-${selectedLayerId}`) ?? null;
+    }
+    if (!parent) {
+        activeRenderBoxGizmoEntity = null;
+        return;
+    }
+    const ent = ensureRenderBoxPreviewEntityForParent(parent);
+    if (!ent) return;
+    ent.enabled = !!rb.enabled;
+    ent.setLocalPosition(
+        clampRenderBoxNumber(rb.center?.x, 0),
+        clampRenderBoxNumber(rb.center?.y, 0),
+        clampRenderBoxNumber(rb.center?.z, 0),
+    );
+    ent.setLocalEulerAngles(0, 0, 0);
+    ent.setLocalScale(
+        clampRenderBoxSize(rb.size?.x, 2),
+        clampRenderBoxSize(rb.size?.y, 2),
+        clampRenderBoxSize(rb.size?.z, 2),
+    );
+    activeRenderBoxGizmoEntity = ent;
+};
+
+const applyActiveRenderBoxToRuntime = () => {
+    const rb = getActiveRenderBox();
+    if (!rb) return;
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        for (const pb of paintables) applyRenderBoxToGsplat(pb.gsplatComponent, rb);
+        invalidateBaseChunkVisibilityCamCache();
+        updateSpatialBaseChunkVisibility();
+    } else {
+        const ent = layersContainer.findByName(`layer-${selectedLayerId}`);
+        if (ent?.gsplat) applyRenderBoxToGsplat(ent.gsplat, rb);
+    }
+    refreshActiveRenderBoxPreview();
+};
+
+const getActiveRenderBoxBounds = () => {
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        const b = gsplatDataCache?.bounds;
+        if (!b) return null;
+        return {
+            min: { x: b.min[0], y: b.min[1], z: b.min[2] },
+            max: { x: b.max[0], y: b.max[1], z: b.max[2] },
+        };
+    }
+    const layer = layers.find((l) => l.id === selectedLayerId);
+    if (!layer?.splats?.length) return null;
+    let minx = Infinity;
+    let miny = Infinity;
+    let minz = Infinity;
+    let maxx = -Infinity;
+    let maxy = -Infinity;
+    let maxz = -Infinity;
+    for (const s of layer.splats) {
+        minx = Math.min(minx, s.x);
+        miny = Math.min(miny, s.y);
+        minz = Math.min(minz, s.z);
+        maxx = Math.max(maxx, s.x);
+        maxy = Math.max(maxy, s.y);
+        maxz = Math.max(maxz, s.z);
+    }
+    return {
+        min: { x: minx, y: miny, z: minz },
+        max: { x: maxx, y: maxy, z: maxz },
+    };
+};
+
+const fitActiveRenderBoxToBounds = () => {
+    const rb = getActiveRenderBox();
+    const b = getActiveRenderBoxBounds();
+    if (!rb || !b) return;
+    rb.enabled = true;
+    rb.center.x = (b.min.x + b.max.x) * 0.5;
+    rb.center.y = (b.min.y + b.max.y) * 0.5;
+    rb.center.z = (b.min.z + b.max.z) * 0.5;
+    rb.size.x = Math.max(0.01, b.max.x - b.min.x);
+    rb.size.y = Math.max(0.01, b.max.y - b.min.y);
+    rb.size.z = Math.max(0.01, b.max.z - b.min.z);
+    syncLayerTransformUI();
+    applyActiveRenderBoxToRuntime();
+};
+
+const resetActiveRenderBox = () => {
+    if (selectedLayerId === 'base' || !selectedLayerId) {
+        baseRenderBox = createDefaultRenderBox();
+    } else {
+        const layer = layers.find((l) => l.id === selectedLayerId);
+        if (layer) layer.renderBox = createDefaultRenderBox();
+    }
+    syncLayerTransformUI();
+    applyActiveRenderBoxToRuntime();
+};
+
+const toggleRenderBoxGizmoEditMode = () => {
+    renderBoxGizmoEditMode = !renderBoxGizmoEditMode;
+    if (renderBoxGizmoEditMode) {
+        const rb = getActiveRenderBox();
+        if (rb && !rb.enabled) {
+            rb.enabled = true;
+            applyActiveRenderBoxToRuntime();
+        }
+    }
+    updateRenderBoxGizmoEditButton();
+    refreshLayerGizmoAttachment();
+};
+
+const readRenderBoxInputsIntoModel = () => {
+    if (_syncingLayerTransformUI) return;
+    const rb = getActiveRenderBox();
+    if (!rb) return;
+    rb.enabled = !!g('rb-enabled')?.checked;
+    const num = (id, d = 0) => numericFieldValueOrNull(g(id)?.value) ?? d;
+    rb.center.x = clampRenderBoxNumber(num('rb-cx', 0), 0);
+    rb.center.y = clampRenderBoxNumber(num('rb-cy', 0), 0);
+    rb.center.z = clampRenderBoxNumber(num('rb-cz', 0), 0);
+    rb.size.x = clampRenderBoxSize(num('rb-sx', 2), 2);
+    rb.size.y = clampRenderBoxSize(num('rb-sy', 2), 2);
+    rb.size.z = clampRenderBoxSize(num('rb-sz', 2), 2);
+    applyActiveRenderBoxToRuntime();
+};
+
 const syncLayerTransformUI = () => {
     const sec = g('layer-transform-section');
     if (!sec) return;
@@ -4538,6 +5679,20 @@ const syncLayerTransformUI = () => {
     setv('lt-scl-x', scl.x);
     setv('lt-scl-y', scl.y);
     setv('lt-scl-z', scl.z);
+    const rb = getActiveRenderBox() || createDefaultRenderBox();
+    const setb = (id, v) => {
+        const el = g(id);
+        if (el) el.value = v;
+    };
+    const ckb = g('rb-enabled');
+    if (ckb) ckb.checked = !!rb.enabled;
+    setb('rb-cx', rb.center?.x ?? 0);
+    setb('rb-cy', rb.center?.y ?? 0);
+    setb('rb-cz', rb.center?.z ?? 0);
+    setb('rb-sx', rb.size?.x ?? 2);
+    setb('rb-sy', rb.size?.y ?? 2);
+    setb('rb-sz', rb.size?.z ?? 2);
+    updateRenderBoxGizmoEditButton();
     _syncingLayerTransformUI = false;
 };
 
@@ -4668,7 +5823,9 @@ const renderLayersUI = () => {
     const baseLoaded = paintables.length > 0;
     const baseItem = document.createElement('div');
     baseItem.className = `layer-item layer-item-base${selectedLayerId === 'base' ? ' selected' : ''}`;
-    const baseVisible = baseLoaded && paintables[0].entity.enabled;
+    const baseVisible = baseLoaded && (baseSpatialChunkingActive
+        ? !baseLayerHiddenByUser
+        : paintables[0].entity.enabled);
     baseLayerOpacityPct = clampLayerOpacityPct(baseLayerOpacityPct);
     baseItem.innerHTML = `
       <button class="layer-visibility${baseVisible ? '' : ' hidden'}" title="${baseVisible ? 'Hide' : 'Show'}">${layerVisIcon(baseVisible)}</button>
@@ -4700,8 +5857,14 @@ const renderLayersUI = () => {
     baseItem.querySelector('.layer-visibility').addEventListener('click', (e) => {
         e.stopPropagation();
         if (!baseLoaded) return;
-        const ent = paintables[0].entity;
-        ent.enabled = !ent.enabled;
+        if (baseSpatialChunkingActive) {
+            baseLayerHiddenByUser = !baseLayerHiddenByUser;
+            invalidateBaseChunkVisibilityCamCache();
+            updateSpatialBaseChunkVisibility();
+        } else {
+            const ent = paintables[0].entity;
+            ent.enabled = !ent.enabled;
+        }
         renderLayersUI();
     });
     const baseDel = baseItem.querySelector('.layer-delete');
@@ -4719,8 +5882,9 @@ const renderLayersUI = () => {
             if (!baseLoaded) return;
             baseLayerOpacityPct = clampLayerOpacityPct(baseOpInp.value);
             baseOpInp.value = String(baseLayerOpacityPct);
-            const gsp = paintables[0]?.gsplatComponent;
-            if (gsp) pushLayerOpacityToGsplat(gsp, baseLayerOpacityPct);
+            for (const pb of paintables) {
+                if (pb.gsplatComponent) pushLayerOpacityToGsplat(pb.gsplatComponent, baseLayerOpacityPct);
+            }
         });
     }
     list.appendChild(baseItem);
@@ -4852,6 +6016,85 @@ const splatsToDataTable = (splats, DataTable, Column) => {
 
 /** Minimum centroid magnitude to trigger re-origin (avoid jitter on already-centered layers). */
 const SPLAT_MASS_ORIGIN_EPS = 1e-5;
+
+/**
+ * Build a PLY DataTable directly from PlayCanvas GSplatData — avoids splatsToDataTable’s
+ * per-column `arr.map` over millions of JS objects (major cost on large layer imports).
+ */
+const dataTableFromGsplatCpuData = (data) => {
+    if (!data?.numSplats) return new DataTable([]);
+    const columns = [];
+    const push = (name) => {
+        const buf = data.getProp(name);
+        if (!buf) return;
+        columns.push(new Column(name, floatPropToCache(buf)));
+    };
+    push('x');
+    push('y');
+    push('z');
+    push('nx');
+    push('ny');
+    push('nz');
+    push('f_dc_0');
+    push('f_dc_1');
+    push('f_dc_2');
+    for (let k = 0; k < 45; k++) {
+        const name = `f_rest_${k}`;
+        if (data.getProp(name)) push(name);
+    }
+    push('opacity');
+    push('scale_0');
+    push('scale_1');
+    push('scale_2');
+    push('rot_0');
+    push('rot_1');
+    push('rot_2');
+    push('rot_3');
+    return new DataTable(columns);
+};
+
+/**
+ * Same mass-origin shift as shiftUserLayerSplatsToMassOrigin, but mutates GSplatData x/y/z.
+ * Call before building splats / DataTable from `data`.
+ */
+const shiftGsplatCpuDataMassOriginForLayer = (layer, data, existingEntity) => {
+    const x = data.getProp('x');
+    const y = data.getProp('y');
+    const z = data.getProp('z');
+    if (!x?.length || !y?.length || !z?.length) return null;
+    const n = data.numSplats;
+    let sx = 0;
+    let sy = 0;
+    let sz = 0;
+    for (let i = 0; i < n; i++) {
+        sx += x[i];
+        sy += y[i];
+        sz += z[i];
+    }
+    const inv = 1 / n;
+    const C = new pc.Vec3(sx * inv, sy * inv, sz * inv);
+    if (C.length() < SPLAT_MASS_ORIGIN_EPS) return null;
+
+    const wc = new pc.Vec3();
+    if (existingEntity) {
+        existingEntity.getWorldTransform().transformPoint(C, wc);
+    } else {
+        ensureUserLayerTransform(layer);
+        const t = new pc.Vec3(layer.position.x, layer.position.y, layer.position.z);
+        const q = new pc.Quat().setFromEulerAngles(layer.rotation.x, layer.rotation.y, layer.rotation.z);
+        const s = new pc.Vec3(layer.scale.x, layer.scale.y, layer.scale.z);
+        const layerM = new pc.Mat4().setTRS(t, q, s);
+        const worldM = new pc.Mat4().mul2(layersContainer.getWorldTransform(), layerM);
+        worldM.transformPoint(C, wc);
+    }
+
+    for (let i = 0; i < n; i++) {
+        x[i] -= C.x;
+        y[i] -= C.y;
+        z[i] -= C.z;
+    }
+    return wc;
+};
 
 const computeSplatsCentroidVec3 = (splats) => {
     if (!splats?.length) return null;
@@ -5052,7 +6295,11 @@ const runSingleLayerEntityUpdate = async (layer) => {
     }
 
     // Put layer pivot / gizmo at center of mass: zero mean positions, adjust transform.
-    const massWorldSnap = shiftUserLayerSplatsToMassOrigin(layer, existing);
+    let massWorldSnap = shiftUserLayerSplatsToMassOrigin(layer, existing);
+    if (!massWorldSnap && layer._importMassWorldSnap) {
+        massWorldSnap = layer._importMassWorldSnap;
+        delete layer._importMassWorldSnap;
+    }
 
     const oldEnt = existing;
     const oldPb = layer._gsplatPaint;
@@ -5062,7 +6309,13 @@ const runSingleLayerEntityUpdate = async (layer) => {
 
     console.log(`[layer] updateLayerEntity: ${layer.id}, splats=${layer.splats.length}`);
 
-    const table = splatsToDataTable(layer.splats, DataTable, Column);
+    let table;
+    if (layer._layerImportPlyTable) {
+        table = layer._layerImportPlyTable;
+        layer._layerImportPlyTable = null;
+    } else {
+        table = splatsToDataTable(layer.splats, DataTable, Column);
+    }
     const memFs = new MemoryFileSystem();
     const filename = `layer-${layer.id}.ply`;
     await writePly(
@@ -5134,8 +6387,12 @@ const runSingleLayerEntityUpdate = async (layer) => {
             gsplat.setParameter('uHoverColor',    [1, 1, 1, 0]);
             ensureLayerColorGrade(layer);
             ensureLayerOpacityPct(layer);
+            ensureLayerRenderBox(layer);
             applyColorGradeToGsplat(gsplat, layer.colorGrade);
             pushLayerOpacityToGsplat(gsplat, layer.opacityPct);
+            applyRenderBoxToGsplat(gsplat, layer.renderBox);
+            pushWorldToModelUniform(gsplat);
+            refreshActiveRenderBoxPreview();
 
             layer._gsplatPaint = {
                 entity,
@@ -5194,16 +6451,28 @@ const uploadSelectionToTexture = () => {
     // Base model
     if (selectionMask && paintables.length) {
         const n = selectionMask.length;
+        const chunkMode = baseSpatialChunkingActive;
         for (const p of paintables) {
             const tex = p.gsplatComponent.getInstanceTexture('customSelection');
             if (!tex) continue;
             const d = tex.lock();
             if (!d) continue;
             const numTexels = tex.width * tex.height;
-            for (let i = 0; i < Math.min(n, numTexels); i++) {
-                const off = i * 4;
-                const v = selectionMask[i] ? 255 : 0;
-                d[off] = v; d[off+1] = 0; d[off+2] = 0; d[off+3] = 255;
+            if (chunkMode && p.chunkGlobalIndices) {
+                const map = p.chunkGlobalIndices;
+                const nk = Math.min(map.length, numTexels);
+                for (let j = 0; j < nk; j++) {
+                    const off = j * 4;
+                    const g = map[j];
+                    const v = g < n && selectionMask[g] ? 255 : 0;
+                    d[off] = v; d[off + 1] = 0; d[off + 2] = 0; d[off + 3] = 255;
+                }
+            } else {
+                for (let i = 0; i < Math.min(n, numTexels); i++) {
+                    const off = i * 4;
+                    const v = selectionMask[i] ? 255 : 0;
+                    d[off] = v; d[off+1] = 0; d[off+2] = 0; d[off+3] = 255;
+                }
             }
             tex.unlock();
         }
@@ -5686,13 +6955,52 @@ const yieldThreeFrames = async () => {
  */
 const countSelectedAndStampFullEraseBaseGpu = (delMask) => {
     if (!delMask?.length || !paintables.length || !gsplatDataCache) return 0;
+    const nGlob = Math.min(delMask.length, gsplatDataCache.numSplats);
+    if (baseSpatialChunkingActive) {
+        let nDel = 0;
+        for (const p of paintables) {
+            const tex = p.gsplatComponent.getInstanceTexture('customOpacity');
+            if (!tex) continue;
+            const d = tex.lock();
+            if (!d) continue;
+            const numTexels = tex.width * tex.height;
+            const map = p.chunkGlobalIndices;
+            if (map) {
+                const nk = Math.min(map.length, numTexels);
+                for (let j = 0; j < nk; j++) {
+                    const g = map[j];
+                    if (g >= nGlob || !delMask[g]) continue;
+                    nDel++;
+                    const off = j * 4;
+                    d[off] = 0;
+                    d[off + 1] = 0;
+                    d[off + 2] = 0;
+                    d[off + 3] = 255;
+                }
+            } else {
+                const n = Math.min(nGlob, numTexels);
+                for (let i = 0; i < n; i++) {
+                    if (!delMask[i]) continue;
+                    nDel++;
+                    const off = i * 4;
+                    d[off] = 0;
+                    d[off + 1] = 0;
+                    d[off + 2] = 0;
+                    d[off + 3] = 255;
+                }
+            }
+            tex.unlock();
+            p.gsplatComponent.workBufferUpdate = pc.WORKBUFFER_UPDATE_ONCE;
+        }
+        return nDel;
+    }
     const gsp = paintables[0].gsplatComponent;
     const tex = gsp.getInstanceTexture('customOpacity');
     if (!tex) return 0;
     const d = tex.lock();
     if (!d) return 0;
     const numTexels = tex.width * tex.height;
-    const n = Math.min(delMask.length, gsplatDataCache.numSplats, numTexels);
+    const n = Math.min(nGlob, numTexels);
     let nDel = 0;
     for (let i = 0; i < n; i++) {
         if (!delMask[i]) continue;
@@ -5943,6 +7251,7 @@ const runBaseSelectionDeleteCompaction = async (n, delMaskCopy, nDel) => {
         selectionMask = null;
         updateSelectionUI();
 
+        ensureBaseGsplatShRestHydratedFromDeferred();
         const { x: xA, y: yA, z: zA, shRest, extra } = cache;
         const out0 = painted?.out0 ?? cache.fdc0;
         const out1 = painted?.out1 ?? cache.fdc1;
@@ -6116,6 +7425,7 @@ const sharpenSelectedSplats = async () => {
     // ── Base model: PLY rebuild ─────────────────────────────────────────────
     if (!gsplatDataCache || !hasSelection || !selectionMask) return;
 
+    ensureBaseGsplatShRestHydratedFromDeferred();
     const { x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache;
     const n = gsplatDataCache.numSplats;
     const painted = applyAllCpuStrokes();
@@ -6948,11 +8258,72 @@ const frameOrbitOnLayerSplats = (layer) => {
     snapshotCameraResetFromFramedView();
 };
 
+const _frameBaseBoundsCorner = new pc.Vec3();
+
+/**
+ * Frame base orbit from `gsplatDataCache.bounds` (8 corners → world AABB). O(1).
+ * Large splat counts / big files use a closer orbit so fewer splats fill the view (better FPS).
+ */
+const applyBaseOrbitFromCachedBounds = () => {
+    const c = gsplatDataCache;
+    if (!c?.bounds || !paintables.length) return false;
+    const wt = paintables[0].entity.getWorldTransform();
+    const { min: Bmin, max: Bmax } = c.bounds;
+    const cx = [Bmin[0], Bmax[0]];
+    const cy = [Bmin[1], Bmax[1]];
+    const cz = [Bmin[2], Bmax[2]];
+    let wx0 = Infinity;
+    let wx1 = -Infinity;
+    let wy0 = Infinity;
+    let wy1 = -Infinity;
+    let wz0 = Infinity;
+    let wz1 = -Infinity;
+    for (let ix = 0; ix < 2; ix++) {
+        for (let iy = 0; iy < 2; iy++) {
+            for (let iz = 0; iz < 2; iz++) {
+                _frameBaseBoundsCorner.set(cx[ix], cy[iy], cz[iz]);
+                wt.transformPoint(_frameBaseBoundsCorner, _frameBaseBoundsCorner);
+                const px = _frameBaseBoundsCorner.x;
+                const py = _frameBaseBoundsCorner.y;
+                const pz = _frameBaseBoundsCorner.z;
+                wx0 = Math.min(wx0, px);
+                wx1 = Math.max(wx1, px);
+                wy0 = Math.min(wy0, py);
+                wy1 = Math.max(wy1, py);
+                wz0 = Math.min(wz0, pz);
+                wz1 = Math.max(wz1, pz);
+            }
+        }
+    }
+    if (!Number.isFinite(wx0)) return false;
+    const tcx = (wx0 + wx1) * 0.5;
+    const tcy = (wy0 + wy1) * 0.5;
+    const tcz = (wz0 + wz1) * 0.5;
+    const halfExtent = Math.max(wx1 - wx0, wy1 - wy0, wz1 - wz0) * 0.5;
+    const n = c.numSplats;
+    const bytes = c._sourceFileBytes ?? 0;
+    let distMult = 2.8;
+    if (n >= TIGHT_ORBIT_SPLAT_THRESHOLD || bytes >= TIGHT_ORBIT_FILE_BYTES) {
+        distMult = TIGHT_ORBIT_DIST_MULT;
+    } else if (n >= CLOSE_ORBIT_SPLAT_THRESHOLD || bytes >= CLOSE_ORBIT_FILE_BYTES) {
+        distMult = CLOSE_ORBIT_DIST_MULT;
+    }
+    orbit.target.set(tcx, tcy, tcz);
+    orbit.distance = Math.max(halfExtent * distMult, 0.35);
+    orbit.yaw = 0;
+    orbit.pitch = -15;
+    if (cameraNavMode === 'fly') syncFlyCamFromOrbitParams();
+    updateCamera();
+    snapshotCameraResetFromFramedView();
+    return true;
+};
+
 /** Center orbit/fly camera on the active layer (base splats or user layer entity). */
 const frameCameraOnSelectedLayer = () => {
     const isBase = selectedLayerId === 'base' || !selectedLayerId;
     if (isBase) {
         if (!paintables.length || !gsplatDataCache?.numSplats) return;
+        if (applyBaseOrbitFromCachedBounds()) return;
         const wt = paintables[0].entity.getWorldTransform();
         const v = new pc.Vec3();
         const { x, y, z, numSplats } = gsplatDataCache;
@@ -7879,28 +9250,11 @@ const createPaintableSplat = async (asset, opts = {}) => {
     gsplatComponent.setParameter('uHoverColor',    [1, 1, 1, 0]);
     applyColorGradeToGsplat(gsplatComponent, baseColorGrade);
     pushLayerOpacityToGsplat(gsplatComponent, baseLayerOpacityPct);
+    applyRenderBoxToGsplat(gsplatComponent, baseRenderBox);
+    pushWorldToModelUniform(gsplatComponent);
 
     const processors = createGsplatPaintProcessors(gsplatComponent);
     paintables.push({ entity, gsplatComponent, ...processors });
-
-    // Auto-center camera on the loaded model (skip when replacing, e.g. after delete-selection).
-    if (!opts?.preserveCamera) {
-        try {
-            const aabb = resource.aabb;
-            if (aabb) {
-                const center = aabb.center;
-                const halfExtent = aabb.halfExtents;
-                const radius = Math.max(halfExtent.x, halfExtent.y, halfExtent.z) * 2.5;
-                orbit.target.copy(center);
-                orbit.distance = Math.max(radius, 0.5);
-                orbit.yaw = 0;
-                orbit.pitch = -15;
-                if (cameraNavMode === 'fly') syncFlyCamFromOrbitParams();
-                updateCamera();
-                snapshotCameraResetFromFramedView();
-            }
-        } catch (_) { /* best effort */ }
-    }
 
     // Cache splat data for CPU export.
     // We use PlayCanvas's internal getProp() API to pull every standard
@@ -7911,14 +9265,7 @@ const createPaintableSplat = async (asset, opts = {}) => {
     if (data) {
         const n = data.numSplats;
 
-        // Collect higher-order SH bands (up to f_rest_44)
-        const shRest = [];
-        for (let i = 0; i < 45; i++) {
-            const k = `f_rest_${i}`;
-            const a = data.getProp(k);
-            if (a) shRest.push({ key: k, data: new Float32Array(a) });
-            if (opts?.staggerHeavyInit && i % 6 === 5) await yieldOneFrame();
-        }
+        // Higher-order SH (f_rest_*) deferred: duplicate GPU data — hydrate in ensureBaseGsplatShRestHydratedFromDeferred.
 
         // Collect extra standard Gaussian Splat properties (scale, rotation, normals).
         // These are required for a valid Gaussian Splat PLY/SOG.
@@ -7931,24 +9278,43 @@ const createPaintableSplat = async (asset, opts = {}) => {
         for (let pi = 0; pi < EXTRA_PROPS.length; pi++) {
             const prop = EXTRA_PROPS[pi];
             const a = data.getProp(prop);
-            if (a) extra[prop] = new Float32Array(a);
+            if (a) extra[prop] = floatPropToCache(a);
             if (opts?.staggerHeavyInit && pi === 2) await yieldOneFrame();
         }
 
-        const xCol = new Float32Array(data.getProp('x'));
+        const xCol = floatPropToCache(data.getProp('x'));
         if (opts?.staggerHeavyInit) await yieldOneFrame();
-        const yCol = new Float32Array(data.getProp('y'));
+        const yCol = floatPropToCache(data.getProp('y'));
         if (opts?.staggerHeavyInit) await yieldOneFrame();
-        const zCol = new Float32Array(data.getProp('z'));
+        const zCol = floatPropToCache(data.getProp('z'));
         if (opts?.staggerHeavyInit) await yieldOneFrame();
-        const f0 = new Float32Array(data.getProp('f_dc_0'));
+        const f0 = floatPropToCache(data.getProp('f_dc_0'));
         if (opts?.staggerHeavyInit) await yieldOneFrame();
-        const f1 = new Float32Array(data.getProp('f_dc_1'));
+        const f1 = floatPropToCache(data.getProp('f_dc_1'));
         if (opts?.staggerHeavyInit) await yieldOneFrame();
-        const f2 = new Float32Array(data.getProp('f_dc_2'));
+        const f2 = floatPropToCache(data.getProp('f_dc_2'));
         if (opts?.staggerHeavyInit) await yieldOneFrame();
-        const op = new Float32Array(data.getProp('opacity'));
+        const op = floatPropToCache(data.getProp('opacity'));
         if (opts?.staggerHeavyInit) await yieldOneFrame();
+
+        const srcBytes = opts.sourceFileBytes ?? 0;
+        let bminx = Infinity;
+        let bminy = Infinity;
+        let bminz = Infinity;
+        let bmaxx = -Infinity;
+        let bmaxy = -Infinity;
+        let bmaxz = -Infinity;
+        for (let i = 0; i < n; i++) {
+            const xi = xCol[i];
+            const yi = yCol[i];
+            const zi = zCol[i];
+            bminx = Math.min(bminx, xi);
+            bmaxx = Math.max(bmaxx, xi);
+            bminy = Math.min(bminy, yi);
+            bmaxy = Math.max(bmaxy, yi);
+            bminz = Math.min(bminz, zi);
+            bmaxz = Math.max(bmaxz, zi);
+        }
 
         gsplatDataCache = {
             numSplats: n,
@@ -7959,8 +9325,11 @@ const createPaintableSplat = async (asset, opts = {}) => {
             fdc1:    f1,
             fdc2:    f2,
             opacity: op,
-            shRest,
+            shRest: null,
+            _cpuGsplatDataForShRest: data,
             extra,   // scale, rotation, normals, etc.
+            bounds: { min: [bminx, bminy, bminz], max: [bmaxx, bmaxy, bmaxz] },
+            _sourceFileBytes: srcBytes,
         };
         selectionMask = new Uint8Array(n);
         resetBaseSplatAliveMask(n);
@@ -7970,6 +9339,14 @@ const createPaintableSplat = async (asset, opts = {}) => {
     applyModelRotation();
     refreshBaseGizmoMassPivotChild();
     refreshLayerGizmoAttachment();
+
+    if (gsplatDataCache && shouldSpatialChunkBase(gsplatDataCache.numSplats, opts)) {
+        await replaceMonolithicBaseWithSpatialChunks(asset, opts);
+    }
+    if (!opts?.preserveCamera && gsplatDataCache?.bounds) {
+        applyBaseOrbitFromCachedBounds();
+    }
+    requestAnimationFrame(() => resizeCanvasToContainer());
 };
 
 /** Build layer-style splat objects from PlayCanvas gsplat decompressed data. */
@@ -8023,6 +9400,59 @@ const gsplatDataToSplats = (data) => {
     return splats;
 };
 
+/** Same as gsplatDataToSplats but yields so the UI stays responsive on huge layers. */
+const GSPLAT_TO_SPLATS_YIELD_EVERY = 48_000;
+const gsplatDataToSplatsAsync = async (data) => {
+    if (!data?.numSplats) return [];
+    const n = data.numSplats;
+    const x = data.getProp('x');
+    const y = data.getProp('y');
+    const z = data.getProp('z');
+    const fdc0 = data.getProp('f_dc_0');
+    const fdc1 = data.getProp('f_dc_1');
+    const fdc2 = data.getProp('f_dc_2');
+    const op = data.getProp('opacity');
+    const nx = data.getProp('nx');
+    const ny = data.getProp('ny');
+    const nz = data.getProp('nz');
+    const sc0 = data.getProp('scale_0');
+    const sc1 = data.getProp('scale_1');
+    const sc2 = data.getProp('scale_2');
+    const r0 = data.getProp('rot_0');
+    const r1 = data.getProp('rot_1');
+    const r2 = data.getProp('rot_2');
+    const r3 = data.getProp('rot_3');
+    const shProps = [];
+    for (let k = 0; k < 45; k++) {
+        const name = `f_rest_${k}`;
+        if (data.getProp(name)) shProps.push(name);
+    }
+    const splats = new Array(n);
+    for (let i = 0; i < n; i++) {
+        const s = {
+            x: x[i], y: y[i], z: z[i],
+            f_dc_0: fdc0[i], f_dc_1: fdc1[i], f_dc_2: fdc2[i],
+            opacity: op[i],
+            scale_0: sc0 ? sc0[i] : -5,
+            scale_1: sc1 ? sc1[i] : -5,
+            scale_2: sc2 ? sc2[i] : -5,
+            rot_0: r0 ? r0[i] : 1,
+            rot_1: r1 ? r1[i] : 0,
+            rot_2: r2 ? r2[i] : 0,
+            rot_3: r3 ? r3[i] : 0,
+            nx: nx ? nx[i] : 0,
+            ny: ny ? ny[i] : 1,
+            nz: nz ? nz[i] : 0,
+        };
+        for (const key of shProps) {
+            s[key] = data.getProp(key)[i];
+        }
+        splats[i] = s;
+        if (i > 0 && i % GSPLAT_TO_SPLATS_YIELD_EVERY === 0) await yieldNextMacrotask();
+    }
+    return splats;
+};
+
 const collectShKeysFromSplatsArray = (arr) => {
     if (!arr.length) return [];
     const set = new Set();
@@ -8047,6 +9477,13 @@ const removeBaseModel = () => {
     }
     paintables.length = 0;
     gsplatDataCache = null;
+    baseSpatialChunkingActive = false;
+    baseSpatialStreamRadius = null;
+    baseLayerHiddenByUser = false;
+    adaptiveBaseSplatBudget = null;
+    adaptiveRenderScaleCap = null;
+    adaptTimer = 0;
+    adaptGoodWindows = 0;
     baseSplatAliveMask = null;
     selectionMask = null;
     strokes.length = 0;
@@ -8054,6 +9491,7 @@ const removeBaseModel = () => {
     activeStroke = null;
     baseModelName = '';
     baseTransform = createDefaultLayerTransform();
+    baseRenderBox = createDefaultRenderBox();
     destroyGradeLutGpu(baseColorGrade);
     baseColorGrade = createDefaultColorGrade();
     baseLayerOpacityPct = 100;
@@ -8067,6 +9505,8 @@ const removeBaseModel = () => {
     }
     renderLayersUI();
     updateSelectionUI();
+    pruneUnusedGsplatAssetsFromRegistry();
+    requestAnimationFrame(() => resizeCanvasToContainer());
 };
 
 /** Load PLY/SOG as a CPU splat layer (does not replace the scene). */
@@ -8106,8 +9546,6 @@ const importSplatAsLayer = async (source) => {
                     reject(new Error('No splat data'));
                     return;
                 }
-                setModelImportProgressIndeterminate('Preparing splats…');
-                const splats = gsplatDataToSplats(data);
                 const baseName = source instanceof File
                     ? source.name.replace(/\.[^/.]+$/, '')
                     : (originalUrl.split('/').pop() ?? 'Imported').replace(/\.[^/.]+$/, '');
@@ -8116,11 +9554,20 @@ const importSplatAsLayer = async (source) => {
                     name: baseName || 'Imported',
                     visible: true,
                     opacityPct: 100,
-                    splats,
+                    splats: [],
                     selectionMask: null,
                     colorGrade: cloneColorGrade(),
+                    renderBox: createDefaultRenderBox(),
                     ...createDefaultLayerTransform(),
                 };
+                // Mass-origin in typed arrays first (matches later splat objects); keep world snap for GPU entity placement.
+                setModelImportProgressIndeterminate('Centering…');
+                const wcSnap = shiftGsplatCpuDataMassOriginForLayer(layer, data, null);
+                if (wcSnap) layer._importMassWorldSnap = wcSnap;
+                // PLY columns from getProp directly — avoids splatsToDataTable’s O(n × columns) maps on huge layers.
+                layer._layerImportPlyTable = dataTableFromGsplatCpuData(data);
+                setModelImportProgressIndeterminate('Preparing splats…');
+                layer.splats = await gsplatDataToSplatsAsync(data);
                 layers.push(layer);
                 selectedLayerId = layer.id;
                 hasSelection = false;
@@ -8138,7 +9585,7 @@ const importSplatAsLayer = async (source) => {
                     frameCameraOnSelectedLayer();
                     getPosthog()?.capture('layer_imported', {
                         file_name: source instanceof File ? source.name : (originalUrl.split('/').pop() ?? ''),
-                        splat_count: splats.length,
+                        splat_count: layer.splats.length,
                     });
                     resolve();
                 }).catch((err) => {
@@ -8206,7 +9653,14 @@ const unloadAll = () => {
         p.resetOpacityProcessor?.destroy?.();
         p.entity.destroy();
     }
-        paintables.length = 0;
+    paintables.length = 0;
+    baseSpatialChunkingActive = false;
+    baseSpatialStreamRadius = null;
+    baseLayerHiddenByUser = false;
+    adaptiveBaseSplatBudget = null;
+    adaptiveRenderScaleCap = null;
+    adaptTimer = 0;
+    adaptGoodWindows = 0;
     for (const layer of [...layers]) {
         destroyLayerGsplatPaint(layer);
     }
@@ -8221,13 +9675,16 @@ const unloadAll = () => {
     selectedLayerId = 'base';
     baseModelName = '';
     baseTransform = createDefaultLayerTransform();
+    baseRenderBox = createDefaultRenderBox();
     destroyGradeLutGpu(baseColorGrade);
     baseColorGrade = createDefaultColorGrade();
     baseLayerOpacityPct = 100;
     for (const c of layersContainer.children.slice()) c.destroy();
     resetModelRotation();
+    pruneUnusedGsplatAssetsFromRegistry();
     updateUndoRedoUI(); updateSelectionUI();
     renderLayersUI();
+    requestAnimationFrame(() => resizeCanvasToContainer());
 };
 
 /**
@@ -8281,11 +9738,18 @@ const replaceBaseModelWithPlyFile = async (file, opts = {}) => {
                         if (savedSelections[i].layerId === 'base') savedSelections.splice(i, 1);
                     }
 
-                    if (opts.staggerHeavyInit) {
+                    const staggerHeavyInit = opts.staggerHeavyInit ?? (
+                        file instanceof File && file.size >= GSPLAT_LARGE_FILE_STAGGER_BYTES
+                    );
+                    if (staggerHeavyInit) {
                         await yieldThreeFrames();
                         await yieldNextMacrotask();
                     }
-                    await createPaintableSplat(a, opts);
+                    await createPaintableSplat(a, {
+                        ...opts,
+                        staggerHeavyInit,
+                        sourceFileBytes: file instanceof File ? file.size : 0,
+                    });
 
                     if (preserve) {
                         if (savedNavMode === 'fly' && savedFly) {
@@ -8373,7 +9837,18 @@ const loadSplat = async (source, opts = {}) => {
                     const savedFly = preserve ? { pos: flyCam.pos.clone(), yaw: flyCam.yaw, pitch: flyCam.pitch } : null;
                     const savedRot = preserve ? { ...globalModelRotation } : null;
                     unloadAll();
-                    await createPaintableSplat(a, opts);
+                    const staggerHeavyInit = opts.staggerHeavyInit ?? (
+                        source instanceof File && source.size >= GSPLAT_LARGE_FILE_STAGGER_BYTES
+                    );
+                    if (staggerHeavyInit) {
+                        await yieldThreeFrames();
+                        await yieldNextMacrotask();
+                    }
+                    await createPaintableSplat(a, {
+                        ...opts,
+                        staggerHeavyInit,
+                        sourceFileBytes: source instanceof File ? source.size : 0,
+                    });
                     if (preserve) {
                         if (savedNavMode === 'fly' && savedFly) {
                             flyCam.pos.copy(savedFly.pos);
@@ -8596,26 +10071,97 @@ const applyAllCpuStrokes = () => {
 // Read paint from GPU textures (guarantees export matches what you see)
 const getPaintFromGpu = async (opts = {}) => {
     if (!gsplatDataCache || !paintables.length) return null;
+    const n = gsplatDataCache.numSplats;
+    const { fdc0, fdc1, fdc2, opacity } = gsplatDataCache;
+    const readOptsBase = { mipLevel: 0, face: 0, immediate: true };
+    const curBlend = blendMode();
+
+    const useChunks = baseSpatialChunkingActive && paintables.some((pb) => pb.chunkGlobalIndices);
+    if (useChunks) {
+        const out0 = new Float32Array(fdc0);
+        const out1 = new Float32Array(fdc1);
+        const out2 = new Float32Array(fdc2);
+        const outOp = new Float32Array(opacity);
+        const yieldEvery = opts?.yieldEvery ?? 0;
+        let iter = 0;
+        for (const pb of paintables) {
+            const idx = pb.chunkGlobalIndices;
+            if (!idx) continue;
+            const colorTex = pb.gsplatComponent.getInstanceTexture('customColor');
+            const opacityTex = pb.gsplatComponent.getInstanceTexture('customOpacity');
+            if (!colorTex || !opacityTex) continue;
+            const w = colorTex.width;
+            const h = colorTex.height;
+            if (w <= 0 || h <= 0) continue;
+            if (opts.flushGpuBeforeRead && typeof app.graphicsDevice?.submit === 'function') {
+                app.graphicsDevice.submit();
+                await yieldNextMacrotask();
+            }
+            let colorData;
+            let opacityData;
+            try {
+                colorData = await colorTex.read(0, 0, w, h, readOptsBase);
+                if (opts.yieldBetweenTextureReads) await yieldNextMacrotask();
+                opacityData = await opacityTex.read(0, 0, w, h, readOptsBase);
+            } catch (_) {
+                continue;
+            }
+            const maxTex = w * h;
+            const nk = idx.length;
+            for (let j = 0; j < nk; j++) {
+                const i = idx[j];
+                if (i < 0 || i >= n) continue;
+                const off = Math.min(j, maxTex - 1) * 4;
+                const cr = colorData[off] / 255;
+                const cg = colorData[off + 1] / 255;
+                const cb = colorData[off + 2] / 255;
+                const ca = colorData[off + 3] / 255;
+                const ea = opacityData[off + 3] / 255;
+                const origR = 0.5 + fdc0[i] * SH_C0;
+                const origG = 0.5 + fdc1[i] * SH_C0;
+                const origB = 0.5 + fdc2[i] * SH_C0;
+                let fR;
+                let fG;
+                let fB;
+                if (ca > 0) {
+                    switch (curBlend) {
+                        case 1: fR = origR + (origR * cr - origR) * ca; fG = origG + (origG * cg - origG) * ca; fB = origB + (origB * cb - origB) * ca; break;
+                        case 2: fR = origR + (Math.max(origR, cr) - origR) * ca; fG = origG + (Math.max(origG, cg) - origG) * ca; fB = origB + (Math.max(origB, cb) - origB) * ca; break;
+                        case 3: fR = origR + (Math.min(origR, cr) - origR) * ca; fG = origG + (Math.min(origG, cg) - origG) * ca; fB = origB + (Math.min(origB, cb) - origB) * ca; break;
+                        default: fR = origR + (cr - origR) * ca; fG = origG + (cg - origG) * ca; fB = origB + (cb - origB) * ca;
+                    }
+                    out0[i] = (fR - 0.5) / SH_C0;
+                    out1[i] = (fG - 0.5) / SH_C0;
+                    out2[i] = (fB - 0.5) / SH_C0;
+                }
+                if (ea > 0) outOp[i] = invSigmoid(sigmoid(opacity[i]) * (1 - Math.min(1, ea)));
+                iter++;
+                if (yieldEvery > 0 && iter > 0 && iter % yieldEvery === 0) await yieldOneFrame();
+            }
+        }
+        return { out0, out1, out2, outOp };
+    }
+
     const p = paintables[0];
     const colorTex = p.gsplatComponent.getInstanceTexture('customColor');
     const opacityTex = p.gsplatComponent.getInstanceTexture('customOpacity');
     if (!colorTex || !opacityTex) return null;
-    const w = colorTex.width, h = colorTex.height;
+    const w = colorTex.width;
+    const h = colorTex.height;
     if (w <= 0 || h <= 0) return null;
-    const n = gsplatDataCache.numSplats;
-    const readOptsBase = { mipLevel: 0, face: 0, immediate: true };
     if (opts.flushGpuBeforeRead && typeof app.graphicsDevice?.submit === 'function') {
         app.graphicsDevice.submit();
         await yieldNextMacrotask();
     }
-    let colorData, opacityData;
+    let colorData;
+    let opacityData;
     try {
         colorData = await colorTex.read(0, 0, w, h, readOptsBase);
         if (opts.yieldBetweenTextureReads) await yieldNextMacrotask();
         opacityData = await opacityTex.read(0, 0, w, h, readOptsBase);
-    } catch (_) { return null; }
-    const { fdc0, fdc1, fdc2, opacity } = gsplatDataCache;
-    const curBlend = blendMode();
+    } catch (_) {
+        return null;
+    }
     const tryWorker = opts.useWorkerMerge && typeof Worker !== 'undefined' && n >= MIN_SPLATS_FOR_GPU_MERGE_WORKER;
     if (tryWorker) {
         try {
@@ -8624,15 +10170,24 @@ const getPaintFromGpu = async (opts = {}) => {
             console.warn('[getPaintFromGpu] worker merge failed, using main thread', werr);
         }
     }
-    const out0 = new Float32Array(fdc0), out1 = new Float32Array(fdc1), out2 = new Float32Array(fdc2);
+    const out0 = new Float32Array(fdc0);
+    const out1 = new Float32Array(fdc1);
+    const out2 = new Float32Array(fdc2);
     const outOp = new Float32Array(opacity);
     const yieldEvery = opts?.yieldEvery ?? 0;
     for (let i = 0; i < n; i++) {
         const off = Math.min(i, w * h - 1) * 4;
-        const cr = colorData[off] / 255, cg = colorData[off + 1] / 255, cb = colorData[off + 2] / 255, ca = colorData[off + 3] / 255;
+        const cr = colorData[off] / 255;
+        const cg = colorData[off + 1] / 255;
+        const cb = colorData[off + 2] / 255;
+        const ca = colorData[off + 3] / 255;
         const ea = opacityData[off + 3] / 255;
-        const origR = 0.5 + fdc0[i] * SH_C0, origG = 0.5 + fdc1[i] * SH_C0, origB = 0.5 + fdc2[i] * SH_C0;
-        let fR, fG, fB;
+        const origR = 0.5 + fdc0[i] * SH_C0;
+        const origG = 0.5 + fdc1[i] * SH_C0;
+        const origB = 0.5 + fdc2[i] * SH_C0;
+        let fR;
+        let fG;
+        let fB;
         if (ca > 0) {
             switch (curBlend) {
                 case 1: fR = origR + (origR * cr - origR) * ca; fG = origG + (origG * cg - origG) * ca; fB = origB + (origB * cb - origB) * ca; break;
@@ -8640,7 +10195,9 @@ const getPaintFromGpu = async (opts = {}) => {
                 case 3: fR = origR + (Math.min(origR, cr) - origR) * ca; fG = origG + (Math.min(origG, cg) - origG) * ca; fB = origB + (Math.min(origB, cb) - origB) * ca; break;
                 default: fR = origR + (cr - origR) * ca; fG = origG + (cg - origG) * ca; fB = origB + (cb - origB) * ca;
             }
-            out0[i] = (fR - 0.5) / SH_C0; out1[i] = (fG - 0.5) / SH_C0; out2[i] = (fB - 0.5) / SH_C0;
+            out0[i] = (fR - 0.5) / SH_C0;
+            out1[i] = (fG - 0.5) / SH_C0;
+            out2[i] = (fB - 0.5) / SH_C0;
         }
         if (ea > 0) outOp[i] = invSigmoid(sigmoid(opacity[i]) * (1 - Math.min(1, ea)));
         if (yieldEvery > 0 && i > 0 && i % yieldEvery === 0) await yieldOneFrame();
@@ -8812,6 +10369,7 @@ const exportToFile = async () => {
     const emptyF = new Float32Array(0);
 
     if (hasBase) {
+        ensureBaseGsplatShRestHydratedFromDeferred();
         ({ x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache);
         const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
         const p = painted ?? {
@@ -9514,6 +11072,13 @@ window.addEventListener('keydown', (e) => {
         return;
     }
 
+    if (e.shiftKey && e.code === 'KeyF') {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+        e.preventDefault();
+        toggleViewerFpsHud();
+        return;
+    }
+
     const key = e.key.toLowerCase();
 
     // Selection mode: 8=New, 9=Add, 0=Subtract when a selection tool is active — before INPUT check
@@ -9723,7 +11288,24 @@ g('add-layer-btn').addEventListener('click', addLayer);
             syncLayerTransformUI();
         });
     });
+['rb-cx', 'rb-cy', 'rb-cz', 'rb-sx', 'rb-sy', 'rb-sz']
+    .forEach((id) => {
+        const el = g(id);
+        if (!el) return;
+        enableNumericExprTyping(el);
+        el.addEventListener('input', readRenderBoxInputsIntoModel);
+        el.addEventListener('change', readRenderBoxInputsIntoModel);
+        el.addEventListener('blur', () => {
+            if (_syncingLayerTransformUI) return;
+            readRenderBoxInputsIntoModel();
+            syncLayerTransformUI();
+        });
+    });
 g('lt-reset-btn')?.addEventListener('click', resetActiveLayerTransform);
+g('rb-enabled')?.addEventListener('change', readRenderBoxInputsIntoModel);
+g('rb-edit-gizmo-btn')?.addEventListener('click', toggleRenderBoxGizmoEditMode);
+g('rb-fit-btn')?.addEventListener('click', fitActiveRenderBoxToBounds);
+g('rb-reset-btn')?.addEventListener('click', resetActiveRenderBox);
 g('add-shape-preview-btn')?.addEventListener('click', () => placeShapePreviewAtOrbitTarget());
 g('splat-shape-btn')?.addEventListener('click', () => splatShapePreviewToLayer());
 
@@ -10216,7 +11798,7 @@ g('cg-toggle-visibility-btn')?.addEventListener('click', () => {
     const { grade, gsplat } = getActiveColorGradeBundle();
     grade.enabled = !(grade.enabled !== false);
     updateCgVisibilityButton(grade.enabled !== false);
-    applyColorGradeToGsplat(gsplat, grade);
+    applyColorGradeBundleToGpu(grade, gsplat);
 });
 g('cg-bake-grade-btn')?.addEventListener('click', () => { bakeColorGradeIntoActiveTarget(); });
 g('brush-bake-paint-btn')?.addEventListener('click', () => { bakeBrushPaintIntoModel(); });
@@ -10234,7 +11816,7 @@ g('cg-lut-clear-btn')?.addEventListener('click', () => {
     grade.lutDomainMax = [1, 1, 1];
     grade.lutMix = 1;
     refreshColorGradeUIFromSelection();
-    applyColorGradeToGsplat(gsplat, grade);
+    applyColorGradeBundleToGpu(grade, gsplat);
 });
 g('cg-lut-file')?.addEventListener('change', async (ev) => {
     const input = ev.target;
@@ -10253,7 +11835,7 @@ g('cg-lut-file')?.addEventListener('change', async (ev) => {
         grade.lutName = file.name.replace(/\.cube$/i, '') || 'LUT';
         grade.lutMix = 1;
         refreshColorGradeUIFromSelection();
-        applyColorGradeToGsplat(gsplat, grade);
+        applyColorGradeBundleToGpu(grade, gsplat);
     } catch (err) {
         console.error('[cube-lut]', err);
         alert(`Could not load LUT: ${err?.message || err}`);
