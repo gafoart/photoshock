@@ -4695,6 +4695,7 @@ const resetActiveColorGrade = () => {
 /** Bake current color grade (and optional GPU paint for base) into SH DC, reset grade UI. */
 const bakeColorGradeIntoActiveTarget = async () => {
     commitActiveColorGradeFromUI();
+    drainPendingPaints();
     const gradeOnlySel = !!g('cg-grade-selected-only')?.checked;
 
     const activeLayer = getActiveLayer();
@@ -4702,7 +4703,7 @@ const bakeColorGradeIntoActiveTarget = async () => {
         ensureLayerColorGrade(activeLayer);
         const gSnap = cloneColorGrade(activeLayer.colorGrade);
         const ent = layersContainer.findByName(`layer-${activeLayer.id}`);
-        const baked = ent?.gsplat ? await getLayerPaintFromGpu(activeLayer, ent.gsplat) : null;
+        const baked = await getLayerPaintBaked(activeLayer, ent?.gsplat ?? null, { flushGpuBeforeRead: true });
         const mask = activeLayer.selectionMask;
         for (let i = 0; i < activeLayer.splats.length; i++) {
             if (gradeOnlySel && mask && !mask[i]) continue;
@@ -4730,7 +4731,7 @@ const bakeColorGradeIntoActiveTarget = async () => {
         return;
     }
     const gSnap = cloneColorGrade(baseColorGrade);
-    const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
+    const painted = await getPaintFromGpu({ flushGpuBeforeRead: true }) ?? applyAllCpuStrokes();
     if (!painted) {
         alert('Could not read colors for bake.');
         return;
@@ -4793,10 +4794,11 @@ const strokeTouchesBaseModel = (stroke) =>
 
 /** Bake brush/bucket/erase GPU paint into splat SH + opacity; clear textures & undo for this target. Color grade is left as-is. */
 const bakeBrushPaintIntoModel = async () => {
+    drainPendingPaints();
     const activeLayer = getActiveLayer();
     if (activeLayer) {
         const ent = layersContainer.findByName(`layer-${activeLayer.id}`);
-        const baked = ent?.gsplat ? await getLayerPaintFromGpu(activeLayer, ent.gsplat) : null;
+        const baked = await getLayerPaintBaked(activeLayer, ent?.gsplat ?? null, { flushGpuBeforeRead: true });
         if (!baked) {
             alert('Could not read paint on this layer.');
             return;
@@ -4823,7 +4825,7 @@ const bakeBrushPaintIntoModel = async () => {
         alert('Nothing to bake.');
         return;
     }
-    const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
+    const painted = await getPaintFromGpu({ flushGpuBeforeRead: true }) ?? applyAllCpuStrokes();
     if (!painted) {
         alert('Could not read paint for bake.');
         return;
@@ -5212,8 +5214,8 @@ const duplicateLayer = async (layerId) => {
 
     const splats = src.splats.map((s) => ({ ...s }));
     const ent = layersContainer.findByName(`layer-${src.id}`);
-    if (ent?.gsplat && splats.length) {
-        const baked = await getLayerPaintFromGpu(src, ent.gsplat);
+    if (splats.length) {
+        const baked = await getLayerPaintBaked(src, ent?.gsplat ?? null, { flushGpuBeforeRead: true });
         if (baked) {
             for (let i = 0; i < splats.length; i++) {
                 splats[i].f_dc_0 = baked.out0[i];
@@ -5300,8 +5302,8 @@ const separateSelectionToNewLayer = async () => {
     const ent = layersContainer.findByName(`layer-${src.id}`);
     const n = src.splats.length;
     const bakedSplats = src.splats.map((s) => ({ ...s }));
-    if (ent?.gsplat && n) {
-        const baked = await getLayerPaintFromGpu(src, ent.gsplat);
+    if (n) {
+        const baked = await getLayerPaintBaked(src, ent?.gsplat ?? null, { flushGpuBeforeRead: true });
         if (baked) {
             for (let i = 0; i < n; i++) {
                 bakedSplats[i].f_dc_0 = baked.out0[i];
@@ -10068,6 +10070,170 @@ const applyAllCpuStrokes = () => {
     return { out0, out1, out2, outOp };
 };
 
+/**
+ * CPU replay of brush / bucket / erase for one user layer (same math as `applyAllCpuStrokes`).
+ * Used when `getLayerPaintFromGpu` cannot read instance textures (e.g. some WebGPU paths) so
+ * export / bake still match committed `cpuOps` — shape layers and imports both benefit.
+ */
+const applyLayerCpuStrokes = (layer) => {
+    if (!layer?.splats?.length) return null;
+    const splats = layer.splats;
+    const numSplats = splats.length;
+    const xA = new Float32Array(numSplats);
+    const yA = new Float32Array(numSplats);
+    const zA = new Float32Array(numSplats);
+    const fdc0 = new Float32Array(numSplats);
+    const fdc1 = new Float32Array(numSplats);
+    const fdc2 = new Float32Array(numSplats);
+    const opacity = new Float32Array(numSplats);
+    for (let i = 0; i < numSplats; i++) {
+        const s = splats[i];
+        xA[i] = s.x; yA[i] = s.y; zA[i] = s.z;
+        fdc0[i] = s.f_dc_0 ?? 0;
+        fdc1[i] = s.f_dc_1 ?? 0;
+        fdc2[i] = s.f_dc_2 ?? 0;
+        opacity[i] = s.opacity ?? 0;
+    }
+    const layerMask = layer.selectionMask;
+    const layerHasSelection = !!(layerMask?.some((v) => v > 0));
+
+    const cumPR = new Float32Array(numSplats);
+    const cumPG = new Float32Array(numSplats);
+    const cumPB = new Float32Array(numSplats);
+    const cumPA = new Float32Array(numSplats);
+    const cumErase = new Float32Array(numSplats);
+
+    const layerId = layer.id;
+    for (const stroke of strokes) {
+        const opsToApply = stroke.cpuOps?.length
+            ? stroke.cpuOps
+            : (stroke.ops || []).map((o) => (
+                o.isBucket
+                    ? {
+                        isBucket: true,
+                        r: o.color[0], g: o.color[1], b: o.color[2],
+                        intensity: o.color[3], blendMode: blendMode(),
+                        ...(o.layerId ? { layerId: o.layerId } : {}),
+                    }
+                    : {
+                        cx: o.sphere[0], cy: o.sphere[1], cz: o.sphere[2],
+                        radius: o.sphere[3],
+                        r: o.color[0], g: o.color[1], b: o.color[2],
+                        intensity: o.color[3], hardness: o.hardness,
+                        isErase: o.isErase, blendMode: blendMode(),
+                        selectionConstraint: o.selectionConstraint,
+                        ...(o.layerId ? { layerId: o.layerId } : {}),
+                        ...(o.isErase && o.eraseDepthHalf != null
+                            ? { eraseDepthHalf: o.eraseDepthHalf, evX: o.evX, evY: o.evY, evZ: o.evZ }
+                            : {}),
+                    }
+            ));
+        if (!opsToApply.length) continue;
+        for (const op of opsToApply) {
+            if (op.layerId !== layerId) continue;
+            if (op.isBucket) {
+                const a = op.intensity;
+                for (let i = 0; i < numSplats; i++) {
+                    if (!layerMask?.[i]) continue;
+                    cumPR[i] = op.r * a + cumPR[i] * (1 - a);
+                    cumPG[i] = op.g * a + cumPG[i] * (1 - a);
+                    cumPB[i] = op.b * a + cumPB[i] * (1 - a);
+                    cumPA[i] = a + cumPA[i] * (1 - a);
+                }
+                continue;
+            }
+            const r2 = (op.radius * 1.001) ** 2;
+            const sc = op.selectionConstraint != null ? op.selectionConstraint : (layerHasSelection ? 1 : 0);
+            for (let i = 0; i < numSplats; i++) {
+                if (sc === 1 && layerMask?.[i]) continue;
+                if (sc === 2 && (!layerMask || !layerMask[i])) continue;
+                const dx = xA[i] - op.cx, dy = yA[i] - op.cy, dz = zA[i] - op.cz;
+                let falloff;
+                if (op.isErase) {
+                    let tEdge;
+                    if ((op.eraseDepthHalf ?? 0) > 1e-8 && op.evX != null) {
+                        const evx = op.evX, evy = op.evY, evz = op.evZ;
+                        const longitud = dx * evx + dy * evy + dz * evz;
+                        const perpSq = dx * dx + dy * dy + dz * dz - longitud * longitud;
+                        const perp = Math.sqrt(Math.max(0, perpSq));
+                        const R = op.radius;
+                        const D = Math.max(op.eraseDepthHalf, 1e-6);
+                        if (perp >= R || Math.abs(longitud) > D) continue;
+                        tEdge = Math.max(perp / R, Math.abs(longitud) / D);
+                    } else {
+                        if (dx * dx + dy * dy + dz * dz >= r2) continue;
+                        tEdge = Math.sqrt(dx * dx + dy * dy + dz * dz) / op.radius;
+                    }
+                    const tLin = 1 - tEdge;
+                    falloff = op.hardness >= 1
+                        ? 1
+                        : smoothstepJS(0, Math.max(0.001, 1 - op.hardness), tLin);
+                } else {
+                    if (dx * dx + dy * dy + dz * dz >= r2) continue;
+                    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    falloff = paintPlateauFalloff(dist, op.radius, op.hardness);
+                }
+                if (falloff < 0.008) continue;
+                const a = op.intensity * falloff;
+                if (op.isErase) {
+                    cumErase[i] += a;
+                } else {
+                    cumPR[i] = op.r * a + cumPR[i] * (1 - a);
+                    cumPG[i] = op.g * a + cumPG[i] * (1 - a);
+                    cumPB[i] = op.b * a + cumPB[i] * (1 - a);
+                    cumPA[i] = a + cumPA[i] * (1 - a);
+                }
+            }
+        }
+    }
+
+    const curBlend = blendMode();
+    const out0 = new Float32Array(fdc0);
+    const out1 = new Float32Array(fdc1);
+    const out2 = new Float32Array(fdc2);
+    const outOp = new Float32Array(opacity);
+
+    for (let i = 0; i < numSplats; i++) {
+        const a = cumPA[i];
+        if (a > 0) {
+            const origR = 0.5 + fdc0[i] * SH_C0;
+            const origG = 0.5 + fdc1[i] * SH_C0;
+            const origB = 0.5 + fdc2[i] * SH_C0;
+            let fR, fG, fB;
+            switch (curBlend) {
+                case 1:
+                    fR = origR + (origR * cumPR[i] - origR) * a;
+                    fG = origG + (origG * cumPG[i] - origG) * a;
+                    fB = origB + (origB * cumPB[i] - origB) * a;
+                    break;
+                case 2:
+                    fR = origR + (Math.max(origR, cumPR[i]) - origR) * a;
+                    fG = origG + (Math.max(origG, cumPG[i]) - origG) * a;
+                    fB = origB + (Math.max(origB, cumPB[i]) - origB) * a;
+                    break;
+                case 3:
+                    fR = origR + (Math.min(origR, cumPR[i]) - origR) * a;
+                    fG = origG + (Math.min(origG, cumPG[i]) - origG) * a;
+                    fB = origB + (Math.min(origB, cumPB[i]) - origB) * a;
+                    break;
+                default:
+                    fR = origR + (cumPR[i] - origR) * a;
+                    fG = origG + (cumPG[i] - origG) * a;
+                    fB = origB + (cumPB[i] - origB) * a;
+            }
+            out0[i] = (fR - 0.5) / SH_C0;
+            out1[i] = (fG - 0.5) / SH_C0;
+            out2[i] = (fB - 0.5) / SH_C0;
+        }
+        if (cumErase[i] > 0) {
+            outOp[i] = invSigmoid(
+                sigmoid(outOp[i]) * (1 - Math.min(1, cumErase[i])),
+            );
+        }
+    }
+    return { out0, out1, out2, outOp };
+};
+
 // Read paint from GPU textures (guarantees export matches what you see)
 const getPaintFromGpu = async (opts = {}) => {
     if (!gsplatDataCache || !paintables.length) return null;
@@ -10209,7 +10375,7 @@ const getPaintFromGpu = async (opts = {}) => {
  * Bake GPU customColor/customOpacity into SH DC + opacity for one user layer.
  * Uses `layer._cpuToGpuSplat` so texel indices match the paint pipeline (same as selection).
  */
-const getLayerPaintFromGpu = async (layer, gsplat) => {
+const getLayerPaintFromGpu = async (layer, gsplat, opts = {}) => {
     const n = layer.splats.length;
     if (!n) return null;
     const colorTex = gsplat.getInstanceTexture('customColor');
@@ -10218,6 +10384,10 @@ const getLayerPaintFromGpu = async (layer, gsplat) => {
     const w = colorTex.width;
     const h = colorTex.height;
     if (w <= 0 || h <= 0) return null;
+    if (opts.flushGpuBeforeRead && typeof app.graphicsDevice?.submit === 'function') {
+        app.graphicsDevice.submit();
+        await yieldNextMacrotask();
+    }
     let colorData;
     let opacityData;
     try {
@@ -10294,6 +10464,35 @@ const getLayerPaintFromGpu = async (layer, gsplat) => {
     return { out0, out1, out2, outOp };
 };
 
+/** True if undo history still has brush/bucket/erase ops for this layer (shape or import). */
+const layerHasPaintHistoryInStrokes = (layer) => {
+    const id = layer?.id;
+    if (!id) return false;
+    for (const s of strokes) {
+        if ((s.cpuOps || []).some((o) => o.layerId === id)) return true;
+        if ((s.ops || []).some((o) => o.layerId === id)) return true;
+    }
+    return false;
+};
+
+/**
+ * Bake layer paint for export / bake tools.
+ * Prefer CPU replay from `strokes` when this layer still has paint history: `getLayerPaintFromGpu`
+ * always returns an object on success, so a bad or empty erase readback previously skipped the CPU
+ * path and exported pre-erase opacity (common on shape layers). With history, cpuOps are authoritative.
+ */
+const getLayerPaintBaked = async (layer, gsplat, opts = {}) => {
+    if (layerHasPaintHistoryInStrokes(layer)) {
+        const cpu = applyLayerCpuStrokes(layer);
+        if (cpu) return cpu;
+    }
+    if (gsplat) {
+        const fromGpu = await getLayerPaintFromGpu(layer, gsplat, opts);
+        if (fromGpu) return fromGpu;
+    }
+    return applyLayerCpuStrokes(layer);
+};
+
 /**
  * Save a Blob as a file. Safari/macOS leaves `name.ply.download` if revokeObjectURL runs
  * before the download finishes; we defer revoke. Chromium can use the Save dialog when available.
@@ -10340,6 +10539,7 @@ const triggerBlobDownload = async (blob, downloadFilename) => {
 
 const exportToFile = async () => {
     commitActiveColorGradeFromUI();
+    drainPendingPaints();
     const hasBase = !!(gsplatDataCache && paintables.length > 0);
     const layerSplats = [];
     const layerEntities = [];
@@ -10371,7 +10571,7 @@ const exportToFile = async () => {
     if (hasBase) {
         ensureBaseGsplatShRestHydratedFromDeferred();
         ({ x: xA, y: yA, z: zA, shRest, extra } = gsplatDataCache);
-        const painted = await getPaintFromGpu() ?? applyAllCpuStrokes();
+        const painted = await getPaintFromGpu({ flushGpuBeforeRead: true }) ?? applyAllCpuStrokes();
         const p = painted ?? {
             out0: gsplatDataCache.fdc0, out1: gsplatDataCache.fdc1,
             out2: gsplatDataCache.fdc2, outOp: gsplatDataCache.opacity,
@@ -10404,10 +10604,8 @@ const exportToFile = async () => {
     for (const layer of layers) {
         if (!layer.visible || !layer.splats.length) continue;
         const ent = layersContainer.findByName(`layer-${layer.id}`);
-        if (ent?.gsplat) {
-            layerPaintTargets.push(layer);
-            layerPaintPromises.push(getLayerPaintFromGpu(layer, ent.gsplat));
-        }
+        layerPaintTargets.push(layer);
+        layerPaintPromises.push(getLayerPaintBaked(layer, ent?.gsplat ?? null, { flushGpuBeforeRead: true }));
     }
     const layerPaintResults = await Promise.all(layerPaintPromises);
     const layerPaintById = new Map();
